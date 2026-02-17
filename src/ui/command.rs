@@ -1,27 +1,28 @@
 #[derive(Clone, Debug)]
 pub enum Command {
-    // Control de ejecución
+    // Execution
     Run,
     Continue,
-    Step,        // step-in
-    Next,        // step-over
-    Finish,      // step-out
-    Interrupt,   // Ctrl-C
+    Step,
+    Next,
+    Finish,
+    Interrupt,
     Restart,
 
     // Breakpoints
-    AddBreakpoint    { file: String, line: u32 },
-    RemoveBreakpoint(u32),                        // por id
+    AddBreakpoint { file: String, line: u32 },
+    RemoveBreakpoint(u32),
     ToggleBreakpoint { id: u32, enable: bool },
 
-    // Carga de programa
+    // Program
     LoadExecutable(String),
 
-    // Consultas (la respuesta llega como DebuggerEvent)
     RequestLocals,
     RequestStack,
+    RequestRegisterNames,
+    RequestRegisters,
+    RequestDisasm,
     Evaluate(String),
 
-    // Consola libre
     Raw(String),
 }

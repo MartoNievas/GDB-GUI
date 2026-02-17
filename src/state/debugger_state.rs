@@ -18,26 +18,46 @@ pub struct Breakpoint {
     pub enabled: bool,
 }
 
-// ─── Variable (watch / locals) ────────────────────────────────────────────────
+// ─── Variable (locals / watch) ────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct Variable {
     pub name: String,
     pub value: String,
+
     pub type_: String,
+}
+
+// ─── Register ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct Register {
+    pub number: u32,
+    pub name: String,
+    pub value: String, // hex: "0x00007fff..."
+}
+
+// ─── Disassembly ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct AsmLine {
+    pub addr: u64,
+    pub offset: u32,
+    pub inst: String,  // "mov rax, rbx"
+    pub current: bool, // es la instrucción en $pc
 }
 
 // ─── Stop reason ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum StopReason {
-    BreakpointHit(u32), // id del breakpoint
+    BreakpointHit(u32),
     EndStepping,
-    Signal(String), // "SIGSEGV", "SIGINT", …
+    Signal(String),
     Unknown,
 }
 
-// ─── Pause state  ────────────────
+// ─── Pause state ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct PauseState {
@@ -58,7 +78,7 @@ pub enum ProgramState {
     Exited { code: Option<i32> },
 }
 
-// ─── Persistent state (sobrevive entre runs) ──────────────────────────────────
+// ─── Persistent state ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct PersistentState {
@@ -66,17 +86,20 @@ pub struct PersistentState {
     pub breakpoints: Vec<Breakpoint>,
 }
 
-// ─── Top-level state ──────────────────────────────────────────────────────────
+// ─── Top-level state ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct DebuggerState {
     pub program: ProgramState,
     pub pause: Option<PauseState>,
     pub locals: Vec<Variable>,
+    pub register_names: Vec<String>, // índice = número de registro
+    pub registers: Vec<Register>,
+    pub disasm: Vec<AsmLine>,
     pub persistent: PersistentState,
 }
 
-// ─── Events ───────────────────────────────────────────────────────────────────
+// ─── Events ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum StateEvent {
@@ -88,6 +111,9 @@ pub enum StateEvent {
     BreakpointRemoved { id: u32 },
     BreakpointToggled { id: u32, enabled: bool },
     LocalsUpdated { vars: Vec<Variable> },
+    RegisterNamesReceived { names: Vec<String> },
+    RegistersUpdated { registers: Vec<Register> },
+    DisasmUpdated { lines: Vec<AsmLine> },
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +128,7 @@ pub enum DebuggerEvent {
     Ui(UiEvent),
 }
 
-// ─── impl DebuggerState ───────────────────────────────────────────────────────
+// ─── impl ────────────────────────────────────────────────────────────────────
 
 impl DebuggerState {
     pub fn new() -> Self {
@@ -110,6 +136,9 @@ impl DebuggerState {
             program: ProgramState::NoProgramLoaded,
             pause: None,
             locals: vec![],
+            register_names: vec![],
+            registers: vec![],
+            disasm: vec![],
             persistent: PersistentState {
                 executable: None,
                 breakpoints: vec![],
@@ -117,7 +146,6 @@ impl DebuggerState {
         }
     }
 
-    /// Única puerta de mutación del estado.
     pub fn apply(&mut self, event: StateEvent) {
         match event {
             StateEvent::ProgramLoaded { executable } => {
@@ -125,12 +153,18 @@ impl DebuggerState {
                 self.persistent.executable = Some(executable);
                 self.pause = None;
                 self.locals = vec![];
+                self.register_names = vec![];
+                self.registers = vec![];
+                self.disasm = vec![];
             }
 
             StateEvent::ProgramStarted => {
                 self.program = ProgramState::Running;
                 self.pause = None;
                 self.locals = vec![];
+                self.register_names = vec![];
+                self.registers = vec![];
+                self.disasm = vec![];
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -142,6 +176,9 @@ impl DebuggerState {
                 self.program = ProgramState::Exited { code };
                 self.pause = None;
                 self.locals = vec![];
+                self.register_names = vec![];
+                self.registers = vec![];
+                self.disasm = vec![];
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -158,13 +195,14 @@ impl DebuggerState {
                 }
             }
 
-            StateEvent::LocalsUpdated { vars } => {
-                self.locals = vars;
-            }
+            StateEvent::LocalsUpdated { vars } => self.locals = vars,
+            StateEvent::RegisterNamesReceived { names } => self.register_names = names,
+            StateEvent::RegistersUpdated { registers } => self.registers = registers,
+            StateEvent::DisasmUpdated { lines } => self.disasm = lines,
         }
     }
 
-    // ── Helpers de consulta (la UI los usa para no acceder a campos raw) ──────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     pub fn is_paused(&self) -> bool {
         matches!(self.program, ProgramState::Paused)
@@ -184,6 +222,10 @@ impl DebuggerState {
 
     pub fn current_function(&self) -> Option<&str> {
         Some(self.pause.as_ref()?.frame.function.as_str())
+    }
+
+    pub fn current_addr(&self) -> Option<u64> {
+        Some(self.pause.as_ref()?.frame.addr)
     }
 
     pub fn breakpoint_at(&self, file: &str, line: u32) -> Option<&Breakpoint> {

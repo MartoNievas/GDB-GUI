@@ -1,6 +1,7 @@
 mod debugger_state;
 
 pub use debugger_state::{
+    AsmLine,
     Breakpoint,
     // Events
     DebuggerEvent,
@@ -10,8 +11,8 @@ pub use debugger_state::{
     Frame,
     PauseState,
 
-    PersistentState,
     ProgramState,
+    Register,
     StateEvent,
     StopReason,
 

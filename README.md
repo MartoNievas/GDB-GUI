@@ -12,3 +12,11 @@ Its goal is to provide a more intuitive and visual debugging experience by allow
 - Interact with GDB through a structured interface instead of the command line
 
 The interface is built using Rust and egui, focusing on simplicity, performance, and portability.
+
+## Usage 
+
+Compile this project with cargo build and then 
+
+```bash
+cargo run <bin file>
+```

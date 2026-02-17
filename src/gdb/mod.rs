@@ -1,5 +1,5 @@
-pub mod parser;
-pub mod process;
-pub mod writer;
+mod parser;
+mod process;
+mod writer;
 
-pub use writer::command_to_mi;
+pub use process::run_loop;
