@@ -43,8 +43,8 @@ pub struct Register {
 pub struct AsmLine {
     pub addr: u64,
     pub offset: u32,
-    pub inst: String,  // "mov rax, rbx"
-    pub current: bool, // es la instrucción en $pc
+    pub inst: String,
+    pub current: bool,
 }
 
 // ─── Stop reason ─────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ pub struct DebuggerState {
     pub program: ProgramState,
     pub pause: Option<PauseState>,
     pub locals: Vec<Variable>,
-    pub register_names: Vec<String>, // índice = número de registro
+    pub register_names: Vec<String>,
     pub registers: Vec<Register>,
     pub disasm: Vec<AsmLine>,
     pub persistent: PersistentState,

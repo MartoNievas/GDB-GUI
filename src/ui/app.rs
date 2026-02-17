@@ -54,7 +54,7 @@ pub struct App {
 
     // UI state
     console_input: String,
-    console_log: Vec<String>, // buffer local de logs UI
+    console_log: Vec<String>,
     watch_tab: WatchTab,
 
     // Collapsible sections

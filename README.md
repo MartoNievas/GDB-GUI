@@ -20,3 +20,5 @@ Compile this project with cargo build and then
 ```bash
 cargo run <bin file>
 ```
+
+![alt text](~/Escritorio/gdb_gui/gdb-gui.png) 
