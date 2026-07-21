@@ -2,13 +2,13 @@ use crate::ui::command::Command;
 
 pub fn command_to_mi(cmd: &Command) -> String {
     match cmd {
-        Command::Run => "-exec-run".into(),
+        Command::Run => "-exec-run --start".into(),
         Command::Continue => "-exec-continue".into(),
         Command::Step => "-exec-step".into(),
         Command::Next => "-exec-next".into(),
         Command::Finish => "-exec-finish".into(),
         Command::Interrupt => "-exec-interrupt".into(),
-        Command::Restart => "-exec-run".into(),
+        Command::Restart => "-exec-run --start".into(),
 
         Command::AddBreakpoint { file, line } => format!("-break-insert {file}:{line}"),
         Command::RemoveBreakpoint(id) => format!("-break-delete {id}"),
@@ -33,6 +33,9 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::RequestDisasm => "-data-disassemble -s $pc -e \"$pc + 64\" -- 0".into(),
 
         Command::Evaluate(expr) => format!("-data-evaluate-expression {expr}"),
+
+        Command::RequestGlobalNames => "-symbol-info-variables".into(),
+        Command::EvaluateGlobal(name) => format!("-data-evaluate-expression {name}"),
 
         Command::Raw(s) => s.clone(),
     }

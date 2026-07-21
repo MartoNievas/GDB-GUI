@@ -1,4 +1,7 @@
 /target
 musicalizer.c
-examples
-
+example
+*.c
+ROADMAP.md
+graphify-out/
+.gdb_history

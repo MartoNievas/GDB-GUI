@@ -14,7 +14,14 @@ pub struct Frame {
 pub struct Breakpoint {
     pub id: u32,
     pub file: String,
+    /// Línea real donde GDB colocó el breakpoint (puede diferir de la pedida:
+    /// al pedir uno en la línea del nombre de una función, GDB lo reubica a la
+    /// primera línea ejecutable del cuerpo).
     pub line: u32,
+    /// Línea originalmente solicitada (de `original-location`), si se conoce.
+    /// Permite que un click sobre esa línea quite el breakpoint aunque GDB lo
+    /// haya movido a otra.
+    pub requested_line: Option<u32>,
     pub enabled: bool,
 }
 
@@ -42,9 +49,7 @@ pub struct Register {
 #[derive(Clone, Debug)]
 pub struct AsmLine {
     pub addr: u64,
-    pub offset: u32,
     pub inst: String,
-    pub current: bool,
 }
 
 // ─── Stop reason ─────────────────────────────────────────────────────────────
@@ -96,6 +101,8 @@ pub struct DebuggerState {
     pub register_names: Vec<String>,
     pub registers: Vec<Register>,
     pub disasm: Vec<AsmLine>,
+    pub global_names: Vec<String>,
+    pub globals: Vec<Variable>,
     pub persistent: PersistentState,
 }
 
@@ -107,6 +114,7 @@ pub enum StateEvent {
     ProgramStarted,
     ProgramPaused { pause: PauseState },
     ProgramExited { code: Option<i32> },
+    StackUpdated { frames: Vec<Frame> },
     BreakpointAdded { breakpoint: Breakpoint },
     BreakpointRemoved { id: u32 },
     BreakpointToggled { id: u32, enabled: bool },
@@ -114,6 +122,8 @@ pub enum StateEvent {
     RegisterNamesReceived { names: Vec<String> },
     RegistersUpdated { registers: Vec<Register> },
     DisasmUpdated { lines: Vec<AsmLine> },
+    GlobalNamesReceived { names: Vec<String> },
+    GlobalValueUpdated { name: String, value: String },
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +149,8 @@ impl DebuggerState {
             register_names: vec![],
             registers: vec![],
             disasm: vec![],
+            global_names: vec![],
+            globals: vec![],
             persistent: PersistentState {
                 executable: None,
                 breakpoints: vec![],
@@ -156,15 +168,19 @@ impl DebuggerState {
                 self.register_names = vec![];
                 self.registers = vec![];
                 self.disasm = vec![];
+                self.global_names = vec![];
+                self.globals = vec![];
             }
 
             StateEvent::ProgramStarted => {
                 self.program = ProgramState::Running;
                 self.pause = None;
                 self.locals = vec![];
-                self.register_names = vec![];
+                // register_names are architecture-static — fetched once on load,
+                // so we keep them across runs instead of wiping and refetching.
                 self.registers = vec![];
                 self.disasm = vec![];
+                self.globals = vec![];
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -172,17 +188,38 @@ impl DebuggerState {
                 self.pause = Some(pause);
             }
 
+            StateEvent::StackUpdated { frames } => {
+                // Llega justo después del *stopped (que solo trae el frame superior);
+                // reemplaza el stack de un solo frame por el completo.
+                if let Some(pause) = &mut self.pause {
+                    if let Some(top) = frames.first() {
+                        pause.frame = top.clone();
+                    }
+                    pause.stack = frames;
+                }
+            }
+
             StateEvent::ProgramExited { code } => {
                 self.program = ProgramState::Exited { code };
                 self.pause = None;
                 self.locals = vec![];
-                self.register_names = vec![];
+                // Keep register_names — same executable, same architecture.
                 self.registers = vec![];
                 self.disasm = vec![];
+                self.globals = vec![];
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
-                self.persistent.breakpoints.push(breakpoint);
+                if let Some(existing) = self
+                    .persistent
+                    .breakpoints
+                    .iter_mut()
+                    .find(|b| b.id == breakpoint.id)
+                {
+                    *existing = breakpoint;
+                } else {
+                    self.persistent.breakpoints.push(breakpoint);
+                }
             }
 
             StateEvent::BreakpointRemoved { id } => {
@@ -199,6 +236,19 @@ impl DebuggerState {
             StateEvent::RegisterNamesReceived { names } => self.register_names = names,
             StateEvent::RegistersUpdated { registers } => self.registers = registers,
             StateEvent::DisasmUpdated { lines } => self.disasm = lines,
+
+            StateEvent::GlobalNamesReceived { names } => self.global_names = names,
+            StateEvent::GlobalValueUpdated { name, value } => {
+                if let Some(existing) = self.globals.iter_mut().find(|v| v.name == name) {
+                    existing.value = value;
+                } else {
+                    self.globals.push(Variable {
+                        name,
+                        value,
+                        type_: String::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -228,16 +278,187 @@ impl DebuggerState {
         Some(self.pause.as_ref()?.frame.addr)
     }
 
+    /// Breakpoint que un click en `line` debe alternar. Coincide con la línea
+    /// real donde GDB lo puso o con la línea originalmente solicitada, de modo
+    /// que se pueda quitar tanto desde la línea del nombre de una función como
+    /// desde la línea ejecutable a la que GDB lo reubicó.
     pub fn breakpoint_at(&self, file: &str, line: u32) -> Option<&Breakpoint> {
+        self.persistent.breakpoints.iter().find(|b| {
+            same_file(&b.file, file) && (b.line == line || b.requested_line == Some(line))
+        })
+    }
+
+    /// ¿Debe dibujarse el marcador de breakpoint en esta línea? Solo en la línea
+    /// real donde GDB detiene la ejecución, no en la solicitada (que GDB pudo
+    /// reubicar), para no mostrar un punto fantasma en dos líneas.
+    pub fn has_breakpoint_marker(&self, file: &str, line: u32) -> bool {
         self.persistent
             .breakpoints
             .iter()
-            .find(|b| b.file == file && b.line == line)
+            .any(|b| b.line == line && same_file(&b.file, file))
     }
+
+    /// Comprueba si `candidate` es redundante: ya existe otro breakpoint (con
+    /// distinto id) en la misma ubicación *resuelta* (archivo + línea real).
+    ///
+    /// Ocurre porque GDB reubica los breakpoints pedidos en líneas no ejecutables
+    /// a la siguiente línea real: p.ej. pedir la línea 11 y la 12 puede acabar en
+    /// la misma línea 12 con dos ids distintos. Devuelve `true` para descartar el
+    /// duplicado y quedarnos con uno solo.
+    pub fn is_duplicate_breakpoint(&self, candidate: &Breakpoint) -> bool {
+        self.persistent.breakpoints.iter().any(|b| {
+            b.id != candidate.id && b.line == candidate.line && same_file(&b.file, &candidate.file)
+        })
+    }
+}
+
+/// Compara dos rutas de archivo de forma tolerante.
+///
+/// GDB puede reportar la ruta de un breakpoint de forma distinta a la del frame
+/// actual (absoluta vs relativa, con o sin prefijos como `./`). Consideramos que
+/// dos rutas apuntan al mismo archivo si son iguales o si la más corta es un
+/// sufijo —por componentes— de la más larga. Comparar por componentes evita
+/// falsos positivos como `foobar.c` vs `bar.c`.
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+
+    let a_comps: Vec<_> = std::path::Path::new(a).components().collect();
+    let b_comps: Vec<_> = std::path::Path::new(b).components().collect();
+    let n = a_comps.len().min(b_comps.len());
+    if n == 0 {
+        return false;
+    }
+
+    a_comps[a_comps.len() - n..] == b_comps[b_comps.len() - n..]
 }
 
 impl Default for DebuggerState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bp(id: u32, file: &str, line: u32) -> Breakpoint {
+        Breakpoint {
+            id,
+            file: file.into(),
+            line,
+            requested_line: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn same_file_matches_absolute_and_relative() {
+        assert!(same_file("/tmp/example.c", "/tmp/example.c"));
+        assert!(same_file("/tmp/example.c", "example.c"));
+        assert!(same_file("example.c", "/tmp/example.c"));
+        assert!(same_file("/home/user/src/example.c", "src/example.c"));
+        assert!(same_file("./example.c", "example.c"));
+    }
+
+    #[test]
+    fn same_file_rejects_different_files() {
+        assert!(!same_file("/tmp/foobar.c", "bar.c"));
+        assert!(!same_file("/tmp/a/example.c", "/tmp/b/example.c"));
+        assert!(!same_file("main.c", "example.c"));
+    }
+
+    // Reproduce el bug: GDB guarda el breakpoint con ruta absoluta, pero el
+    // click consulta con la ruta tal cual la conoce la UI. El toggle debe
+    // encontrar el breakpoint existente en vez de crear un duplicado.
+    #[test]
+    fn breakpoint_at_finds_bp_despite_path_form() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .breakpoints
+            .push(bp(1, "/tmp/example.c", 8));
+
+        assert!(state.breakpoint_at("/tmp/example.c", 8).is_some());
+        assert!(state.breakpoint_at("example.c", 8).is_some());
+        assert!(state.breakpoint_at("/tmp/example.c", 9).is_none());
+    }
+
+    // GDB reubica un breakpoint pedido en la línea del nombre de la función
+    // (línea 6) a la primera línea ejecutable (línea 7). Un nuevo click sobre la
+    // línea 6 debe encontrarlo (vía requested_line) y quitarlo, no duplicarlo.
+    #[test]
+    fn breakpoint_at_matches_requested_and_resolved_line() {
+        let mut state = DebuggerState::new();
+        state.persistent.breakpoints.push(Breakpoint {
+            id: 1,
+            file: "/tmp/example.c".into(),
+            line: 7,
+            requested_line: Some(6),
+            enabled: true,
+        });
+
+        // Click sobre la línea real donde GDB lo puso.
+        assert!(state.breakpoint_at("example.c", 7).is_some());
+        // Click sobre la línea del nombre de la función (la pedida).
+        assert!(state.breakpoint_at("example.c", 6).is_some());
+        // Una línea sin relación no coincide.
+        assert!(state.breakpoint_at("example.c", 5).is_none());
+    }
+
+    // El marcador visual solo debe aparecer en la línea real (7), no en la
+    // solicitada (6), aunque el toggle sí funcione desde ambas.
+    #[test]
+    fn marker_only_on_resolved_line() {
+        let mut state = DebuggerState::new();
+        state.persistent.breakpoints.push(Breakpoint {
+            id: 1,
+            file: "/tmp/example.c".into(),
+            line: 7,
+            requested_line: Some(6),
+            enabled: true,
+        });
+
+        assert!(state.has_breakpoint_marker("example.c", 7));
+        assert!(!state.has_breakpoint_marker("example.c", 6));
+    }
+
+    // Pedir la línea 11 y la 12 puede resolver ambas a la línea 12 con ids
+    // distintos: el segundo es un duplicado que debe descartarse.
+    #[test]
+    fn detects_duplicate_at_resolved_line() {
+        let mut state = DebuggerState::new();
+        state.persistent.breakpoints.push(Breakpoint {
+            id: 1,
+            file: "/tmp/example.c".into(),
+            line: 12,
+            requested_line: Some(11),
+            enabled: true,
+        });
+
+        // Mismo archivo+línea resuelta, id distinto → duplicado.
+        let candidate = Breakpoint {
+            id: 2,
+            file: "/tmp/example.c".into(),
+            line: 12,
+            requested_line: Some(12),
+            enabled: true,
+        };
+        assert!(state.is_duplicate_breakpoint(&candidate));
+
+        // Distinta línea resuelta → no es duplicado.
+        let other = Breakpoint {
+            id: 3,
+            file: "/tmp/example.c".into(),
+            line: 8,
+            requested_line: Some(8),
+            enabled: true,
+        };
+        assert!(!state.is_duplicate_breakpoint(&other));
+
+        // El mismo id (re-emisión del propio breakpoint) no cuenta como duplicado.
+        assert!(!state.is_duplicate_breakpoint(&bp(1, "/tmp/example.c", 12)));
     }
 }

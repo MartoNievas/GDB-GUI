@@ -24,5 +24,9 @@ pub enum Command {
     RequestDisasm,
     Evaluate(String),
 
+    // Globals
+    RequestGlobalNames,
+    EvaluateGlobal(String),
+
     Raw(String),
 }

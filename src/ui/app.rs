@@ -5,6 +5,7 @@ use eframe::egui::{
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::command::Command;
+use super::registers::{RegClass, classify, display_order, is_x86_32_gp};
 use crate::state::{DebuggerEvent, DebuggerState, UiEvent};
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
@@ -27,6 +28,16 @@ const TXT_MUTED: Color32 = Color32::from_rgb(0x77, 0x77, 0x77);
 const TXT_CYAN: Color32 = Color32::from_rgb(0x7e, 0xc8, 0xe3);
 const TXT_YELLOW: Color32 = Color32::from_rgb(0xe8, 0xc9, 0x7d);
 const TXT_HL: Color32 = Color32::from_rgb(0xd4, 0xf0, 0xd4);
+
+// ─── Register groups (categoría → etiqueta + color) ───────────────────────────
+// Orden en que se muestran los grupos en la pestaña Registers.
+const REG_GROUPS: [(RegClass, &str, Color32); 5] = [
+    (RegClass::General, "General purpose", TXT_CYAN),
+    (RegClass::Control, "Control / flags", ACCENT),
+    (RegClass::Segment, "Segment", TXT_MUTED),
+    (RegClass::Simd, "SIMD / FP", BLUE),
+    (RegClass::Other, "Other", TXT_DIM),
+];
 
 // ─── UI-only tab state ────────────────────────────────────────────────────────
 
@@ -111,13 +122,6 @@ impl App {
             return;
         }
 
-        self.console_log
-            .push(format!("[DEBUG] GDB says file is: {:?}", target_file));
-        self.console_log.push(format!(
-            "[DEBUG] Current dir: {:?}",
-            std::env::current_dir()
-        ));
-
         let content = self.try_load_source(&target_file);
 
         match content {
@@ -186,17 +190,43 @@ impl eframe::App for App {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 DebuggerEvent::State(s) => {
+                    // GDB puede crear un segundo breakpoint en la misma línea resuelta
+                    // (p.ej. al pedir la línea 11 y la 12, ambas caen en la 12). Descartamos
+                    // el redundante y lo borramos de GDB para no duplicar.
+                    if let crate::state::StateEvent::BreakpointAdded { breakpoint } = &s {
+                        if self.state.is_duplicate_breakpoint(breakpoint) {
+                            self.send(Command::RemoveBreakpoint(breakpoint.id));
+                            continue;
+                        }
+                    }
+
                     let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
                     let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
+                    let new_global_names =
+                        if let crate::state::StateEvent::GlobalNamesReceived { names } = &s {
+                            Some(names.clone())
+                        } else {
+                            None
+                        };
                     self.state.apply(s);
                     self.load_source_if_needed();
                     if was_loaded {
                         self.send(Command::RequestRegisterNames);
+                        self.send(Command::RequestGlobalNames);
                     }
                     if was_paused {
                         self.send(Command::RequestLocals);
+                        self.send(Command::RequestStack);
                         self.send(Command::RequestRegisters);
                         self.send(Command::RequestDisasm);
+                        for name in self.state.global_names.clone() {
+                            self.send(Command::EvaluateGlobal(name));
+                        }
+                    }
+                    if let Some(names) = new_global_names {
+                        for name in names {
+                            self.send(Command::EvaluateGlobal(name));
+                        }
                     }
                 }
                 DebuggerEvent::Ui(UiEvent::ConsoleOutput(text)) => {
@@ -353,312 +383,371 @@ impl eframe::App for App {
             .default_width(280.0)
             .frame(flat(BG_PANEL))
             .show(ctx, |ui| {
-                // Upper collapsible sections
-                ScrollArea::vertical()
-                    .id_salt("right_upper")
-                    .max_height(ui.available_height() * 0.52)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
+                // Upper collapsible sections — drag the divider below to resize
+                egui::TopBottomPanel::top("right_upper_panel")
+                    .resizable(true)
+                    .default_height(ui.available_height() * 0.52)
+                    .frame(flat(BG_PANEL))
+                    .show_inside(ui, |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("right_upper")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
 
-                        // BREAKPOINTS ──────────────────────────────────────────
-                        sec_hdr(ui, "Breakpoints", &mut self.open_bp);
-                        if self.open_bp {
-                            egui::Grid::new("bp_grid")
-                                .num_columns(3)
-                                .spacing([8.0, 2.0])
-                                .show(ui, |ui| {
-                                    for h in ["File", "Line", ""] {
-                                        ui.label(m(h, 11.0, TXT_DIM));
-                                    }
-                                    ui.end_row();
+                                // BREAKPOINTS ──────────────────────────────────────────
+                                sec_hdr(ui, "Breakpoints", &mut self.open_bp);
+                                if self.open_bp {
+                                    egui::Grid::new("bp_grid")
+                                        .num_columns(3)
+                                        .spacing([8.0, 2.0])
+                                        .show(ui, |ui| {
+                                            for h in ["File", "Line", ""] {
+                                                ui.label(m(h, 11.0, TXT_DIM));
+                                            }
+                                            ui.end_row();
 
-                                    for bp in &self.state.persistent.breakpoints {
-                                        // Nombre corto del archivo
-                                        let short_file = bp
-                                            .file
-                                            .split('/')
-                                            .last()
-                                            .or_else(|| bp.file.split('\\').last())
-                                            .unwrap_or(&bp.file);
+                                            for bp in &self.state.persistent.breakpoints {
+                                                // Nombre corto del archivo
+                                                let short_file = bp
+                                                    .file
+                                                    .split('/')
+                                                    .last()
+                                                    .or_else(|| bp.file.split('\\').last())
+                                                    .unwrap_or(&bp.file);
 
-                                        ui.label(m(short_file, 12.0, TXT_CYAN));
-                                        ui.label(m(&bp.line.to_string(), 12.0, TXT_YELLOW));
+                                                ui.label(m(short_file, 12.0, TXT_CYAN));
+                                                ui.label(m(&bp.line.to_string(), 12.0, TXT_YELLOW));
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(m("×", 12.0, RED))
+                                                            .fill(Color32::TRANSPARENT)
+                                                            .stroke(Stroke::NONE),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.send(Command::RemoveBreakpoint(bp.id));
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                                hl(ui);
+
+                                // COMMANDS ──────────────────────────────────────────────
+                                sec_hdr(ui, "Commands", &mut self.open_cmd);
+                                if self.open_cmd {
+                                    for cmd_str in &[
+                                        "info locals",
+                                        "bt full",
+                                        "info registers",
+                                        "info threads",
+                                    ] {
                                         if ui
                                             .add(
-                                                egui::Button::new(m("×", 12.0, RED))
+                                                egui::Button::new(m(cmd_str, 11.0, TXT_CYAN))
                                                     .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::NONE),
+                                                    .stroke(Stroke::NONE)
+                                                    .min_size(Vec2::new(
+                                                        ui.available_width(),
+                                                        18.0,
+                                                    )),
                                             )
                                             .clicked()
                                         {
-                                            self.send(Command::RemoveBreakpoint(bp.id));
+                                            self.send(Command::Raw(cmd_str.to_string()));
                                         }
-                                        ui.end_row();
                                     }
-                                });
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
-
-                        // COMMANDS ──────────────────────────────────────────────
-                        sec_hdr(ui, "Commands", &mut self.open_cmd);
-                        if self.open_cmd {
-                            for cmd_str in
-                                &["info locals", "bt full", "info registers", "info threads"]
-                            {
-                                if ui
-                                    .add(
-                                        egui::Button::new(m(cmd_str, 11.0, TXT_CYAN))
-                                            .fill(Color32::TRANSPARENT)
-                                            .stroke(Stroke::NONE)
-                                            .min_size(Vec2::new(ui.available_width(), 18.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.send(Command::Raw(cmd_str.to_string()));
+                                    ui.add_space(4.0);
                                 }
-                            }
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
+                                hl(ui);
 
-                        // STRUCT ────────────────────────────────────────────────
-                        sec_hdr(ui, "Struct", &mut self.open_struct);
-                        if self.open_struct {
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new("No struct selected")
-                                        .color(TXT_DIM)
-                                        .font(FontId::monospace(11.0))
-                                        .italics(),
-                                );
-                            });
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
+                                // STRUCT ────────────────────────────────────────────────
+                                sec_hdr(ui, "Struct", &mut self.open_struct);
+                                if self.open_struct {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new("No struct selected")
+                                                .color(TXT_DIM)
+                                                .font(FontId::monospace(11.0))
+                                                .italics(),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                }
+                                hl(ui);
 
-                        // STACK ─────────────────────────────────────────────────
-                        sec_hdr(ui, "Stack", &mut self.open_stack);
-                        if self.open_stack {
-                            if let Some(pause) = &self.state.pause {
-                                egui::Grid::new("stack_grid")
-                                    .num_columns(3)
-                                    .spacing([6.0, 2.0])
-                                    .show(ui, |ui| {
-                                        for h in ["#", "Function", "Location"] {
-                                            ui.label(m(h, 11.0, TXT_DIM));
-                                        }
-                                        ui.end_row();
+                                // STACK ─────────────────────────────────────────────────
+                                sec_hdr(ui, "Stack", &mut self.open_stack);
+                                if self.open_stack {
+                                    if let Some(pause) = &self.state.pause {
+                                        egui::Grid::new("stack_grid")
+                                            .num_columns(3)
+                                            .spacing([6.0, 2.0])
+                                            .show(ui, |ui| {
+                                                for h in ["#", "Function", "Location"] {
+                                                    ui.label(m(h, 11.0, TXT_DIM));
+                                                }
+                                                ui.end_row();
 
-                                        for (idx, frame) in pause.stack.iter().enumerate() {
-                                            let active = idx == 0;
+                                                for (idx, frame) in pause.stack.iter().enumerate() {
+                                                    let active = idx == 0;
 
-                                            let (stripe, _) = ui.allocate_exact_size(
-                                                Vec2::new(2.0, 14.0),
+                                                    let (stripe, _) = ui.allocate_exact_size(
+                                                        Vec2::new(2.0, 14.0),
+                                                        Sense::hover(),
+                                                    );
+                                                    if active {
+                                                        ui.painter().rect_filled(stripe, 0.0, BLUE);
+                                                    }
+
+                                                    let fn_col =
+                                                        if active { BLUE } else { TXT_CYAN };
+                                                    ui.label(m(&idx.to_string(), 11.0, TXT_DIM));
+                                                    ui.label(m(&frame.function, 11.0, fn_col));
+
+                                                    let loc = if let (Some(file), Some(line)) =
+                                                        (&frame.file, frame.line)
+                                                    {
+                                                        let short = file
+                                                            .split('/')
+                                                            .last()
+                                                            .or_else(|| file.split('\\').last())
+                                                            .unwrap_or(file);
+                                                        format!("{short}:{line}")
+                                                    } else {
+                                                        format!("0x{:x}", frame.addr)
+                                                    };
+                                                    ui.label(m(&loc, 11.0, TXT_MUTED));
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    } else {
+                                        ui.label(m("Not paused", 11.0, TXT_DIM).italics());
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                                hl(ui);
+
+                                // FILES ─────────────────────────────────────────────────
+                                sec_hdr(ui, "Files", &mut self.open_files);
+                                if self.open_files {
+                                    if let Some(exe) = &self.state.persistent.executable {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(m(&format!("📄 {exe}"), 11.0, TXT_CYAN));
+                                        });
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                                hl(ui);
+
+                                // THREAD ────────────────────────────────────────────────
+                                sec_hdr(ui, "Thread", &mut self.open_thread);
+                                if self.open_thread {
+                                    if let Some(pause) = &self.state.pause {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(8.0);
+                                            let (r, _) = ui.allocate_exact_size(
+                                                Vec2::splat(8.0),
                                                 Sense::hover(),
                                             );
-                                            if active {
-                                                ui.painter().rect_filled(stripe, 0.0, BLUE);
-                                            }
-
-                                            let fn_col = if active { BLUE } else { TXT_CYAN };
-                                            ui.label(m(&idx.to_string(), 11.0, TXT_DIM));
-                                            ui.label(m(&frame.function, 11.0, fn_col));
-
-                                            let loc = if let (Some(file), Some(line)) =
-                                                (&frame.file, frame.line)
-                                            {
-                                                let short = file
-                                                    .split('/')
-                                                    .last()
-                                                    .or_else(|| file.split('\\').last())
-                                                    .unwrap_or(file);
-                                                format!("{short}:{line}")
-                                            } else {
-                                                format!("0x{:x}", frame.addr)
-                                            };
-                                            ui.label(m(&loc, 11.0, TXT_MUTED));
-                                            ui.end_row();
-                                        }
-                                    });
-                            } else {
-                                ui.label(m("Not paused", 11.0, TXT_DIM).italics());
-                            }
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
-
-                        // FILES ─────────────────────────────────────────────────
-                        sec_hdr(ui, "Files", &mut self.open_files);
-                        if self.open_files {
-                            if let Some(exe) = &self.state.persistent.executable {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
-                                    ui.label(m(&format!("📄 {exe}"), 11.0, TXT_CYAN));
-                                });
-                            }
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
-
-                        // THREAD ────────────────────────────────────────────────
-                        sec_hdr(ui, "Thread", &mut self.open_thread);
-                        if self.open_thread {
-                            if let Some(pause) = &self.state.pause {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
-                                    let (r, _) =
-                                        ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                    ui.painter().circle_filled(r.center(), 4.0, ACCENT);
+                                            ui.painter().circle_filled(r.center(), 4.0, ACCENT);
+                                            ui.add_space(4.0);
+                                            ui.label(m(
+                                                &format!("Thread {}", pause.thread_id),
+                                                11.0,
+                                                TXT_MUTED,
+                                            ));
+                                        });
+                                    }
                                     ui.add_space(4.0);
-                                    ui.label(m(
-                                        &format!("Thread {}", pause.thread_id),
-                                        11.0,
-                                        TXT_MUTED,
-                                    ));
-                                });
-                            }
-                            ui.add_space(4.0);
-                        }
-                        hl(ui);
+                                }
+                                hl(ui);
+                            });
                     });
 
-                // Watch / Registers / Data tabs ───────────────────────────────
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    for (label, tab) in [
-                        ("Watch", WatchTab::Watch),
-                        ("Registers", WatchTab::Registers),
-                        ("Data", WatchTab::Data),
-                    ] {
-                        let active = self.watch_tab == tab;
-                        let col = if active {
-                            Color32::from_rgb(0xe0, 0xe0, 0xe0)
-                        } else {
-                            TXT_DIM
-                        };
-                        let fill = if active {
-                            BG_HOVER
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        let resp = ui.add(
-                            egui::Button::new(m(label, 12.0, col))
-                                .fill(fill)
-                                .stroke(Stroke::NONE)
-                                .min_size(Vec2::new(0.0, 24.0)),
-                        );
-                        if active {
-                            let r = resp.rect;
-                            ui.painter().line_segment(
-                                [r.left_bottom(), r.right_bottom()],
-                                Stroke::new(2.0, ACCENT),
-                            );
-                        }
-                        if resp.clicked() {
-                            self.watch_tab = tab;
-                        }
-                    }
-                });
-                hl(ui);
-
-                // Tab body ──────────────────────────────────────────────────────
-                ScrollArea::vertical().id_salt("watch_body").show(ui, |ui| {
-                    ui.add_space(2.0);
-                    match self.watch_tab {
-                        WatchTab::Watch => {
-                            for var in &self.state.locals {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
-                                    ui.label(m(&var.name, 11.0, TXT_CYAN));
-                                    ui.label(m(" = ", 11.0, TXT_DIM));
-                                    ui.label(m(&var.value, 11.0, TXT_YELLOW));
-                                });
-                            }
-                            if self.state.locals.is_empty() {
-                                ui.label(m("No locals", 11.0, TXT_DIM).italics());
-                            }
-                        }
-                        WatchTab::Registers => {
-                            // DEBUG info
-                            ui.label(m(
-                                &format!(
-                                    "registers: {}  names: {}",
-                                    self.state.registers.len(),
-                                    self.state.register_names.len()
-                                ),
-                                10.0,
-                                TXT_MUTED,
-                            ));
-
-                            if self.state.registers.is_empty() {
-                                ui.label(
-                                    m("Not paused — no register data", 11.0, TXT_DIM).italics(),
+                // Watch / Registers / Data tabs — fill the remaining space
+                egui::CentralPanel::default()
+                    .frame(flat(BG_PANEL))
+                    .show_inside(ui, |ui| {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            for (label, tab) in [
+                                ("Watch", WatchTab::Watch),
+                                ("Registers", WatchTab::Registers),
+                                ("Data", WatchTab::Data),
+                            ] {
+                                let active = self.watch_tab == tab;
+                                let col = if active {
+                                    Color32::from_rgb(0xe0, 0xe0, 0xe0)
+                                } else {
+                                    TXT_DIM
+                                };
+                                let fill = if active {
+                                    BG_HOVER
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let resp = ui.add(
+                                    egui::Button::new(m(label, 12.0, col))
+                                        .fill(fill)
+                                        .stroke(Stroke::NONE)
+                                        .min_size(Vec2::new(0.0, 24.0)),
                                 );
-                            } else {
-                                let names = &self.state.register_names;
-
-                                let mut all: Vec<(String, &str)> = self
-                                    .state
-                                    .registers
-                                    .iter()
-                                    .map(|r| {
-                                        let name = names
-                                            .get(r.number as usize)
-                                            .cloned()
-                                            .unwrap_or_else(|| format!("#{}", r.number));
-                                        (name, r.value.as_str())
-                                    })
-                                    .collect();
-
-                                all.sort_by_key(|(name, _)| display_order(name));
-
-                                // Mostrar todos (sin filtro) para debug
-                                let show_all = all.iter().take(30);
-
-                                egui::Grid::new("reg_grid")
-                                    .num_columns(2)
-                                    .spacing([12.0, 1.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for (name, value) in show_all {
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(8.0);
-                                                let col = if is_general_purpose(name) {
-                                                    TXT_CYAN
-                                                } else {
-                                                    TXT_DIM // gris = filtrado normalmente
-                                                };
-                                                ui.label(m(name, 11.0, col));
-                                            });
-                                            ui.label(m(value, 11.0, TXT_YELLOW));
-                                            ui.end_row();
-                                        }
-                                    });
-                            }
-                        }
-                        WatchTab::Data => {
-                            if self.state.disasm.is_empty() {
-                                ui.label(m("Not paused", 11.0, TXT_DIM).italics());
-                            } else {
-                                for asm in &self.state.disasm {
-                                    let col = if asm.current { TXT_HL } else { TXT };
-                                    ui.horizontal(|ui| {
-                                        if asm.current {
-                                            ui.label(m("▶", 11.0, ACCENT));
-                                        } else {
-                                            ui.add_space(14.0);
-                                        }
-                                        ui.label(m(&format!("0x{:x}", asm.addr), 11.0, TXT_DIM));
-                                        ui.add_space(6.0);
-                                        ui.label(m(&asm.inst, 11.0, col));
-                                    });
+                                if active {
+                                    let r = resp.rect;
+                                    ui.painter().line_segment(
+                                        [r.left_bottom(), r.right_bottom()],
+                                        Stroke::new(2.0_f32, ACCENT),
+                                    );
+                                }
+                                if resp.clicked() {
+                                    self.watch_tab = tab;
                                 }
                             }
-                        }
-                    }
-                });
+                        });
+                        hl(ui);
+
+                        // Tab body ──────────────────────────────────────────────────────
+                        ScrollArea::vertical()
+                            .id_salt("watch_body")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_space(2.0);
+                                match self.watch_tab {
+                                    WatchTab::Watch => {
+                                        for var in &self.state.locals {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label(m(&var.name, 11.0, TXT_CYAN));
+                                                ui.label(m(" = ", 11.0, TXT_DIM));
+                                                ui.label(m(&var.value, 11.0, TXT_YELLOW));
+                                            });
+                                        }
+                                        if self.state.locals.is_empty() {
+                                            ui.label(m("No locals", 11.0, TXT_DIM).italics());
+                                        }
+
+                                        if !self.state.globals.is_empty() {
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label(m("Globals", 10.0, TXT_DIM).italics());
+                                            });
+                                            for var in &self.state.globals {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(8.0);
+                                                    ui.label(m(&var.name, 11.0, TXT_CYAN));
+                                                    ui.label(m(" = ", 11.0, TXT_DIM));
+                                                    ui.label(m(&var.value, 11.0, TXT_YELLOW));
+                                                });
+                                            }
+                                        }
+                                    }
+                                    WatchTab::Registers => {
+                                        if self.state.registers.is_empty() {
+                                            ui.label(
+                                                m("Not paused — no register data", 11.0, TXT_DIM)
+                                                    .italics(),
+                                            );
+                                        } else {
+                                            let names = &self.state.register_names;
+                                            // En x86-64, eax/ebx/... son la parte baja
+                                            // de rax/rbx/...; solo las ocultamos si el
+                                            // registro de 64 bits está presente.
+                                            let is_x86_64 = names.iter().any(|n| n == "rax");
+
+                                            // (nombre, valor, categoría)
+                                            let rows: Vec<(String, &str, RegClass)> = self
+                                                .state
+                                                .registers
+                                                .iter()
+                                                .filter_map(|r| {
+                                                    // GDB deja algunos slots con nombre
+                                                    // vacío; mostramos solo los que tienen
+                                                    // nombre real.
+                                                    let name = names.get(r.number as usize)?;
+                                                    if name.is_empty() {
+                                                        return None;
+                                                    }
+                                                    if is_x86_64 && is_x86_32_gp(name) {
+                                                        return None;
+                                                    }
+                                                    let class = classify(name);
+                                                    Some((name.clone(), r.value.as_str(), class))
+                                                })
+                                                .collect();
+
+                                            for (class, label, color) in REG_GROUPS {
+                                                let mut group: Vec<_> = rows
+                                                    .iter()
+                                                    .filter(|(_, _, c)| *c == class)
+                                                    .collect();
+                                                if group.is_empty() {
+                                                    continue;
+                                                }
+                                                // El grupo general va en orden convencional;
+                                                // el resto conserva el orden de GDB.
+                                                if class == RegClass::General {
+                                                    group.sort_by_key(|(name, _, _)| {
+                                                        display_order(name)
+                                                    });
+                                                }
+
+                                                ui.add_space(4.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(8.0);
+                                                    ui.label(m(label, 10.0, TXT_MUTED).italics());
+                                                });
+
+                                                egui::Grid::new(label)
+                                                    .num_columns(2)
+                                                    .spacing([12.0, 1.0])
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        for (name, value, _) in &group {
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(8.0);
+                                                                ui.label(m(name, 11.0, color));
+                                                            });
+                                                            ui.label(m(value, 11.0, TXT_YELLOW));
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            }
+                                        }
+                                    }
+                                    WatchTab::Data => {
+                                        if self.state.disasm.is_empty() {
+                                            ui.label(m("Not paused", 11.0, TXT_DIM).italics());
+                                        } else {
+                                            let cur_addr = self.state.current_addr();
+                                            for asm in &self.state.disasm {
+                                                let is_current = Some(asm.addr) == cur_addr;
+                                                let col = if is_current { TXT_HL } else { TXT };
+                                                ui.horizontal(|ui| {
+                                                    if is_current {
+                                                        ui.label(m("▶", 11.0, ACCENT));
+                                                    } else {
+                                                        ui.add_space(14.0);
+                                                    }
+                                                    ui.label(m(
+                                                        &format!("0x{:x}", asm.addr),
+                                                        11.0,
+                                                        TXT_DIM,
+                                                    ));
+                                                    ui.add_space(6.0);
+                                                    ui.label(m(&asm.inst, 11.0, col));
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                    });
             });
 
         // ── SOURCE VIEW (central) ─────────────────────────────────────────────
@@ -677,12 +766,23 @@ impl eframe::App for App {
 
                     for line in &self.source_lines {
                         let is_current = Some(line.number) == current_line;
-                        let has_bp = self
-                            .state
-                            .breakpoint_at(self.source_file.as_deref().unwrap_or(""), line.number)
-                            .is_some();
+                        let file_ref = self.source_file.as_deref().unwrap_or("");
+                        // El marcador solo se dibuja en la línea real donde GDB para;
+                        // el toggle admite además la línea solicitada (por si GDB reubicó).
+                        let has_bp = self.state.has_breakpoint_marker(file_ref, line.number);
+                        let bp_id = self.state.breakpoint_at(file_ref, line.number).map(|b| b.id);
 
-                        source_row(ui, line.number, &line.text, is_current, has_bp);
+                        let response = source_row(ui, line.number, &line.text, is_current, has_bp);
+                        if response.clicked() {
+                            if let Some(id) = bp_id {
+                                self.send(Command::RemoveBreakpoint(id));
+                            } else if let Some(file) = self.source_file.clone() {
+                                self.send(Command::AddBreakpoint {
+                                    file,
+                                    line: line.number,
+                                });
+                            }
+                        }
                     }
                 });
             });
@@ -691,11 +791,23 @@ impl eframe::App for App {
 
 // ─── Source row ───────────────────────────────────────────────────────────────
 
-fn source_row(ui: &mut egui::Ui, line_no: u32, code: &str, is_current: bool, has_bp: bool) {
-    let (rect, _) = ui.allocate_exact_size(
+fn source_row(
+    ui: &mut egui::Ui,
+    line_no: u32,
+    code: &str,
+    is_current: bool,
+    has_bp: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
         Vec2::new(f32::max(ui.available_width(), 900.0), 18.0),
-        Sense::hover(),
+        Sense::click(),
     );
+
+    if response.hovered() {
+        ui.ctx()
+            .output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+
     let p = ui.painter();
     let cy = rect.center().y;
 
@@ -703,7 +815,7 @@ fn source_row(ui: &mut egui::Ui, line_no: u32, code: &str, is_current: bool, has
         p.rect_filled(rect, 0.0, BG_LINE_HL);
         p.line_segment(
             [rect.left_top(), rect.left_bottom()],
-            Stroke::new(2.0, ACCENT),
+            Stroke::new(2.0_f32, ACCENT),
         );
     }
 
@@ -728,6 +840,8 @@ fn source_row(ui: &mut egui::Ui, line_no: u32, code: &str, is_current: bool, has
         FontId::monospace(12.5),
         if is_current { TXT_HL } else { TXT },
     );
+
+    response
 }
 
 // ─── Micro-helpers ────────────────────────────────────────────────────────────
@@ -760,7 +874,7 @@ fn tbtn(ui: &mut egui::Ui, label: &str, accent: bool) -> egui::Response {
         } else {
             BG_TOPBAR
         })
-        .stroke(Stroke::new(1.0, SEP_COLOR))
+        .stroke(Stroke::new(1.0_f32, SEP_COLOR))
         .min_size(Vec2::new(0.0, 22.0)),
     )
 }
@@ -787,7 +901,7 @@ fn sec_hdr(ui: &mut egui::Ui, label: &str, open: &mut bool) {
 fn hl(ui: &mut egui::Ui) {
     let y = ui.cursor().top();
     ui.painter()
-        .hline(ui.max_rect().x_range(), y, Stroke::new(1.0, SEP_COLOR));
+        .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, SEP_COLOR));
     ui.add_space(1.0);
 }
 
@@ -798,70 +912,10 @@ fn apply_theme(ctx: &egui::Context) {
     v.extreme_bg_color = BG_CONSOLE;
     v.faint_bg_color = BG_TOPBAR;
     v.widgets.noninteractive.bg_fill = BG_TOPBAR;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, SEP_COLOR);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, SEP_COLOR);
     v.widgets.inactive.bg_fill = BG_TOPBAR;
     v.widgets.hovered.bg_fill = BG_HOVER;
     v.widgets.active.bg_fill = BG_HOVER;
     v.override_text_color = Some(TXT);
     ctx.set_visuals(v);
-}
-
-// ─── Register filter ─────────────────────────────────────────────────────────
-
-fn is_general_purpose(name: &str) -> bool {
-    matches!(
-        name,
-        // x86-64
-        "rax" | "rbx" | "rcx" | "rdx"
-        | "rsi" | "rdi" | "rbp" | "rsp"
-        | "r8"  | "r9"  | "r10" | "r11"
-        | "r12" | "r13" | "r14" | "r15"
-        | "rip" | "rflags" | "eflags"
-        // x86-32
-        | "eax" | "ebx" | "ecx" | "edx"
-        | "esi" | "edi" | "ebp" | "esp" | "eip"
-        // ARM64
-        | "x0"  | "x1"  | "x2"  | "x3"  | "x4"  | "x5"  | "x6"  | "x7"
-        | "x8"  | "x9"  | "x10" | "x11" | "x12" | "x13" | "x14" | "x15"
-        | "x16" | "x17" | "x18" | "x19" | "x20" | "x21" | "x22" | "x23"
-        | "x24" | "x25" | "x26" | "x27" | "x28" | "x29" | "x30"
-        | "sp" | "pc" | "cpsr"
-        // RISC-V
-        | "zero" | "ra" | "gp" | "tp"
-        | "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7"
-        | "s0" | "s1" | "t0" | "t1" | "t2" | "t3" | "t4" | "t5" | "t6"
-    )
-}
-
-fn display_order(name: &str) -> u32 {
-    match name {
-        "rax" => 0,
-        "rbx" => 1,
-        "rcx" => 2,
-        "rdx" => 3,
-        "rsi" => 4,
-        "rdi" => 5,
-        "rbp" => 6,
-        "rsp" => 7,
-        "r8" => 8,
-        "r9" => 9,
-        "r10" => 10,
-        "r11" => 11,
-        "r12" => 12,
-        "r13" => 13,
-        "r14" => 14,
-        "r15" => 15,
-        "rip" => 16,
-        "rflags" | "eflags" => 17,
-        "eax" => 0,
-        "ebx" => 1,
-        "ecx" => 2,
-        "edx" => 3,
-        "esi" => 4,
-        "edi" => 5,
-        "ebp" => 6,
-        "esp" => 7,
-        "eip" => 16,
-        _ => 99,
-    }
 }

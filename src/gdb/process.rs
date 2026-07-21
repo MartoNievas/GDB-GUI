@@ -1,11 +1,12 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{Receiver, Sender},
     thread,
 };
 
-use super::parser::parse_line;
+use super::parser::{extract_str, parse_line};
 use super::writer::command_to_mi;
 use crate::state::{DebuggerEvent, StateEvent, UiEvent};
 use crate::ui::command::Command as DebuggerCommand;
@@ -32,6 +33,7 @@ fn spawn_gdb(
     let mut cmd = Command::new("gdb");
     cmd.arg("--interpreter=mi")
         .arg("--quiet")
+        .arg("-nx")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -99,9 +101,19 @@ pub fn run_loop(
         }
     });
 
+    // Cola FIFO de nombres de variables globales pendientes de evaluar. GDB responde a
+    // comandos síncronos (-data-evaluate-expression, etc.) en el mismo orden en que se
+    // mandan, así que podemos correlacionar cada "^done,value=..." sin nombre propio con
+    // el nombre que le corresponde simplemente desencolando en orden de llegada.
+    let mut pending_globals: VecDeque<String> = VecDeque::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = command_to_mi(&cmd);
+
+            if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
+                pending_globals.push_back(name.clone());
+            }
 
             let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!("> {mi}"))));
 
@@ -112,10 +124,42 @@ pub fn run_loop(
                 let _ = child.kill();
                 return;
             }
+
+            // GDB responde a `-break-delete` con un simple `^done` sin `=breakpoint-deleted`
+            // ni el id borrado, así que la respuesta no se puede correlacionar. Emitimos el
+            // evento de eliminación nosotros mismos para que la UI lo refleje.
+            if let DebuggerCommand::RemoveBreakpoint(id) = &cmd {
+                let _ = event_tx.send(DebuggerEvent::State(StateEvent::BreakpointRemoved {
+                    id: *id,
+                }));
+            }
         }
 
         while let Ok(line) = line_rx.try_recv() {
-            let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(line.clone())));
+            // Los stream records (~ @ &) los convierte parse_line en texto limpio;
+            // echoar además la línea cruda duplicaría la salida en la consola.
+            let first = line
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .chars()
+                .next();
+            let is_stream = matches!(first, Some('~') | Some('@') | Some('&'));
+            if !is_stream {
+                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(line.clone())));
+            }
+
+            if !pending_globals.is_empty() && is_bare_value_done(&line) {
+                if let Some(name) = pending_globals.pop_front() {
+                    if let Some(value) = extract_str(&line, "value") {
+                        let event =
+                            DebuggerEvent::State(StateEvent::GlobalValueUpdated { name, value });
+                        if event_tx.send(event).is_err() {
+                            let _ = child.kill();
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
 
             if let Some(event) = parse_line(&line) {
                 // None = línea ignorable, no es error
@@ -128,4 +172,13 @@ pub fn run_loop(
 
         thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+/// true si la línea es exactamente `^done,value="..."`, la respuesta de
+/// -data-evaluate-expression sin ningún otro campo.
+fn is_bare_value_done(line: &str) -> bool {
+    line.trim_start_matches(|c: char| c.is_ascii_digit())
+        .starts_with("^done,value=\"")
 }
