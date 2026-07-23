@@ -7,7 +7,6 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::Step => "-exec-step".into(),
         Command::Next => "-exec-next".into(),
         Command::Finish => "-exec-finish".into(),
-        Command::Interrupt => "-exec-interrupt".into(),
         Command::Restart => "-exec-run --start".into(),
 
         Command::AddBreakpoint {
@@ -43,6 +42,32 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::EvaluateGlobal(name) => format!("-data-evaluate-expression {name}"),
 
         Command::Raw(s) => s.clone(),
+
+        // Interrupt no es un comando MI: se despacha como señal (SIGINT) desde
+        // `dispatch`, que lo intercepta antes de llegar acá.
+        Command::Interrupt => unreachable!("Interrupt is signal-dispatched via dispatch(), never MI"),
+    }
+}
+
+/// Cómo debe ejecutarse un `Command`: como texto MI escrito al stdin de GDB, o
+/// como una señal al proceso.
+///
+/// `Interrupt` es el único comando que se emite mientras el inferior CORRE. En
+/// modo síncrono GDB no lee su stdin en ese momento, así que un `-exec-interrupt`
+/// por el pipe no tendría efecto; debe mandarse como SIGINT. El resto de los
+/// comandos se emiten con el programa detenido, cuando GDB sí lee su stdin.
+pub enum GdbAction {
+    /// Texto MI para escribir al stdin de GDB.
+    Mi(String),
+    /// Frenar el inferior mandándole una señal al proceso de GDB.
+    Interrupt,
+}
+
+/// Clasifica un `Command` en la acción de transporte que le corresponde.
+pub fn dispatch(cmd: &Command) -> GdbAction {
+    match cmd {
+        Command::Interrupt => GdbAction::Interrupt,
+        other => GdbAction::Mi(command_to_mi(other)),
     }
 }
 
@@ -149,5 +174,28 @@ mod tests {
     #[test]
     fn break_condition_builder_clears_with_no_trailing_arg() {
         assert_eq!(build_break_condition(3, ""), "-break-condition 3");
+    }
+
+    // ─── Interrupt dispatch (Option A: SIGINT, not an MI command) ──────────────
+    //
+    // Interrupt is the only command issued while the inferior is RUNNING. In
+    // synchronous mode GDB does not read its stdin then, so `-exec-interrupt`
+    // written to the pipe is a no-op. It must be routed to a signal instead —
+    // this test pins that routing decision.
+
+    #[test]
+    fn interrupt_is_dispatched_as_a_signal_not_mi() {
+        assert!(
+            matches!(dispatch(&Command::Interrupt), GdbAction::Interrupt),
+            "Interrupt must be routed to the signal path, never written as MI"
+        );
+    }
+
+    #[test]
+    fn execution_commands_are_dispatched_as_mi() {
+        match dispatch(&Command::Continue) {
+            GdbAction::Mi(mi) => assert_eq!(mi, "-exec-continue"),
+            GdbAction::Interrupt => panic!("Continue must be an MI command, not a signal"),
+        }
     }
 }

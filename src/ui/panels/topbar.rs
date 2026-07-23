@@ -28,6 +28,9 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         if tbtn(ui, "Finish", false).clicked() {
             app.send(Command::Finish);
         }
+        if tbtn(ui, "Interrupt", false).clicked() {
+            app.send(Command::Interrupt);
+        }
         if tbtn(ui, "Restart", false).clicked() {
             app.send(Command::Restart);
         }

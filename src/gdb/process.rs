@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::parser::{extract_str, parse_line, parse_token};
-use super::writer::command_to_mi;
+use super::writer::{GdbAction, dispatch};
 use crate::state::{DebuggerEvent, StateEvent, UiEvent};
 use crate::ui::command::Command as DebuggerCommand;
 
@@ -98,6 +98,9 @@ pub fn run_loop(
         }
     };
 
+    // PID de GDB, necesario para mandarle SIGINT en un Interrupt (ver dispatch).
+    let gdb_pid = child.id();
+
     if let Some(exe) = &executable {
         let _ = event_tx.send(DebuggerEvent::State(StateEvent::ProgramLoaded {
             executable: exe.clone(),
@@ -144,7 +147,21 @@ pub fn run_loop(
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
-            let mi = command_to_mi(&cmd);
+            let mi = match dispatch(&cmd) {
+                GdbAction::Interrupt => {
+                    // El inferior está corriendo: en modo síncrono GDB no lee su
+                    // stdin, así que `-exec-interrupt` por el pipe no haría nada.
+                    // Le mandamos SIGINT al proceso de GDB, que frena el inferior
+                    // y emite `*stopped,reason="signal-received"` (lo parsea
+                    // parse_line más abajo).
+                    let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(
+                        "> [SIGINT] interrupt".into(),
+                    )));
+                    send_interrupt(gdb_pid);
+                    continue;
+                }
+                GdbAction::Mi(mi) => mi,
+            };
 
             if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
                 pending_globals.push_back(name.clone());
@@ -228,6 +245,27 @@ pub fn run_loop(
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
+
+/// Frena el inferior mandándole SIGINT al proceso de GDB.
+///
+/// GDB atrapa la señal e interrumpe el programa en ejecución (equivalente al
+/// `Ctrl+C` de una sesión interactiva), emitiendo `*stopped`. Se le manda solo
+/// al PID de GDB —no al grupo de procesos— para que sea GDB quien decida cómo
+/// frenar el inferior, en vez de matarlo directamente.
+#[cfg(unix)]
+fn send_interrupt(pid: u32) {
+    // SAFETY: `kill` con un pid válido y SIGINT no tiene precondiciones de
+    // memoria. Ignoramos el resultado: un interrupt fallido (p.ej. el proceso ya
+    // terminó) no es fatal.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_interrupt(_pid: u32) {
+    // El interrupt por señal solo está soportado en Unix por ahora.
+}
 
 /// true si la línea es exactamente `^done,value="..."`, la respuesta de
 /// -data-evaluate-expression sin ningún otro campo.
