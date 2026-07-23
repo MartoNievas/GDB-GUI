@@ -1,27 +1,56 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{Receiver, Sender},
     thread,
 };
 
-use super::parser::{extract_str, parse_line};
+use super::parser::{extract_str, parse_line, parse_token};
 use super::writer::command_to_mi;
 use crate::state::{DebuggerEvent, StateEvent, UiEvent};
 use crate::ui::command::Command as DebuggerCommand;
 
-struct GdbWriter {
-    stdin: ChildStdin,
+/// Generic over `W: Write` so unit tests can substitute an in-memory buffer
+/// instead of a real `ChildStdin` (which requires a live subprocess).
+struct GdbWriter<W: Write> {
+    stdin: W,
     seq: u32,
 }
 
-impl GdbWriter {
-    fn send(&mut self, raw_mi: &str) -> std::io::Result<()> {
-        writeln!(self.stdin, "{}{}", self.seq, raw_mi)?;
+impl<W: Write> GdbWriter<W> {
+    /// Writes `"{seq}{raw_mi}\n"` and returns the token (`seq` before
+    /// increment) it used — callers correlate GDB's reply to this token.
+    fn send(&mut self, raw_mi: &str) -> std::io::Result<u32> {
+        let token = self.seq;
+        writeln!(self.stdin, "{}{}", token, raw_mi)?;
         self.stdin.flush()?;
         self.seq += 1;
-        Ok(())
+        Ok(token)
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `-break-condition` command. If the token matches an entry in
+/// `pending_cond`, removes it (cleanup happens on both success and failure)
+/// and — only for `^error` — returns the `BreakpointConditionError` event to
+/// emit for the affected row. Success (`^done`) needs no event here: the
+/// separate `=breakpoint-modified` notify-async record (parsed elsewhere via
+/// `parse_line`) already carries the state update.
+fn correlate_pending_cond(line: &str, pending_cond: &mut HashMap<u32, u32>) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let id = *pending_cond.get(&token)?;
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_cond.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::BreakpointConditionError { id, message: msg })
+    } else if rest.starts_with("^done") {
+        pending_cond.remove(&token);
+        None
+    } else {
+        None
     }
 }
 
@@ -29,7 +58,7 @@ impl GdbWriter {
 
 fn spawn_gdb(
     executable: Option<&str>,
-) -> std::io::Result<(Child, GdbWriter, BufReader<ChildStdout>)> {
+) -> std::io::Result<(Child, GdbWriter<ChildStdin>, BufReader<ChildStdout>)> {
     let mut cmd = Command::new("gdb");
     cmd.arg("--interpreter=mi")
         .arg("--quiet")
@@ -107,6 +136,12 @@ pub fn run_loop(
     // el nombre que le corresponde simplemente desencolando en orden de llegada.
     let mut pending_globals: VecDeque<String> = VecDeque::new();
 
+    // Token (asignado por GdbWriter::send) -> id del breakpoint cuyo
+    // `-break-condition` está pendiente de respuesta. GDB ecoa el token en su
+    // result record (`{token}^done`/`{token}^error`), lo que permite
+    // correlacionar un `^error` con la fila exacta que lo originó.
+    let mut pending_cond: HashMap<u32, u32> = HashMap::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = command_to_mi(&cmd);
@@ -117,12 +152,19 @@ pub fn run_loop(
 
             let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!("> {mi}"))));
 
-            if let Err(e) = writer.send(&mi) {
-                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
-                    "Error escribiendo a GDB: {e}"
-                ))));
-                let _ = child.kill();
-                return;
+            let token = match writer.send(&mi) {
+                Ok(token) => token,
+                Err(e) => {
+                    let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
+                        "Error escribiendo a GDB: {e}"
+                    ))));
+                    let _ = child.kill();
+                    return;
+                }
+            };
+
+            if let DebuggerCommand::SetBreakpointCondition { id, .. } = &cmd {
+                pending_cond.insert(token, *id);
             }
 
             // GDB responde a `-break-delete` con un simple `^done` sin `=breakpoint-deleted`
@@ -161,6 +203,17 @@ pub fn run_loop(
                 continue;
             }
 
+            // Correlación de -break-condition: un `^error` cuyo token está en
+            // pending_cond se traduce en BreakpointConditionError para la fila
+            // exacta. El GdbError de consola de parse_line abajo se sigue
+            // emitiendo igual (no se reemplaza), así el log no pierde nada.
+            if let Some(event) = correlate_pending_cond(&line, &mut pending_cond) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
+                }
+            }
+
             if let Some(event) = parse_line(&line) {
                 // None = línea ignorable, no es error
                 if event_tx.send(event).is_err() {
@@ -181,4 +234,81 @@ pub fn run_loop(
 fn is_bare_value_done(line: &str) -> bool {
     line.trim_start_matches(|c: char| c.is_ascii_digit())
         .starts_with("^done,value=\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_returns_the_token_it_used() {
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 5,
+        };
+        let token = writer.send("-break-condition 3 \"x > 5\"").unwrap();
+        assert_eq!(token, 5);
+        assert_eq!(writer.seq, 6);
+
+        let token2 = writer.send("-exec-continue").unwrap();
+        assert_eq!(token2, 6);
+
+        assert_eq!(
+            String::from_utf8(writer.stdin).unwrap(),
+            "5-break-condition 3 \"x > 5\"\n6-exec-continue\n"
+        );
+    }
+
+    #[test]
+    fn pending_cond_insert_and_removal_on_matching_reply() {
+        let mut pending_cond: HashMap<u32, u32> = HashMap::new();
+        pending_cond.insert(7, 3);
+
+        // A `^done` (success) for the matching token must remove the entry
+        // and emit no new event — the =breakpoint-modified notify already
+        // carries the state update through the normal parse_line path.
+        let result = correlate_pending_cond("7^done", &mut pending_cond);
+        assert!(result.is_none());
+        assert!(
+            !pending_cond.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_cond_emits_error_for_correct_row() {
+        let mut pending_cond: HashMap<u32, u32> = HashMap::new();
+        pending_cond.insert(9, 42);
+
+        let event = correlate_pending_cond(
+            "9^error,msg=\"No symbol \\\"unknown_symbol_xyz\\\" in current context.\"",
+            &mut pending_cond,
+        );
+
+        match event {
+            Some(StateEvent::BreakpointConditionError { id, message }) => {
+                assert_eq!(id, 42);
+                assert_eq!(
+                    message,
+                    "No symbol \"unknown_symbol_xyz\" in current context."
+                );
+            }
+            other => panic!("expected BreakpointConditionError, got {other:?}"),
+        }
+        assert!(
+            !pending_cond.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_cond_ignores_unrelated_tokens() {
+        let mut pending_cond: HashMap<u32, u32> = HashMap::new();
+        pending_cond.insert(1, 10);
+
+        // Different token (2), not in the map -> no correlation, map untouched.
+        let event = correlate_pending_cond("2^done", &mut pending_cond);
+        assert!(event.is_none());
+        assert!(pending_cond.contains_key(&1));
+    }
 }
