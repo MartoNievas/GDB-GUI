@@ -23,6 +23,12 @@ pub struct Breakpoint {
     /// haya movido a otra.
     pub requested_line: Option<u32>,
     pub enabled: bool,
+    /// Expresión de condición GDB (`-c "<cond>"` / `-break-condition`), si el
+    /// breakpoint es condicional. `None` = incondicional.
+    pub condition: Option<String>,
+    /// Mensaje de `^error` de GDB tras un intento fallido de fijar/editar la
+    /// condición. Se limpia (`None`) en cualquier merge exitoso posterior.
+    pub condition_error: Option<String>,
 }
 
 // ─── Variable (locals / watch) ────────────────────────────────────────────────
@@ -118,6 +124,7 @@ pub enum StateEvent {
     BreakpointAdded { breakpoint: Breakpoint },
     BreakpointRemoved { id: u32 },
     BreakpointToggled { id: u32, enabled: bool },
+    BreakpointConditionError { id: u32, message: String },
     LocalsUpdated { vars: Vec<Variable> },
     RegisterNamesReceived { names: Vec<String> },
     RegistersUpdated { registers: Vec<Register> },
@@ -229,6 +236,12 @@ impl DebuggerState {
             StateEvent::BreakpointToggled { id, enabled } => {
                 if let Some(bp) = self.persistent.breakpoints.iter_mut().find(|b| b.id == id) {
                     bp.enabled = enabled;
+                }
+            }
+
+            StateEvent::BreakpointConditionError { id, message } => {
+                if let Some(bp) = self.persistent.breakpoints.iter_mut().find(|b| b.id == id) {
+                    bp.condition_error = Some(message);
                 }
             }
 
@@ -351,7 +364,93 @@ mod tests {
             line,
             requested_line: None,
             enabled: true,
+            condition: None,
+            condition_error: None,
         }
+    }
+
+    #[test]
+    fn breakpoint_has_condition_and_condition_error_fields() {
+        let b = Breakpoint {
+            id: 1,
+            file: "a.c".into(),
+            line: 5,
+            requested_line: None,
+            enabled: true,
+            condition: Some("x == 1".into()),
+            condition_error: Some("No symbol \"x\"".into()),
+        };
+        assert_eq!(b.condition, Some("x == 1".to_string()));
+        assert_eq!(b.condition_error, Some("No symbol \"x\"".to_string()));
+    }
+
+    // La respuesta `=breakpoint-modified` re-parsea la fila completa (replace-by-id):
+    // debe actualizar `condition` con el nuevo valor y limpiar cualquier
+    // `condition_error` previo, ya que un merge exitoso implica que GDB aceptó.
+    #[test]
+    fn breakpoint_added_merge_updates_condition_and_clears_error() {
+        let mut state = DebuggerState::new();
+        state.persistent.breakpoints.push(Breakpoint {
+            id: 1,
+            file: "/tmp/example.c".into(),
+            line: 7,
+            requested_line: None,
+            enabled: true,
+            condition: None,
+            condition_error: Some("previous error".into()),
+        });
+
+        state.apply(StateEvent::BreakpointAdded {
+            breakpoint: Breakpoint {
+                id: 1,
+                file: "/tmp/example.c".into(),
+                line: 7,
+                requested_line: None,
+                enabled: true,
+                condition: Some("count > 3".into()),
+                condition_error: None,
+            },
+        });
+
+        let bp = state
+            .persistent
+            .breakpoints
+            .iter()
+            .find(|b| b.id == 1)
+            .expect("breakpoint 1 must still exist");
+        assert_eq!(bp.condition, Some("count > 3".to_string()));
+        assert_eq!(bp.condition_error, None);
+    }
+
+    #[test]
+    fn breakpoint_condition_error_sets_error_leaves_condition_untouched() {
+        let mut state = DebuggerState::new();
+        state.persistent.breakpoints.push(Breakpoint {
+            id: 1,
+            file: "/tmp/example.c".into(),
+            line: 7,
+            requested_line: None,
+            enabled: true,
+            condition: Some("x == 1".into()),
+            condition_error: None,
+        });
+
+        state.apply(StateEvent::BreakpointConditionError {
+            id: 1,
+            message: "No symbol \"unknown_symbol_xyz\" in current context.".into(),
+        });
+
+        let bp = state
+            .persistent
+            .breakpoints
+            .iter()
+            .find(|b| b.id == 1)
+            .expect("breakpoint 1 must still exist");
+        assert_eq!(bp.condition, Some("x == 1".to_string()));
+        assert_eq!(
+            bp.condition_error,
+            Some("No symbol \"unknown_symbol_xyz\" in current context.".to_string())
+        );
     }
 
     #[test]
@@ -398,6 +497,8 @@ mod tests {
             line: 7,
             requested_line: Some(6),
             enabled: true,
+            condition: None,
+            condition_error: None,
         });
 
         // Click sobre la línea real donde GDB lo puso.
@@ -419,6 +520,8 @@ mod tests {
             line: 7,
             requested_line: Some(6),
             enabled: true,
+            condition: None,
+            condition_error: None,
         });
 
         assert!(state.has_breakpoint_marker("example.c", 7));
@@ -436,6 +539,8 @@ mod tests {
             line: 12,
             requested_line: Some(11),
             enabled: true,
+            condition: None,
+            condition_error: None,
         });
 
         // Mismo archivo+línea resuelta, id distinto → duplicado.
@@ -445,6 +550,8 @@ mod tests {
             line: 12,
             requested_line: Some(12),
             enabled: true,
+            condition: None,
+            condition_error: None,
         };
         assert!(state.is_duplicate_breakpoint(&candidate));
 
@@ -455,6 +562,8 @@ mod tests {
             line: 8,
             requested_line: Some(8),
             enabled: true,
+            condition: None,
+            condition_error: None,
         };
         assert!(!state.is_duplicate_breakpoint(&other));
 
