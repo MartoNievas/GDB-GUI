@@ -312,13 +312,31 @@ fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
         .and_then(|loc| loc.rsplit_once(':').map(|(_, n)| n.to_owned()))
         .and_then(|n| n.parse().ok());
 
+    // `cond=` está ausente cuando el breakpoint no tiene condición: extract_str
+    // devuelve None en ese caso (nunca Some("")), preservando la distinción.
+    let condition = extract_str(block, "cond");
+
     Some(Breakpoint {
         id,
         file,
         line,
         requested_line,
         enabled,
+        condition,
+        condition_error: None,
     })
+}
+
+/// Extrae el token numérico líder de una línea MI cruda (p.ej. `"12^error,..."`
+/// → `Some(12)`). `None` si la línea no empieza con dígitos (records
+/// async/stream sin token, como `*stopped` o `^error` sin prefijo).
+pub fn parse_token(line: &str) -> Option<u32> {
+    let end = line.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+    if end == 0 {
+        None
+    } else {
+        line[..end].parse().ok()
+    }
 }
 
 fn parse_variables(fields: &str) -> Vec<Variable> {
@@ -712,6 +730,39 @@ mod tests {
             }
             other => panic!("expected StackUpdated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_breakpoint_cond_present() {
+        let line = r#"=breakpoint-modified,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x1149",func="main",file="a.c",fullname="/a.c",line="10",cond="i == 10",times="0",original-location="a.c:10"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::BreakpointAdded { breakpoint })) => {
+                assert_eq!(breakpoint.condition, Some("i == 10".to_string()));
+            }
+            other => panic!("expected BreakpointAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_breakpoint_cond_absent() {
+        let line = r#"=breakpoint-modified,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x1149",func="main",file="a.c",fullname="/a.c",line="10",times="0",original-location="a.c:10"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::BreakpointAdded { breakpoint })) => {
+                assert_eq!(breakpoint.condition, None);
+            }
+            other => panic!("expected BreakpointAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_token_present() {
+        assert_eq!(parse_token("12^error,msg=\"bad\""), Some(12));
+    }
+
+    #[test]
+    fn test_parse_token_absent() {
+        assert_eq!(parse_token("^error,msg=\"bad\""), None);
+        assert_eq!(parse_token("*stopped"), None);
     }
 
     #[test]
