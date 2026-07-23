@@ -5,8 +5,6 @@ with [egui](https://github.com/emilk/egui). It drives GDB through its
 Machine Interface (`--interpreter=mi`) and renders the debug session in a
 structured, panel-based UI instead of the raw command line.
 
-![Screenshot](./gdb-gui.png)
-
 ## Features
 
 - **Source view** with the current execution line highlighted.
