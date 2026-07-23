@@ -5,3 +5,5 @@ example
 ROADMAP.md
 graphify-out/
 .gdb_history
+.atl/
+build/
