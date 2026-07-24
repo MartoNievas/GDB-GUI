@@ -35,6 +35,10 @@ pub enum Command {
     RequestRegisterNames,
     RequestRegisters,
     RequestDisasm,
+    /// Evaluates a single expression via `-data-evaluate-expression`. The
+    /// struct panel is this variant's sole producer — no separate
+    /// `EvaluateStruct` variant exists because replies are correlated by MI
+    /// token (`pending_struct` in `process.rs`), not by command identity.
     Evaluate(String),
 
     // Globals

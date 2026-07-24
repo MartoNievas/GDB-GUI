@@ -109,6 +109,8 @@ pub struct DebuggerState {
     pub disasm: Vec<AsmLine>,
     pub global_names: Vec<String>,
     pub globals: Vec<Variable>,
+    pub struct_expr: String,
+    pub struct_value: Option<String>,
     pub persistent: PersistentState,
 }
 
@@ -131,6 +133,7 @@ pub enum StateEvent {
     DisasmUpdated { lines: Vec<AsmLine> },
     GlobalNamesReceived { names: Vec<String> },
     GlobalValueUpdated { name: String, value: String },
+    StructValueUpdated { expr: String, value: String },
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +161,8 @@ impl DebuggerState {
             disasm: vec![],
             global_names: vec![],
             globals: vec![],
+            struct_expr: String::new(),
+            struct_value: None,
             persistent: PersistentState {
                 executable: None,
                 breakpoints: vec![],
@@ -177,6 +182,10 @@ impl DebuggerState {
                 self.disasm = vec![];
                 self.global_names = vec![];
                 self.globals = vec![];
+                // New executable: symbols change, so a previously committed
+                // expression may no longer resolve — reset both.
+                self.struct_expr = String::new();
+                self.struct_value = None;
             }
 
             StateEvent::ProgramStarted => {
@@ -188,6 +197,9 @@ impl DebuggerState {
                 self.registers = vec![];
                 self.disasm = vec![];
                 self.globals = vec![];
+                // struct_expr survives run/pause/continue cycles so it is
+                // auto-re-evaluated on the next pause; only the stale value clears.
+                self.struct_value = None;
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -214,6 +226,7 @@ impl DebuggerState {
                 self.registers = vec![];
                 self.disasm = vec![];
                 self.globals = vec![];
+                self.struct_value = None;
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -260,6 +273,11 @@ impl DebuggerState {
                         value,
                         type_: String::new(),
                     });
+                }
+            }
+            StateEvent::StructValueUpdated { expr, value } => {
+                if expr == self.struct_expr {
+                    self.struct_value = Some(value);
                 }
             }
         }
@@ -467,6 +485,71 @@ mod tests {
         assert!(!same_file("/tmp/foobar.c", "bar.c"));
         assert!(!same_file("/tmp/a/example.c", "/tmp/b/example.c"));
         assert!(!same_file("main.c", "example.c"));
+    }
+
+    #[test]
+    fn struct_value_updated_matching_expr_sets_value() {
+        let mut state = DebuggerState::new();
+        state.struct_expr = "my_struct.field".into();
+
+        state.apply(StateEvent::StructValueUpdated {
+            expr: "my_struct.field".into(),
+            value: "{a = 1, b = 2}".into(),
+        });
+
+        assert_eq!(state.struct_value, Some("{a = 1, b = 2}".to_string()));
+    }
+
+    #[test]
+    fn struct_value_updated_stale_expr_is_dropped() {
+        let mut state = DebuggerState::new();
+        state.struct_expr = "current_expr".into();
+        state.struct_value = Some("stale value".into());
+
+        state.apply(StateEvent::StructValueUpdated {
+            expr: "old_expr".into(),
+            value: "should not apply".into(),
+        });
+
+        assert_eq!(state.struct_value, Some("stale value".to_string()));
+    }
+
+    #[test]
+    fn program_loaded_clears_struct_expr_and_struct_value() {
+        let mut state = DebuggerState::new();
+        state.struct_expr = "my_struct".into();
+        state.struct_value = Some("{a = 1}".into());
+
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+
+        assert_eq!(state.struct_expr, "");
+        assert_eq!(state.struct_value, None);
+    }
+
+    #[test]
+    fn program_started_clears_only_struct_value() {
+        let mut state = DebuggerState::new();
+        state.struct_expr = "my_struct".into();
+        state.struct_value = Some("{a = 1}".into());
+
+        state.apply(StateEvent::ProgramStarted);
+
+        assert_eq!(state.struct_expr, "my_struct");
+        assert_eq!(state.struct_value, None);
+    }
+
+    #[test]
+    fn program_exited_clears_only_struct_value() {
+        let mut state = DebuggerState::new();
+        state.struct_expr = "my_struct".into();
+        state.struct_value = Some("{a = 1}".into());
+
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+
+        assert_eq!(state.struct_expr, "my_struct");
+        assert_eq!(state.struct_value, None);
     }
 
     // Reproduce el bug: GDB guarda el breakpoint con ruta absoluta, pero el

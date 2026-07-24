@@ -41,6 +41,9 @@ pub struct App {
     // Condition column edit buffer, keyed by breakpoint id. Lazily seeded
     // from `bp.condition` the first time each row is rendered.
     pub(crate) bp_cond_buffer: std::collections::HashMap<u32, String>,
+
+    // Struct panel expression edit buffer.
+    pub(crate) struct_input: String,
 }
 
 impl App {
@@ -65,6 +68,7 @@ impl App {
             source_lines: Vec::new(),
             source_file: None,
             bp_cond_buffer: std::collections::HashMap::new(),
+            struct_input: String::new(),
         }
     }
 
@@ -185,6 +189,9 @@ impl eframe::App for App {
                         self.send(Command::RequestDisasm);
                         for name in self.state.global_names.clone() {
                             self.send(Command::EvaluateGlobal(name));
+                        }
+                        if !self.state.struct_expr.is_empty() {
+                            self.send(Command::Evaluate(self.state.struct_expr.clone()));
                         }
                     }
                     if let Some(names) = new_global_names {

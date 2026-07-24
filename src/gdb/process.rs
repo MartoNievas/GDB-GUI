@@ -54,6 +54,35 @@ fn correlate_pending_cond(line: &str, pending_cond: &mut HashMap<u32, u32>) -> O
     }
 }
 
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// struct-panel `Command::Evaluate`. If the token matches an entry in
+/// `pending_struct`, removes it (cleanup happens on both success and failure).
+/// `^done,value=...` returns `StructValueUpdated{expr,value}` for the caller
+/// to emit (and skip further line processing for this line, since the bare
+/// value carries no other information). `^error` returns `None` — the token
+/// is still removed but no event is emitted here, so the line falls through
+/// to `parse_line`, which turns the generic `^error` into a console
+/// `UiEvent::GdbError`.
+fn correlate_pending_struct(
+    line: &str,
+    pending_struct: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let expr = pending_struct.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_struct.remove(&token);
+        let value = extract_str(rest, "value")?;
+        Some(StateEvent::StructValueUpdated { expr, value })
+    } else if rest.starts_with("^error") {
+        pending_struct.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
 fn spawn_gdb(
@@ -145,6 +174,13 @@ pub fn run_loop(
     // correlacionar un `^error` con la fila exacta que lo originó.
     let mut pending_cond: HashMap<u32, u32> = HashMap::new();
 
+    // Token (asignado por GdbWriter::send) -> expresión del panel de struct
+    // pendiente de respuesta. Correlación por token, no por FIFO: distinta de
+    // `pending_globals` para que una respuesta de struct nunca sea consumida
+    // por el camino de globals (y viceversa) aunque ambas estén en vuelo a la
+    // vez tras el mismo pause.
+    let mut pending_struct: HashMap<u32, String> = HashMap::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
@@ -184,6 +220,10 @@ pub fn run_loop(
                 pending_cond.insert(token, *id);
             }
 
+            if let DebuggerCommand::Evaluate(expr) = &cmd {
+                pending_struct.insert(token, expr.clone());
+            }
+
             // GDB responde a `-break-delete` con un simple `^done` sin `=breakpoint-deleted`
             // ni el id borrado, así que la respuesta no se puede correlacionar. Emitimos el
             // evento de eliminación nosotros mismos para que la UI lo refleje.
@@ -195,15 +235,19 @@ pub fn run_loop(
         }
 
         while let Ok(line) = line_rx.try_recv() {
-            // Los stream records (~ @ &) los convierte parse_line en texto limpio;
-            // echoar además la línea cruda duplicaría la salida en la consola.
-            let first = line
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .chars()
-                .next();
-            let is_stream = matches!(first, Some('~') | Some('@') | Some('&'));
-            if !is_stream {
-                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(line.clone())));
+            // Los records crudos de protocolo MI (^done, *stopped, =notify-async, …)
+            // no se echoan a la consola: parse_line ya los traduce en eventos de
+            // estado, y los errores reales llegan aparte como GdbError. Solo los
+            // stream records (~ @) producen texto legible para el usuario.
+            // Correlación del panel de struct: se comprueba PRIMERO, antes que
+            // pending_globals, para que una respuesta de struct nunca sea
+            // consumida por el FIFO de globals.
+            if let Some(event) = correlate_pending_struct(&line, &mut pending_struct) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
+                }
+                continue;
             }
 
             if !pending_globals.is_empty() && is_bare_value_done(&line) {
@@ -337,6 +381,56 @@ mod tests {
             !pending_cond.contains_key(&9),
             "token must be removed after a matching ^error"
         );
+    }
+
+    #[test]
+    fn correlate_pending_struct_emits_event_and_removes_token_on_done() {
+        let mut pending_struct: HashMap<u32, String> = HashMap::new();
+        pending_struct.insert(3, "my_struct.field".into());
+
+        let event = correlate_pending_struct(
+            "3^done,value=\"{a = 1, b = 2}\"",
+            &mut pending_struct,
+        );
+
+        match event {
+            Some(StateEvent::StructValueUpdated { expr, value }) => {
+                assert_eq!(expr, "my_struct.field");
+                assert_eq!(value, "{a = 1, b = 2}");
+            }
+            other => panic!("expected StructValueUpdated, got {other:?}"),
+        }
+        assert!(
+            !pending_struct.contains_key(&3),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_struct_removes_token_and_emits_no_event_on_error() {
+        let mut pending_struct: HashMap<u32, String> = HashMap::new();
+        pending_struct.insert(4, "bad_expr".into());
+
+        let event = correlate_pending_struct(
+            "4^error,msg=\"No symbol \\\"bad_expr\\\" in current context.\"",
+            &mut pending_struct,
+        );
+
+        assert!(event.is_none());
+        assert!(
+            !pending_struct.contains_key(&4),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_struct_ignores_unrelated_tokens() {
+        let mut pending_struct: HashMap<u32, String> = HashMap::new();
+        pending_struct.insert(1, "my_struct".into());
+
+        let event = correlate_pending_struct("2^done,value=\"5\"", &mut pending_struct);
+        assert!(event.is_none());
+        assert!(pending_struct.contains_key(&1));
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         Command::RequestDisasm => "-data-disassemble -s $pc -e \"$pc + 64\" -- 0".into(),
 
-        Command::Evaluate(expr) => format!("-data-evaluate-expression {expr}"),
+        Command::Evaluate(expr) => format!("-data-evaluate-expression {}", quote_mi(expr)),
 
         Command::RequestGlobalNames => "-symbol-info-variables".into(),
         Command::EvaluateGlobal(name) => format!("-data-evaluate-expression {name}"),
@@ -145,6 +145,24 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(&quote_mi(input), expected, "input={input:?}");
         }
+    }
+
+    // SECURITY: an embedded newline in the struct-panel expression must not
+    // survive into the MI command written to GDB's stdin (see quote_mi).
+    #[test]
+    fn evaluate_command_strips_embedded_newline() {
+        let mi = command_to_mi(&Command::Evaluate("*p\n-exec-continue".into()));
+        assert!(
+            !mi.contains('\n'),
+            "MI command must not contain a raw newline: {mi:?}"
+        );
+        assert_eq!(mi, "-data-evaluate-expression \"*p-exec-continue\"");
+    }
+
+    #[test]
+    fn evaluate_command_quotes_expression_with_spaces() {
+        let mi = command_to_mi(&Command::Evaluate("arr[i + 1]".into()));
+        assert_eq!(mi, "-data-evaluate-expression \"arr[i + 1]\"");
     }
 
     #[test]
