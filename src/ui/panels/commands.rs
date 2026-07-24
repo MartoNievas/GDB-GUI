@@ -10,7 +10,7 @@ use crate::ui::widgets::{hl, m, sec_hdr};
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
     sec_hdr(ui, "Commands", &mut app.open_cmd);
     if app.open_cmd {
-        for cmd_str in &["info locals", "bt full", "info registers", "info threads"] {
+        for cmd_str in &["info locals", "bt full", "info registers", "info threads", "flush"] {
             if ui
                 .add(
                     egui::Button::new(m(cmd_str, 11.0, TXT_CYAN))

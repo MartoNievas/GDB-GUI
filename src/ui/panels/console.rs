@@ -45,10 +45,12 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     );
                     if resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) {
                         let raw = app.console_input.trim().to_owned();
-                        if !raw.is_empty() {
+                        if raw.eq_ignore_ascii_case("flush") {
+                            app.console_log.clear();
+                        } else if !raw.is_empty() {
                             app.send(Command::Raw(raw));
-                            app.console_input.clear();
                         }
+                        app.console_input.clear();
                         resp.request_focus();
                     }
                 });
