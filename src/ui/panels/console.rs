@@ -59,15 +59,18 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ScrollArea::vertical()
             .id_salt("con_log")
             .stick_to_bottom(true)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(2.0);
-                for line in &app.console_log {
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        ui.label(m(line, 11.0, TXT));
-                    });
-                }
-                ui.add_space(2.0);
+                ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                    ui.add_space(2.0);
+                    for line in &app.console_log {
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            ui.label(m(line, 11.0, TXT));
+                        });
+                    }
+                    ui.add_space(2.0);
+                });
             });
     });
 }
