@@ -277,7 +277,10 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(flat(BG_APP))
             .show(ctx, |ui| {
-                ScrollArea::both().id_salt("source").show(ui, |ui| {
+                ScrollArea::both()
+                    .id_salt("source")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                     if self.source_lines.is_empty() {
                         ui.centered_and_justified(|ui| {
                             ui.label(m("No source file loaded", 13.0, TXT_DIM).italics());
