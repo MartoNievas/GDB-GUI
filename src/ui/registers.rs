@@ -1,31 +1,31 @@
-//! Clasificación de registros por nombre, independiente de la arquitectura.
+//! Register classification by name, independent of the architecture.
 //!
-//! GDB devuelve los registros de la arquitectura activa (x86-64, x86-32, ARM64,
-//! ARM32, RISC-V) mezclados en una sola lista. Clasificarlos por nombre es
-//! inherentemente ambiguo (`s0` es entero en RISC-V pero coma flotante en
-//! AArch64; `x0` es de propósito general en ARM64/RISC-V…), así que en vez de
-//! predicados sueltos que pueden solaparse usamos un único `classify` con una
-//! **precedencia explícita**: cada registro cae en exactamente una categoría.
+//! GDB returns the registers of the active architecture (x86-64, x86-32, ARM64,
+//! ARM32, RISC-V) mixed together in a single list. Classifying them by name is
+//! inherently ambiguous (`s0` is an integer on RISC-V but floating point on
+//! AArch64; `x0` is general-purpose on ARM64/RISC-V…), so instead of separate
+//! predicates that could overlap, we use a single `classify` function with
+//! **explicit precedence**: each register falls into exactly one category.
 
-/// Categoría a la que pertenece un registro.
+/// Category a register belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegClass {
-    /// Propósito general (rax, x0, a0…).
+    /// General purpose (rax, x0, a0…).
     General,
-    /// Puntero de instrucción y flags (rip, pc, eflags, cpsr…).
+    /// Instruction pointer and flags (rip, pc, eflags, cpsr…).
     Control,
-    /// Registros de segmento x86 (cs, ds, ss…).
+    /// x86 segment registers (cs, ds, ss…).
     Segment,
-    /// Vectoriales / coma flotante (xmm, ymm, st, v0…, f0…).
+    /// Vector / floating point (xmm, ymm, st, v0…, f0…).
     Simd,
-    /// Cualquier otra cosa (fs_base, ftag, registros sin nombre…).
+    /// Anything else (fs_base, ftag, unnamed registers…).
     Other,
 }
 
-/// Clasifica un registro por su nombre. La precedencia resuelve las
-/// ambigüedades: control y segmento (nombres específicos) van primero;
-/// propósito general antes que SIMD para que los `s0`–`s11` de RISC-V no se
-/// confundan con los escalares de coma flotante de AArch64.
+/// Classifies a register by its name. Precedence resolves the ambiguities:
+/// control and segment (specific names) come first; general purpose before
+/// SIMD so that RISC-V's `s0`–`s11` are not confused with AArch64's scalar
+/// floating-point registers.
 pub fn classify(name: &str) -> RegClass {
     let n = name.to_ascii_lowercase();
     let n = n.as_str();
@@ -43,8 +43,8 @@ pub fn classify(name: &str) -> RegClass {
     }
 }
 
-/// En x86-64, `eax`/`ebx`/… son la mitad baja de `rax`/`rbx`/…; conviene
-/// ocultarlas cuando el registro de 64 bits está presente.
+/// On x86-64, `eax`/`ebx`/… are the lower half of `rax`/`rbx`/…; it's best
+/// to hide them when the 64-bit register is present.
 pub fn is_x86_32_gp(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -52,8 +52,8 @@ pub fn is_x86_32_gp(name: &str) -> bool {
     )
 }
 
-/// Orden convencional dentro del grupo de propósito general (rax, rbx, …, rip).
-/// Los nombres desconocidos van al final conservando el orden de GDB.
+/// Conventional order within the general-purpose group (rax, rbx, …, rip).
+/// Unknown names go last, preserving GDB's order.
 pub fn display_order(name: &str) -> u32 {
     match name.to_ascii_lowercase().as_str() {
         "rax" | "eax" => 0,
@@ -76,7 +76,7 @@ pub fn display_order(name: &str) -> u32 {
     }
 }
 
-// ─── Predicados internos (operan sobre un nombre ya en minúsculas) ─────────────
+// ─── Internal predicates (operate on a name already in lowercase) ─────────────
 
 fn is_control(n: &str) -> bool {
     matches!(
@@ -126,7 +126,7 @@ fn is_general(n: &str) -> bool {
 }
 
 fn is_simd(n: &str) -> bool {
-    // Prefijos vectoriales con índice numérico: xmm0-31, ymm0-31, zmm0-31.
+    // Vector prefixes with a numeric index: xmm0-31, ymm0-31, zmm0-31.
     for p in ["xmm", "ymm", "zmm"] {
         if let Some(rest) = n.strip_prefix(p) {
             if rest.parse::<u32>().is_ok() {
@@ -134,8 +134,8 @@ fn is_simd(n: &str) -> bool {
             }
         }
     }
-    // Vistas de una letra que NO colisionan con propósito general:
-    // v (vector AArch64), q (quad), f (coma flotante RISC-V f0-f31).
+    // Single-letter views that do NOT collide with general purpose:
+    // v (AArch64 vector), q (quad), f (RISC-V floating point f0-f31).
     for p in ['v', 'q', 'f'] {
         if let Some(rest) = n.strip_prefix(p) {
             if rest.parse::<u32>().map(|num| num <= 31).unwrap_or(false) {
@@ -148,9 +148,9 @@ fn is_simd(n: &str) -> bool {
         // x86 MMX / x87
         "mm0" | "mm1" | "mm2" | "mm3" | "mm4" | "mm5" | "mm6" | "mm7"
         | "st0" | "st1" | "st2" | "st3" | "st4" | "st5" | "st6" | "st7"
-        // AVX-512 máscaras
+        // AVX-512 masks
         | "k0" | "k1" | "k2" | "k3" | "k4" | "k5" | "k6" | "k7"
-        // RISC-V coma flotante (nombres ABI)
+        // RISC-V floating point (ABI names)
         | "ft0" | "ft1" | "ft2" | "ft3" | "ft4" | "ft5"
         | "ft6" | "ft7" | "ft8" | "ft9" | "ft10" | "ft11"
         | "fs0" | "fs1" | "fs2" | "fs3" | "fs4" | "fs5"
@@ -191,10 +191,10 @@ mod tests {
 
     #[test]
     fn riscv_s_regs_stay_general_not_simd() {
-        // El bug clásico: s0-s11 son enteros "saved" en RISC-V, no FP escalar.
+        // The classic bug: s0-s11 are "saved" integers on RISC-V, not scalar FP.
         assert_eq!(classify("s0"), RegClass::General);
         assert_eq!(classify("s11"), RegClass::General);
-        // …pero fs0 (FP) sí es SIMD.
+        // …but fs0 (FP) is indeed SIMD.
         assert_eq!(classify("fs0"), RegClass::Simd);
     }
 

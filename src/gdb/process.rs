@@ -127,7 +127,7 @@ pub fn run_loop(
         }
     };
 
-    // PID de GDB, necesario para mandarle SIGINT en un Interrupt (ver dispatch).
+    // GDB's PID, needed to send it SIGINT on an Interrupt (see dispatch).
     let gdb_pid = child.id();
 
     if let Some(exe) = &executable {
@@ -162,34 +162,35 @@ pub fn run_loop(
         }
     });
 
-    // Cola FIFO de nombres de variables globales pendientes de evaluar. GDB responde a
-    // comandos síncronos (-data-evaluate-expression, etc.) en el mismo orden en que se
-    // mandan, así que podemos correlacionar cada "^done,value=..." sin nombre propio con
-    // el nombre que le corresponde simplemente desencolando en orden de llegada.
+    // FIFO queue of global variable names pending evaluation. GDB responds to
+    // synchronous commands (-data-evaluate-expression, etc.) in the same order they
+    // are sent, so we can correlate each nameless "^done,value=..." with its
+    // corresponding name simply by dequeuing in arrival order.
     let mut pending_globals: VecDeque<String> = VecDeque::new();
 
-    // Token (asignado por GdbWriter::send) -> id del breakpoint cuyo
-    // `-break-condition` está pendiente de respuesta. GDB ecoa el token en su
-    // result record (`{token}^done`/`{token}^error`), lo que permite
-    // correlacionar un `^error` con la fila exacta que lo originó.
+    // Token (assigned by GdbWriter::send) -> id of the breakpoint whose
+    // `-break-condition` is pending a response. GDB echoes the token in its
+    // result record (`{token}^done`/`{token}^error`), which lets us
+    // correlate an `^error` with the exact row that originated it.
     let mut pending_cond: HashMap<u32, u32> = HashMap::new();
 
-    // Token (asignado por GdbWriter::send) -> expresión del panel de struct
-    // pendiente de respuesta. Correlación por token, no por FIFO: distinta de
-    // `pending_globals` para que una respuesta de struct nunca sea consumida
-    // por el camino de globals (y viceversa) aunque ambas estén en vuelo a la
-    // vez tras el mismo pause.
+    // Token (assigned by GdbWriter::send) -> struct-panel expression pending
+    // a response. Correlated by token, not FIFO: kept separate from
+    // `pending_globals` so a struct response is never consumed by the
+    // globals path (and vice versa), even when both are in flight at the
+    // same time after the same pause.
     let mut pending_struct: HashMap<u32, String> = HashMap::new();
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
                 GdbAction::Interrupt => {
-                    // El inferior está corriendo: en modo síncrono GDB no lee su
-                    // stdin, así que `-exec-interrupt` por el pipe no haría nada.
-                    // Le mandamos SIGINT al proceso de GDB, que frena el inferior
-                    // y emite `*stopped,reason="signal-received"` (lo parsea
-                    // parse_line más abajo).
+                    // The inferior is running: in synchronous mode GDB does not
+                    // read its stdin, so `-exec-interrupt` sent through the pipe
+                    // would do nothing. We send SIGINT to the GDB process instead,
+                    // which stops the inferior and emits
+                    // `*stopped,reason="signal-received"` (parsed by parse_line
+                    // below).
                     let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(
                         "> [SIGINT] interrupt".into(),
                     )));
@@ -224,9 +225,9 @@ pub fn run_loop(
                 pending_struct.insert(token, expr.clone());
             }
 
-            // GDB responde a `-break-delete` con un simple `^done` sin `=breakpoint-deleted`
-            // ni el id borrado, así que la respuesta no se puede correlacionar. Emitimos el
-            // evento de eliminación nosotros mismos para que la UI lo refleje.
+            // GDB responds to `-break-delete` with a plain `^done` without
+            // `=breakpoint-deleted` or the deleted id, so the response cannot be
+            // correlated. We emit the removal event ourselves so the UI reflects it.
             if let DebuggerCommand::RemoveBreakpoint(id) = &cmd {
                 let _ = event_tx.send(DebuggerEvent::State(StateEvent::BreakpointRemoved {
                     id: *id,
@@ -235,13 +236,12 @@ pub fn run_loop(
         }
 
         while let Ok(line) = line_rx.try_recv() {
-            // Los records crudos de protocolo MI (^done, *stopped, =notify-async, …)
-            // no se echoan a la consola: parse_line ya los traduce en eventos de
-            // estado, y los errores reales llegan aparte como GdbError. Solo los
-            // stream records (~ @) producen texto legible para el usuario.
-            // Correlación del panel de struct: se comprueba PRIMERO, antes que
-            // pending_globals, para que una respuesta de struct nunca sea
-            // consumida por el FIFO de globals.
+            // Raw MI protocol records (^done, *stopped, =notify-async, …) are not
+            // echoed to the console: parse_line already translates them into state
+            // events, and real errors arrive separately as GdbError. Only stream
+            // records (~ @) produce readable text for the user.
+            // Struct-panel correlation: checked FIRST, before pending_globals, so
+            // that a struct response is never consumed by the globals FIFO.
             if let Some(event) = correlate_pending_struct(&line, &mut pending_struct) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
@@ -264,10 +264,10 @@ pub fn run_loop(
                 continue;
             }
 
-            // Correlación de -break-condition: un `^error` cuyo token está en
-            // pending_cond se traduce en BreakpointConditionError para la fila
-            // exacta. El GdbError de consola de parse_line abajo se sigue
-            // emitiendo igual (no se reemplaza), así el log no pierde nada.
+            // -break-condition correlation: an `^error` whose token is in
+            // pending_cond is translated into a BreakpointConditionError for the
+            // exact row. The console GdbError from parse_line below is still
+            // emitted regardless (not replaced), so the log loses nothing.
             if let Some(event) = correlate_pending_cond(&line, &mut pending_cond) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
@@ -276,10 +276,10 @@ pub fn run_loop(
             }
 
             if let Some(event) = parse_line(&line) {
-                // None = línea ignorable, no es error
+                // None = ignorable line, not an error
                 if event_tx.send(event).is_err() {
                     let _ = child.kill();
-                    return; // UI cerrada
+                    return; // UI closed
                 }
             }
         }
@@ -290,17 +290,17 @@ pub fn run_loop(
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-/// Frena el inferior mandándole SIGINT al proceso de GDB.
+/// Stops the inferior by sending SIGINT to the GDB process.
 ///
-/// GDB atrapa la señal e interrumpe el programa en ejecución (equivalente al
-/// `Ctrl+C` de una sesión interactiva), emitiendo `*stopped`. Se le manda solo
-/// al PID de GDB —no al grupo de procesos— para que sea GDB quien decida cómo
-/// frenar el inferior, en vez de matarlo directamente.
+/// GDB traps the signal and interrupts the running program (equivalent to
+/// `Ctrl+C` in an interactive session), emitting `*stopped`. It is sent only
+/// to GDB's PID —not to the process group— so that GDB decides how to stop
+/// the inferior, instead of killing it directly.
 #[cfg(unix)]
 fn send_interrupt(pid: u32) {
-    // SAFETY: `kill` con un pid válido y SIGINT no tiene precondiciones de
-    // memoria. Ignoramos el resultado: un interrupt fallido (p.ej. el proceso ya
-    // terminó) no es fatal.
+    // SAFETY: `kill` with a valid pid and SIGINT has no memory preconditions.
+    // We ignore the result: a failed interrupt (e.g. the process already
+    // terminated) is not fatal.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGINT);
     }
@@ -308,11 +308,11 @@ fn send_interrupt(pid: u32) {
 
 #[cfg(not(unix))]
 fn send_interrupt(_pid: u32) {
-    // El interrupt por señal solo está soportado en Unix por ahora.
+    // Signal-based interrupt is only supported on Unix for now.
 }
 
-/// true si la línea es exactamente `^done,value="..."`, la respuesta de
-/// -data-evaluate-expression sin ningún otro campo.
+/// true if the line is exactly `^done,value="..."`, the response to
+/// -data-evaluate-expression with no other field.
 fn is_bare_value_done(line: &str) -> bool {
     line.trim_start_matches(|c: char| c.is_ascii_digit())
         .starts_with("^done,value=\"")

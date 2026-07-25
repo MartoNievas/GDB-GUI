@@ -23,8 +23,8 @@ pub(crate) const TXT_CYAN: Color32 = Color32::from_rgb(0x7e, 0xc8, 0xe3);
 pub(crate) const TXT_YELLOW: Color32 = Color32::from_rgb(0xe8, 0xc9, 0x7d);
 pub(crate) const TXT_HL: Color32 = Color32::from_rgb(0xd4, 0xf0, 0xd4);
 
-// ─── Register groups (categoría → etiqueta + color) ───────────────────────────
-// Orden en que se muestran los grupos en la pestaña Registers.
+// ─── Register groups (category → label + color) ───────────────────────────────
+// Order in which the groups are displayed in the Registers tab.
 pub(crate) const REG_GROUPS: [(RegClass, &str, Color32); 5] = [
     (RegClass::General, "General purpose", TXT_CYAN),
     (RegClass::Control, "Control / flags", ACCENT),

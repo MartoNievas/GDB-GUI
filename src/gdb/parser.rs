@@ -13,7 +13,7 @@ pub fn parse_line(line: &str) -> Option<DebuggerEvent> {
     match line.chars().next()? {
         '~' => parse_console_stream(line),
         '@' => parse_target_stream(line),
-        '&' => None, // log interno, ignorar
+        '&' => None, // internal log, ignore
         '*' => parse_exec_async(line),
         '=' => parse_notify_async(line),
         '^' => parse_result(line),
@@ -35,7 +35,7 @@ fn parse_console_stream(line: &str) -> Option<DebuggerEvent> {
 }
 
 fn parse_target_stream(line: &str) -> Option<DebuggerEvent> {
-    // @"some text\n"  → stdout del programa que se está depurando
+    // @"some text\n"  → stdout of the program being debugged
     let text = unquote(&line[1..])?;
     Some(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!(
         "[target] {text}"
@@ -45,15 +45,15 @@ fn parse_target_stream(line: &str) -> Option<DebuggerEvent> {
 // ─── Exec async (*) ───────────────────────────────────────────────────────────
 
 fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
-    let rest = &line[1..]; // quitar '*'
+    let rest = &line[1..]; // remove '*'
     let (class, fields) = split_class_fields(rest);
 
     match class {
         "running" => Some(DebuggerEvent::State(StateEvent::ProgramStarted)),
 
         "stopped" => {
-            // El programa puede haber terminado: esos *stopped no traen frame,
-            // así que hay que atenderlos antes de exigir uno.
+            // The program may have exited: those *stopped records carry no frame,
+            // so they must be handled before requiring one.
             match extract_str(fields, "reason").as_deref() {
                 Some("exited-normally") => {
                     return Some(DebuggerEvent::State(StateEvent::ProgramExited {
@@ -304,16 +304,16 @@ fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
         .map(|s| s == "y")
         .unwrap_or(true);
 
-    // GDB reubica los breakpoints pedidos en la línea del nombre de una función
-    // hacia la primera línea ejecutable. `original-location` conserva lo pedido
-    // (p.ej. "example.c:6"); guardamos su número de línea para poder hacer toggle
-    // desde la línea en la que el usuario realmente hizo click.
+    // GDB relocates breakpoints requested on a function name's line to the
+    // first executable line. `original-location` preserves what was requested
+    // (e.g. "example.c:6"); we store its line number so toggling works from
+    // the line the user actually clicked.
     let requested_line = extract_str(block, "original-location")
         .and_then(|loc| loc.rsplit_once(':').map(|(_, n)| n.to_owned()))
         .and_then(|n| n.parse().ok());
 
-    // `cond=` está ausente cuando el breakpoint no tiene condición: extract_str
-    // devuelve None en ese caso (nunca Some("")), preservando la distinción.
+    // `cond=` is absent when the breakpoint has no condition: extract_str
+    // returns None in that case (never Some("")), preserving the distinction.
     let condition = extract_str(block, "cond");
 
     Some(Breakpoint {
@@ -327,9 +327,9 @@ fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
     })
 }
 
-/// Extrae el token numérico líder de una línea MI cruda (p.ej. `"12^error,..."`
-/// → `Some(12)`). `None` si la línea no empieza con dígitos (records
-/// async/stream sin token, como `*stopped` o `^error` sin prefijo).
+/// Extracts the leading numeric token from a raw MI line (e.g. `"12^error,..."`
+/// → `Some(12)`). `None` if the line does not start with digits (async/stream
+/// records with no token, like `*stopped` or `^error` with no prefix).
 pub fn parse_token(line: &str) -> Option<u32> {
     let end = line.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
     if end == 0 {
@@ -539,7 +539,7 @@ fn parse_register_names(fields: &str) -> Vec<String> {
         None => return vec![],
     };
 
-    // La lista es: "rax","rbx","rcx",... (strings separados por coma)
+    // The list is: "rax","rbx","rcx",... (comma-separated strings)
     let mut names = vec![];
     let mut rest = list;
 
@@ -575,8 +575,8 @@ fn parse_registers(fields: &str) -> Vec<crate::state::Register> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0u32);
             let value = extract_str(block, "value").unwrap_or_default();
-            // El nombre se cruza en DebuggerState::apply usando register_names[number]
-            // Aquí lo dejamos vacío; la UI lee state.register_names para el display.
+            // The name is cross-referenced in DebuggerState::apply using register_names[number]
+            // We leave it empty here; the UI reads state.register_names for display.
             regs.push(crate::state::Register {
                 number,
                 name: String::new(),
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_parse_global_names() {
-        // Captura real de `-symbol-info-variables` contra GDB 17.2.
+        // Real capture of `-symbol-info-variables` against GDB 17.2.
         let line = r#"4^done,symbols={debug=[{filename="globaltest.c",fullname="/tmp/globaltest.c",symbols=[{line="3",name="global_counter",type="int",description="int global_counter;"},{line="4",name="static_thing",type="int",description="static int static_thing;"}]}]}"#;
         let event = parse_line(line);
         match event {
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_program_exit_normally() {
-        // *stopped por fin de programa no trae frame; antes se descartaba.
+        // *stopped for program termination carries no frame; it used to be discarded.
         let event = parse_line(r#"*stopped,reason="exited-normally""#);
         assert!(matches!(
             event,
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_program_exit_with_code() {
-        // exit-code viene en octal en la salida MI.
+        // exit-code comes in octal in the MI output.
         let event = parse_line(r#"*stopped,reason="exited",exit-code="02""#);
         assert!(matches!(
             event,
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_bare_value_done_not_confused_with_globals() {
-        // -data-evaluate-expression → ^done,value="42" no debe matchear el branch de globals.
+        // -data-evaluate-expression → ^done,value="42" must not match the globals branch.
         let line = r#"5^done,value="42""#;
         let event = parse_line(line);
         assert!(event.is_none());

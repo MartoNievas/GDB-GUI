@@ -8,7 +8,7 @@ use super::theme::*;
 use super::widgets::*;
 use crate::state::{DebuggerEvent, DebuggerState, UiEvent};
 
-// ─── Source line para renderizado ─────────────────────────────────────────────
+// ─── Source line for rendering ─────────────────────────────────────────────────
 
 struct SourceLine {
     number: u32,
@@ -127,7 +127,7 @@ impl App {
     }
 
     fn try_load_source(&self, path: &str) -> Option<String> {
-        // 1. Intentar path tal cual (absoluto o relativo desde CWD)
+        // 1. Try the path as-is (absolute or relative from CWD)
         if let Ok(content) = std::fs::read_to_string(path) {
             return Some(content);
         }
@@ -158,9 +158,9 @@ impl eframe::App for App {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 DebuggerEvent::State(s) => {
-                    // GDB puede crear un segundo breakpoint en la misma línea resuelta
-                    // (p.ej. al pedir la línea 11 y la 12, ambas caen en la 12). Descartamos
-                    // el redundante y lo borramos de GDB para no duplicar.
+                    // GDB can create a second breakpoint on the same resolved line
+                    // (e.g. requesting line 11 and line 12, both landing on 12). We
+                    // discard the redundant one and remove it from GDB to avoid duplicates.
                     if let crate::state::StateEvent::BreakpointAdded { breakpoint } = &s {
                         if self.state.is_duplicate_breakpoint(breakpoint) {
                             self.send(Command::RemoveBreakpoint(breakpoint.id));
@@ -300,8 +300,8 @@ impl eframe::App for App {
                     for line in &self.source_lines {
                         let is_current = Some(line.number) == current_line;
                         let file_ref = self.source_file.as_deref().unwrap_or("");
-                        // El marcador solo se dibuja en la línea real donde GDB para;
-                        // el toggle admite además la línea solicitada (por si GDB reubicó).
+                        // The marker is only drawn on the actual line where GDB stops;
+                        // the toggle also accepts the requested line (in case GDB relocated it).
                         let has_bp = self.state.has_breakpoint_marker(file_ref, line.number);
                         let bp_id = self
                             .state

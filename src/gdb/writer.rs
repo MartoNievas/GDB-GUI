@@ -43,27 +43,28 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         Command::Raw(s) => s.clone(),
 
-        // Interrupt no es un comando MI: se despacha como señal (SIGINT) desde
-        // `dispatch`, que lo intercepta antes de llegar acá.
+        // Interrupt is not an MI command: it is dispatched as a signal (SIGINT)
+        // from `dispatch`, which intercepts it before it gets here.
         Command::Interrupt => unreachable!("Interrupt is signal-dispatched via dispatch(), never MI"),
     }
 }
 
-/// Cómo debe ejecutarse un `Command`: como texto MI escrito al stdin de GDB, o
-/// como una señal al proceso.
+/// How a `Command` must be executed: as MI text written to GDB's stdin, or
+/// as a signal to the process.
 ///
-/// `Interrupt` es el único comando que se emite mientras el inferior CORRE. En
-/// modo síncrono GDB no lee su stdin en ese momento, así que un `-exec-interrupt`
-/// por el pipe no tendría efecto; debe mandarse como SIGINT. El resto de los
-/// comandos se emiten con el programa detenido, cuando GDB sí lee su stdin.
+/// `Interrupt` is the only command issued while the inferior is RUNNING. In
+/// synchronous mode GDB does not read its stdin at that point, so an
+/// `-exec-interrupt` sent through the pipe would have no effect; it must be
+/// sent as SIGINT instead. The rest of the commands are issued while the
+/// program is stopped, when GDB does read its stdin.
 pub enum GdbAction {
-    /// Texto MI para escribir al stdin de GDB.
+    /// MI text to write to GDB's stdin.
     Mi(String),
-    /// Frenar el inferior mandándole una señal al proceso de GDB.
+    /// Stop the inferior by sending a signal to the GDB process.
     Interrupt,
 }
 
-/// Clasifica un `Command` en la acción de transporte que le corresponde.
+/// Classifies a `Command` into its corresponding transport action.
 pub fn dispatch(cmd: &Command) -> GdbAction {
     match cmd {
         Command::Interrupt => GdbAction::Interrupt,

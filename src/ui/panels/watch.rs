@@ -105,8 +105,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             if group.is_empty() {
                                 continue;
                             }
-                            // El grupo general va en orden convencional;
-                            // el resto conserva el orden de GDB.
+                            // The general group goes in conventional order;
+                            // the rest preserve GDB's order.
                             if class == RegClass::General {
                                 group.sort_by_key(|(name, _, _)| {
                                     crate::ui::registers::display_order(name)
