@@ -8,6 +8,7 @@ pub use debugger_state::{
     // Core state
     DebuggerState,
     // Types
+    EditTarget,
     Frame,
     PauseState,
 

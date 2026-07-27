@@ -50,6 +50,18 @@ pub struct Register {
     pub value: String, // hex: "0x00007fff..."
 }
 
+// ─── Edit target (variable / register value writes) ─────────────────────────
+
+/// Identifies the target of a `Command::SetValue` write. Threaded unchanged
+/// from `Command` -> `pending_edit` -> `StateEvent` -> `edit_errors` -> the
+/// UI's per-cell buffer key, so no row identity is re-derived at any hop.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EditTarget {
+    Local(String),
+    Global(String),
+    Register(String),
+}
+
 // ─── Disassembly ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -124,6 +136,11 @@ pub struct DebuggerState {
     pub threads: Vec<ThreadInfo>,
     pub current_thread: Option<u32>,
     pub persistent: PersistentState,
+    /// GDB `^error` message from a failed `Command::SetValue`, keyed by the
+    /// target that failed. Cleared for a key on that key's next
+    /// `ValueEditSucceeded`. Wiped in full on Loaded/Started/Exited, like the
+    /// other per-session panels.
+    pub edit_errors: std::collections::HashMap<EditTarget, String>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -187,6 +204,18 @@ pub enum StateEvent {
     ThreadSelected {
         id: u32,
     },
+    /// `-gdb-set` acked with `^error`: the write did not take effect. Stores
+    /// GDB's message for the affected cell; the value shown is unchanged.
+    ValueEditFailed {
+        target: EditTarget,
+        message: String,
+    },
+    /// `-gdb-set` acked with bare `^done`: the write succeeded. Carries no
+    /// value — the follow-up re-fetch (locals/global/registers, dispatched
+    /// from `app.rs`) is the source of truth for the refreshed cell.
+    ValueEditSucceeded {
+        target: EditTarget,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +251,7 @@ impl DebuggerState {
                 executable: None,
                 breakpoints: vec![],
             },
+            edit_errors: std::collections::HashMap::new(),
         }
     }
 
@@ -243,6 +273,7 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
+                self.edit_errors.clear();
             }
 
             StateEvent::ProgramStarted => {
@@ -259,6 +290,7 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
+                self.edit_errors.clear();
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -288,6 +320,7 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
+                self.edit_errors.clear();
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -351,6 +384,13 @@ impl DebuggerState {
             StateEvent::ThreadSelected { id } => {
                 self.current_thread = Some(id);
             }
+
+            StateEvent::ValueEditFailed { target, message } => {
+                self.edit_errors.insert(target, message);
+            }
+            StateEvent::ValueEditSucceeded { target } => {
+                self.edit_errors.remove(&target);
+            }
         }
     }
 
@@ -400,6 +440,12 @@ impl DebuggerState {
             .any(|b| b.line == line && same_file(&b.file, file))
     }
 
+    /// GDB's `^error` message from the last failed write to `target`, if
+    /// any. `None` means no failed edit is pending display for this target.
+    pub fn edit_error(&self, target: &EditTarget) -> Option<&str> {
+        self.edit_errors.get(target).map(|s| s.as_str())
+    }
+
     /// Checks whether `candidate` is redundant: another breakpoint (with a
     /// different id) already exists at the same *resolved* location (file +
     /// actual line).
@@ -446,6 +492,89 @@ impl Default for DebuggerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_error_returns_none_for_absent_key() {
+        let state = DebuggerState::new();
+        assert_eq!(state.edit_error(&EditTarget::Local("x".into())), None);
+    }
+
+    #[test]
+    fn edit_target_equality_and_hash_roundtrip() {
+        use std::collections::HashMap;
+
+        let a = EditTarget::Local("x".into());
+        let b = EditTarget::Local("x".into());
+        let c = EditTarget::Global("x".into());
+        let d = EditTarget::Register("pc".into());
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+
+        let mut map: HashMap<EditTarget, &str> = HashMap::new();
+        map.insert(a.clone(), "found via a");
+        assert_eq!(map.get(&b), Some(&"found via a"));
+        assert_eq!(map.get(&c), None);
+    }
+
+    #[test]
+    fn value_edit_failed_sets_edit_errors_for_target() {
+        let mut state = DebuggerState::new();
+        let target = EditTarget::Local("x".into());
+
+        state.apply(StateEvent::ValueEditFailed {
+            target: target.clone(),
+            message: "No symbol \"x\" in current context.".into(),
+        });
+
+        assert_eq!(
+            state.edit_error(&target),
+            Some("No symbol \"x\" in current context.")
+        );
+    }
+
+    #[test]
+    fn value_edit_succeeded_clears_only_its_own_key() {
+        let mut state = DebuggerState::new();
+        let target_a = EditTarget::Local("x".into());
+        let target_b = EditTarget::Global("g_counter".into());
+        state
+            .edit_errors
+            .insert(target_a.clone(), "stale error a".into());
+        state
+            .edit_errors
+            .insert(target_b.clone(), "stale error b".into());
+
+        state.apply(StateEvent::ValueEditSucceeded {
+            target: target_a.clone(),
+        });
+
+        assert_eq!(state.edit_error(&target_a), None);
+        assert_eq!(state.edit_error(&target_b), Some("stale error b"));
+    }
+
+    #[test]
+    fn program_loaded_started_exited_wipe_edit_errors() {
+        let target = EditTarget::Register("pc".into());
+
+        let mut state = DebuggerState::new();
+        state.edit_errors.insert(target.clone(), "e".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.edit_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state.edit_errors.insert(target.clone(), "e".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.edit_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state.edit_errors.insert(target, "e".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.edit_errors.is_empty());
+    }
 
     fn bp(id: u32, file: &str, line: u32) -> Breakpoint {
         Breakpoint {

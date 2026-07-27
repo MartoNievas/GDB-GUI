@@ -1,3 +1,5 @@
+use crate::state::EditTarget;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     // Execution
@@ -49,6 +51,15 @@ pub enum Command {
     RequestGlobalNames,
     EvaluateGlobal(String),
 
+    /// Writes a new value to a local/global variable or a register via
+    /// `-gdb-set`. `target` survives unchanged into `pending_edit`, the
+    /// resulting `StateEvent::ValueEdit{Succeeded,Failed}`, and the UI's
+    /// per-cell error/buffer keys.
+    SetValue {
+        target: EditTarget,
+        value: String,
+    },
+
     Raw(String),
 }
 
@@ -83,6 +94,31 @@ mod tests {
     fn request_threads_command_constructs_and_compares() {
         assert_eq!(Command::RequestThreads, Command::RequestThreads);
         assert_ne!(Command::RequestThreads, Command::RequestStack);
+    }
+
+    #[test]
+    fn set_value_command_constructs_and_compares() {
+        use crate::state::EditTarget;
+
+        let a = Command::SetValue {
+            target: EditTarget::Local("x".into()),
+            value: "42".into(),
+        };
+        let b = Command::SetValue {
+            target: EditTarget::Local("x".into()),
+            value: "42".into(),
+        };
+        let different_value = Command::SetValue {
+            target: EditTarget::Local("x".into()),
+            value: "7".into(),
+        };
+        let different_target = Command::SetValue {
+            target: EditTarget::Register("pc".into()),
+            value: "42".into(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, different_value);
+        assert_ne!(a, different_target);
     }
 
     #[test]
