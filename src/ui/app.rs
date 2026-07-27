@@ -44,6 +44,11 @@ pub struct App {
 
     // Struct panel expression edit buffer.
     pub(crate) struct_input: String,
+
+    // Value-cell edit buffer (Watch locals/globals + Registers), keyed by
+    // EditTarget so the same key survives Command -> pending_edit ->
+    // StateEvent -> edit_errors -> this buffer with no re-derivation.
+    pub(crate) value_edit_buffer: std::collections::HashMap<crate::state::EditTarget, String>,
 }
 
 impl App {
@@ -69,6 +74,7 @@ impl App {
             source_file: None,
             bp_cond_buffer: std::collections::HashMap::new(),
             struct_input: String::new(),
+            value_edit_buffer: std::collections::HashMap::new(),
         }
     }
 
@@ -93,6 +99,71 @@ impl App {
         }
         if !self.state.struct_expr.is_empty() {
             self.send(Command::Evaluate(self.state.struct_expr.clone()));
+        }
+    }
+
+    /// Applies one `StateEvent` to `self.state` and dispatches whatever
+    /// follow-up commands that transition requires. Extracted out of
+    /// `update()`'s event pump so it can be driven directly in tests without
+    /// an `egui::Context`/`eframe::Frame` (mirrors the `was_paused` idiom:
+    /// flags are captured from the event BEFORE `apply()` consumes it, then
+    /// used to decide what to send AFTER state reflects the new reality).
+    pub(crate) fn apply_state_event(&mut self, s: crate::state::StateEvent) {
+        // GDB can create a second breakpoint on the same resolved line
+        // (e.g. requesting line 11 and line 12, both landing on 12). We
+        // discard the redundant one and remove it from GDB to avoid duplicates.
+        if let crate::state::StateEvent::BreakpointAdded { breakpoint } = &s {
+            if self.state.is_duplicate_breakpoint(breakpoint) {
+                self.send(Command::RemoveBreakpoint(breakpoint.id));
+                return;
+            }
+        }
+
+        let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
+        let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
+        let thread_selected = matches!(s, crate::state::StateEvent::ThreadSelected { .. });
+        let new_global_names = if let crate::state::StateEvent::GlobalNamesReceived { names } = &s
+        {
+            Some(names.clone())
+        } else {
+            None
+        };
+        // -gdb-set's ^done carries no value: the re-fetch below is the sole
+        // source of truth for the refreshed cell (spec "Explicit Refresh
+        // After Successful Write"). Captured before apply() clears the
+        // matching edit_errors entry, mirroring was_paused/thread_selected.
+        let succeeded_target =
+            if let crate::state::StateEvent::ValueEditSucceeded { target } = &s {
+                Some(target.clone())
+            } else {
+                None
+            };
+
+        self.state.apply(s);
+        self.load_source_if_needed();
+        if was_loaded {
+            self.send(Command::RequestRegisterNames);
+            self.send(Command::RequestGlobalNames);
+        }
+        if was_paused {
+            self.refresh_thread_scoped_views();
+        }
+        if thread_selected {
+            self.refresh_thread_scoped_views();
+        }
+        if let Some(names) = new_global_names {
+            for name in names {
+                self.send(Command::EvaluateGlobal(name));
+            }
+        }
+        if let Some(target) = succeeded_target {
+            match target {
+                crate::state::EditTarget::Local(_) => self.send(Command::RequestLocals),
+                crate::state::EditTarget::Global(name) => {
+                    self.send(Command::EvaluateGlobal(name))
+                }
+                crate::state::EditTarget::Register(_) => self.send(Command::RequestRegisters),
+            }
         }
     }
 
@@ -178,43 +249,7 @@ impl eframe::App for App {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 DebuggerEvent::State(s) => {
-                    // GDB can create a second breakpoint on the same resolved line
-                    // (e.g. requesting line 11 and line 12, both landing on 12). We
-                    // discard the redundant one and remove it from GDB to avoid duplicates.
-                    if let crate::state::StateEvent::BreakpointAdded { breakpoint } = &s {
-                        if self.state.is_duplicate_breakpoint(breakpoint) {
-                            self.send(Command::RemoveBreakpoint(breakpoint.id));
-                            continue;
-                        }
-                    }
-
-                    let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
-                    let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
-                    let thread_selected =
-                        matches!(s, crate::state::StateEvent::ThreadSelected { .. });
-                    let new_global_names =
-                        if let crate::state::StateEvent::GlobalNamesReceived { names } = &s {
-                            Some(names.clone())
-                        } else {
-                            None
-                        };
-                    self.state.apply(s);
-                    self.load_source_if_needed();
-                    if was_loaded {
-                        self.send(Command::RequestRegisterNames);
-                        self.send(Command::RequestGlobalNames);
-                    }
-                    if was_paused {
-                        self.refresh_thread_scoped_views();
-                    }
-                    if thread_selected {
-                        self.refresh_thread_scoped_views();
-                    }
-                    if let Some(names) = new_global_names {
-                        for name in names {
-                            self.send(Command::EvaluateGlobal(name));
-                        }
-                    }
+                    self.apply_state_event(s);
                 }
                 DebuggerEvent::Ui(UiEvent::ConsoleOutput(text)) => {
                     self.console_log.push(text);
@@ -408,6 +443,61 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel();
         let app = App::new(DebuggerState::new(), event_rx, cmd_tx);
         (app, cmd_rx)
+    }
+
+    // Design "Re-fetch site": ValueEditSucceeded triggers an explicit
+    // follow-up request matching the edited item's kind — here, a local
+    // variable's write success must re-fetch the whole locals list (GDB's
+    // ^done carries no value; the follow-up is the source of truth).
+    #[test]
+    fn value_edit_succeeded_local_triggers_request_locals_followup() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::ValueEditSucceeded {
+            target: crate::state::EditTarget::Local("x".into()),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::RequestLocals),
+            "expected a RequestLocals follow-up, got {sent:?}"
+        );
+    }
+
+    // Triangulates the follow-up match: a global write must re-evaluate
+    // that specific global, not the whole locals list.
+    #[test]
+    fn value_edit_succeeded_global_triggers_evaluate_global_followup() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::ValueEditSucceeded {
+            target: crate::state::EditTarget::Global("g_counter".into()),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::EvaluateGlobal("g_counter".into())),
+            "expected an EvaluateGlobal(\"g_counter\") follow-up, got {sent:?}"
+        );
+        assert!(!sent.contains(&Command::RequestLocals));
+    }
+
+    // Triangulates the follow-up match: a register write must re-fetch the
+    // whole register set (no single-register MI request exists).
+    #[test]
+    fn value_edit_succeeded_register_triggers_request_registers_followup() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::ValueEditSucceeded {
+            target: crate::state::EditTarget::Register("pc".into()),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::RequestRegisters),
+            "expected a RequestRegisters follow-up, got {sent:?}"
+        );
+        assert!(!sent.contains(&Command::RequestLocals));
     }
 
     // Pins the spec MUST at specs/thread-selection/spec.md:53: both the
