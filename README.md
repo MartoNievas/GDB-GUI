@@ -142,6 +142,5 @@ which guarantees a condition is sent once on commit and never per keystroke.
 
 ## Known limitations
 
-- The call stack shows a single-threaded backtrace; there is no thread selector yet.
 - Breakpoint conditions are validated by GDB, not by the UI: a malformed
   expression is only reported after the command round-trips.

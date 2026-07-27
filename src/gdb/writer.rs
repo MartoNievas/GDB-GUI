@@ -37,6 +37,7 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::RequestDisasm => "-data-disassemble -s $pc -e \"$pc + 64\" -- 0".into(),
 
         Command::RequestThreads => "-thread-info".into(),
+        Command::SelectThread(id) => format!("-thread-select {id}"),
 
         Command::Evaluate(expr) => format!("-data-evaluate-expression {}", quote_mi(expr)),
 
@@ -173,6 +174,15 @@ mod tests {
     #[test]
     fn request_threads_command_maps_to_thread_info() {
         assert_eq!(command_to_mi(&Command::RequestThreads), "-thread-info");
+    }
+
+    // SECURITY (threat-matrix: argument composition — `-thread-select <id>`
+    // smuggling a 2nd MI command): `id: u32` is structurally incapable of
+    // carrying a newline or any other MI-breaking character, so no `quote_mi`
+    // is needed here.
+    #[test]
+    fn select_thread_command_maps_to_thread_select() {
+        assert_eq!(command_to_mi(&Command::SelectThread(7)), "-thread-select 7");
     }
 
     #[test]

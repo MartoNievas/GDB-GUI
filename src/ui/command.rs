@@ -36,6 +36,9 @@ pub enum Command {
     RequestRegisters,
     RequestDisasm,
     RequestThreads,
+    /// Switches GDB's current thread via `-thread-select <id>`. Clickable
+    /// only from a paused thread-panel row (gated UI-side).
+    SelectThread(u32),
     /// Evaluates a single expression via `-data-evaluate-expression`. The
     /// struct panel is this variant's sole producer — no separate
     /// `EvaluateStruct` variant exists because replies are correlated by MI

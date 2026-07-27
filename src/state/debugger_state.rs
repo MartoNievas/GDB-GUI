@@ -184,6 +184,9 @@ pub enum StateEvent {
         threads: Vec<ThreadInfo>,
         current: Option<u32>,
     },
+    ThreadSelected {
+        id: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +344,12 @@ impl DebuggerState {
             StateEvent::ThreadsUpdated { threads, current } => {
                 self.threads = threads;
                 self.current_thread = current;
+            }
+            // Only updates current_thread — the reply's frame={...} is
+            // deliberately ignored (see design.md "Post-switch frame"):
+            // -stack-list-frames stays the single writer of pause.frame.
+            StateEvent::ThreadSelected { id } => {
+                self.current_thread = Some(id);
             }
         }
     }
@@ -509,6 +518,58 @@ mod tests {
         state.apply(StateEvent::ProgramExited { code: Some(0) });
         assert!(state.threads.is_empty());
         assert_eq!(state.current_thread, None);
+    }
+
+    #[test]
+    fn thread_selected_sets_current_leaves_threads_intact() {
+        let mut state = DebuggerState::new();
+        state.threads = vec![
+            ThreadInfo {
+                id: 1,
+                target_id: "Thread 1".into(),
+                state: "stopped".into(),
+                frame: None,
+            },
+            ThreadInfo {
+                id: 3,
+                target_id: "Thread 3".into(),
+                state: "stopped".into(),
+                frame: None,
+            },
+        ];
+        state.current_thread = Some(1);
+
+        state.apply(StateEvent::ThreadSelected { id: 3 });
+
+        assert_eq!(state.current_thread, Some(3));
+        assert_eq!(state.threads.len(), 2);
+        assert_eq!(state.threads[0].id, 1);
+        assert_eq!(state.threads[1].id, 3);
+    }
+
+    // Design decision "Post-switch frame": the -stack-list-frames reply is the
+    // single authoritative writer of `pause.frame`; ThreadSelected must never
+    // touch it (no second writer, no race).
+    #[test]
+    fn thread_selected_leaves_pause_frame_unchanged() {
+        let mut state = DebuggerState::new();
+        state.pause = Some(PauseState {
+            thread_id: 1,
+            frame: Frame {
+                addr: 0x1000,
+                function: "original_frame".into(),
+                file: Some("a.c".into()),
+                line: Some(5),
+            },
+            stack: vec![],
+            stop_reason: StopReason::Unknown,
+        });
+
+        state.apply(StateEvent::ThreadSelected { id: 3 });
+
+        let frame = &state.pause.as_ref().unwrap().frame;
+        assert_eq!(frame.function, "original_frame");
+        assert_eq!(frame.line, Some(5));
     }
 
     #[test]

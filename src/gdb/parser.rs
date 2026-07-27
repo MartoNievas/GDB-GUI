@@ -208,6 +208,15 @@ fn parse_result(line: &str) -> Option<DebuggerEvent> {
                 }));
             }
 
+            // -thread-select → ^done,new-thread-id="N",frame={...}. The
+            // frame is deliberately ignored (design.md: "Post-switch frame").
+            if fields.contains("new-thread-id=")
+                && let Some(id) =
+                    extract_field_str(fields, "new-thread-id").and_then(|s| s.parse().ok())
+            {
+                return Some(DebuggerEvent::State(StateEvent::ThreadSelected { id }));
+            }
+
             None
         }
 
@@ -938,5 +947,73 @@ mod tests {
             }
             other => panic!("expected ThreadsUpdated, got {other:?}"),
         }
+    }
+
+    // ─── Thread select (-thread-select) reply ──────────────────────────────
+
+    // -thread-select's reply → ^done,new-thread-id="N",frame={...}. Must emit
+    // ThreadSelected{id}, and — the reverse direction of the disjointness
+    // check above — a -thread-info-shaped threads=[...] reply must not hit
+    // this branch either.
+    #[test]
+    fn test_new_thread_id_branch_emits_thread_selected() {
+        let line = r#"^done,new-thread-id="3",frame={level="0",addr="0x1",func="foo",args=[],file="a.c",fullname="/tmp/a.c",line="1"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ThreadSelected { id })) => {
+                assert_eq!(id, 3);
+            }
+            other => panic!("expected ThreadSelected, got {other:?}"),
+        }
+
+        let threads_line = r#"^done,threads=[{id="1",target-id="Thread 1",frame={level="0",addr="0x1",func="main",args=[],file="a.c",fullname="/tmp/a.c",line="1"},state="stopped"}],current-thread-id="1""#;
+        match parse_line(threads_line) {
+            Some(DebuggerEvent::State(StateEvent::ThreadsUpdated { .. })) => {}
+            other => panic!(
+                "expected ThreadsUpdated (not ThreadSelected) for a threads=[ reply, got {other:?}"
+            ),
+        }
+    }
+
+    // Threat-matrix RED: the `new-thread-id=` branch must ignore the reply's
+    // `frame={...}` payload entirely — `ThreadSelected` carries only `id`, so
+    // there is structurally no second writer of `pause.frame` from this path
+    // (design.md: "Post-switch frame" decision).
+    #[test]
+    fn test_new_thread_id_branch_ignores_frame_payload() {
+        let line = r#"^done,new-thread-id="7",frame={level="0",addr="0xdead",func="weird_frame",args=[],file="z.c",fullname="/tmp/z.c",line="99"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ThreadSelected { id })) => {
+                assert_eq!(id, 7);
+                // ThreadSelected has no frame field by construction — the
+                // frame payload above is parsed by nothing.
+            }
+            other => panic!("expected ThreadSelected, got {other:?}"),
+        }
+    }
+
+    // Error-path: an ^error reply to -thread-select must route only through
+    // the existing "error" arm (GdbError), never reach the "done" arm
+    // branches above.
+    #[test]
+    fn test_thread_select_error_reply_routes_to_error_arm() {
+        let line = r#"^error,msg="Thread ID 99 not known.""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::Ui(UiEvent::GdbError(msg))) => {
+                assert_eq!(msg, "Thread ID 99 not known.");
+            }
+            other => panic!("expected GdbError, got {other:?}"),
+        }
+    }
+
+    // Spec: "Thread List Refresh Scope Excludes Live Lifecycle Events" — a
+    // `=thread-created` / `=thread-exited` notify-async record must not be
+    // parsed into any state change; the roster refreshes only on pause or a
+    // successful switch. `parse_notify_async`'s `_ => None` arm already
+    // covers this; this test pins that behavior against regressions (e.g. a
+    // future contributor adding a match arm for these classes).
+    #[test]
+    fn test_thread_lifecycle_notify_async_records_are_not_parsed_into_state_changes() {
+        assert!(parse_line(r#"=thread-created,id="2",group-id="i1""#).is_none());
+        assert!(parse_line(r#"=thread-exited,id="2",group-id="i1""#).is_none());
     }
 }

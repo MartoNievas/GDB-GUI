@@ -76,6 +76,26 @@ impl App {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// Refreshes every thread-scoped view: the roster itself plus locals,
+    /// stack, registers, disasm, globals, and the struct expression — none
+    /// of those commands are thread-qualified, so a thread switch (or a new
+    /// pause) invalidates all of them equally. Called identically from both
+    /// the pause path and the post-switch path (see design.md Data Flow) so
+    /// the two call sites cannot drift apart.
+    pub(crate) fn refresh_thread_scoped_views(&self) {
+        self.send(Command::RequestThreads);
+        self.send(Command::RequestLocals);
+        self.send(Command::RequestStack);
+        self.send(Command::RequestRegisters);
+        self.send(Command::RequestDisasm);
+        for name in self.state.global_names.clone() {
+            self.send(Command::EvaluateGlobal(name));
+        }
+        if !self.state.struct_expr.is_empty() {
+            self.send(Command::Evaluate(self.state.struct_expr.clone()));
+        }
+    }
+
     fn load_source_if_needed(&mut self) {
         let target_file = match self.state.current_file() {
             Some(f) => f.to_owned(),
@@ -170,6 +190,8 @@ impl eframe::App for App {
 
                     let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
                     let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
+                    let thread_selected =
+                        matches!(s, crate::state::StateEvent::ThreadSelected { .. });
                     let new_global_names =
                         if let crate::state::StateEvent::GlobalNamesReceived { names } = &s {
                             Some(names.clone())
@@ -183,17 +205,10 @@ impl eframe::App for App {
                         self.send(Command::RequestGlobalNames);
                     }
                     if was_paused {
-                        self.send(Command::RequestThreads);
-                        self.send(Command::RequestLocals);
-                        self.send(Command::RequestStack);
-                        self.send(Command::RequestRegisters);
-                        self.send(Command::RequestDisasm);
-                        for name in self.state.global_names.clone() {
-                            self.send(Command::EvaluateGlobal(name));
-                        }
-                        if !self.state.struct_expr.is_empty() {
-                            self.send(Command::Evaluate(self.state.struct_expr.clone()));
-                        }
+                        self.refresh_thread_scoped_views();
+                    }
+                    if thread_selected {
+                        self.refresh_thread_scoped_views();
                     }
                     if let Some(names) = new_global_names {
                         for name in names {
@@ -382,3 +397,44 @@ fn source_row(
     response
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::DebuggerState;
+    use std::sync::mpsc;
+
+    fn test_app() -> (App, Receiver<Command>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+        let app = App::new(DebuggerState::new(), event_rx, cmd_tx);
+        (app, cmd_rx)
+    }
+
+    // Pins the spec MUST at specs/thread-selection/spec.md:53: both the
+    // pause and post-switch paths call this single shared function, so it
+    // alone is responsible for the roster re-fetch — no drift possible
+    // between two copies.
+    #[test]
+    fn refresh_thread_scoped_views_sends_request_threads_alongside_existing_refreshes() {
+        let (app, cmd_rx) = test_app();
+        app.refresh_thread_scoped_views();
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+
+        assert!(sent.contains(&Command::RequestThreads));
+        assert!(sent.contains(&Command::RequestLocals));
+        assert!(sent.contains(&Command::RequestStack));
+        assert!(sent.contains(&Command::RequestRegisters));
+        assert!(sent.contains(&Command::RequestDisasm));
+    }
+
+    // Mirrors the existing pause-refresh behavior: no struct expression has
+    // ever been committed → no Evaluate command is sent.
+    #[test]
+    fn refresh_thread_scoped_views_sends_no_evaluate_when_struct_expr_empty() {
+        let (app, cmd_rx) = test_app();
+        app.refresh_thread_scoped_views();
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+
+        assert!(!sent.iter().any(|c| matches!(c, Command::Evaluate(_))));
+    }
+}
