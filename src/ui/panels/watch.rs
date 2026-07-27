@@ -160,3 +160,89 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             }
         });
 }
+
+// ─── Value-cell commit/reseed decisions ────────────────────────────────────────
+
+/// Pure decision for a Watch/Registers value cell: a `Command::SetValue` must
+/// be sent only when the program is paused, the field just lost focus
+/// (covers both Enter and blur), AND the edited text actually differs from
+/// the last known-good value. Mirrors
+/// `breakpoints::should_commit_breakpoint_condition`, plus the paused-only
+/// precondition from the spec.
+pub(crate) fn should_commit_value_edit(
+    paused: bool,
+    lost_focus: bool,
+    buffer: &str,
+    current: &str,
+) -> bool {
+    if !paused || !lost_focus {
+        return false;
+    }
+    buffer != current
+}
+
+/// Pure decision for whether a value-cell buffer should be overwritten with
+/// the authoritative value from `DebuggerState` (re-fetch landed, or the cell
+/// was never touched). Never reseeds a focused field — that would clobber
+/// the user's in-progress keystrokes.
+pub(crate) fn should_reseed_value_buffer(has_focus: bool, buffer: &str, authoritative: &str) -> bool {
+    if has_focus {
+        return false;
+    }
+    buffer != authoritative
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_commit_value_edit_false_when_not_paused() {
+        // Even with lost_focus and a real change, a running program must
+        // never accept a value-edit commit (spec: "Paused-Only Edit
+        // Precondition").
+        assert!(!should_commit_value_edit(false, true, "42", "7"));
+    }
+
+    #[test]
+    fn should_commit_value_edit_false_mid_keystroke() {
+        // Simulates typing: field retains focus so lost_focus() is false —
+        // no command must be sent per keystroke, paused or not.
+        assert!(!should_commit_value_edit(true, false, "4", "7"));
+        assert!(!should_commit_value_edit(true, false, "42", "42"));
+    }
+
+    #[test]
+    fn should_commit_value_edit_false_when_unchanged() {
+        // Clicking into the cell and back out without editing (Esc, or
+        // blur-without-change) must not send a no-op SetValue.
+        assert!(!should_commit_value_edit(true, true, "42", "42"));
+    }
+
+    #[test]
+    fn should_commit_value_edit_true_when_paused_lost_focus_and_changed() {
+        assert!(should_commit_value_edit(true, true, "99", "42"));
+        assert!(should_commit_value_edit(true, true, "0x2a", "0x1"));
+    }
+
+    #[test]
+    fn should_reseed_value_buffer_false_when_focused() {
+        // A field the user is actively editing must never be clobbered by an
+        // incoming refresh, even if the buffer has diverged from state.
+        assert!(!should_reseed_value_buffer(true, "in-progress", "42"));
+    }
+
+    #[test]
+    fn should_reseed_value_buffer_false_when_already_matching() {
+        assert!(!should_reseed_value_buffer(false, "42", "42"));
+    }
+
+    #[test]
+    fn should_reseed_value_buffer_true_when_unfocused_and_diverged() {
+        // Covers both the post-refresh case (new authoritative value landed)
+        // and the hard-revert-on-error case (buffer still shows rejected
+        // text, authoritative is the last known-good value).
+        assert!(should_reseed_value_buffer(false, "stale", "42"));
+        assert!(should_reseed_value_buffer(false, "rejected-text", "7"));
+    }
+}
