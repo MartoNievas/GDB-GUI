@@ -136,6 +136,15 @@ pub struct DebuggerState {
     pub threads: Vec<ThreadInfo>,
     pub current_thread: Option<u32>,
     pub persistent: PersistentState,
+    /// Path resolved by the preload-source probe (`Command::ProbeMainSource`)
+    /// while no pause frame exists yet, so the source view has something to
+    /// show before the user hits Run. Cleared on `ProgramLoaded` (new
+    /// executable, previous resolution stale); deliberately survives
+    /// `ProgramStarted`/`ProgramExited` (source stays visible after the
+    /// program ends, where today the view goes blank). Read only through
+    /// `source_view_file()` — `current_file()` stays pause-only so the
+    /// topbar location label keeps meaning "where execution is".
+    pub preview_file: Option<String>,
     /// GDB `^error` message from a failed `Command::SetValue`, keyed by the
     /// target that failed. Cleared for a key on that key's next
     /// `ValueEditSucceeded`. Wiped in full on Loaded/Started/Exited, like the
@@ -216,6 +225,13 @@ pub enum StateEvent {
     ValueEditSucceeded {
         target: EditTarget,
     },
+    /// The preload-source probe resolved `main`'s file (`^done,bkpt={...}`),
+    /// correlated and consumed by MI token in `process.rs` before it ever
+    /// reaches `parse_result` — this event is the probe's only visible
+    /// trace, and it carries no breakpoint id or row of its own.
+    SourcePreviewResolved {
+        file: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +267,7 @@ impl DebuggerState {
                 executable: None,
                 breakpoints: vec![],
             },
+            preview_file: None,
             edit_errors: std::collections::HashMap::new(),
         }
     }
@@ -273,6 +290,9 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
+                // New executable: a previously resolved preview path may no
+                // longer apply.
+                self.preview_file = None;
                 self.edit_errors.clear();
             }
 
@@ -391,6 +411,9 @@ impl DebuggerState {
             StateEvent::ValueEditSucceeded { target } => {
                 self.edit_errors.remove(&target);
             }
+            StateEvent::SourcePreviewResolved { file } => {
+                self.preview_file = Some(file);
+            }
         }
     }
 
@@ -406,6 +429,15 @@ impl DebuggerState {
 
     pub fn current_file(&self) -> Option<&str> {
         self.pause.as_ref()?.frame.file.as_deref()
+    }
+
+    /// File the source view should display: the pause frame's file while
+    /// stopped, else the preload-source probe's resolution (if any). Falls
+    /// back automatically once `pause` is set again — `current_file()` and
+    /// `preview_file` are never both consulted by anything else, so
+    /// precedence lives here alone.
+    pub fn source_view_file(&self) -> Option<&str> {
+        self.current_file().or(self.preview_file.as_deref())
     }
 
     pub fn current_line(&self) -> Option<u32> {
@@ -799,6 +831,70 @@ mod tests {
         assert!(!same_file("/tmp/foobar.c", "bar.c"));
         assert!(!same_file("/tmp/a/example.c", "/tmp/b/example.c"));
         assert!(!same_file("main.c", "example.c"));
+    }
+
+    // ── Preload-source preview ──────────────────────────────────────────────
+
+    #[test]
+    fn source_preview_resolved_sets_preview_file() {
+        let mut state = DebuggerState::new();
+
+        state.apply(StateEvent::SourcePreviewResolved {
+            file: "/tmp/main.c".into(),
+        });
+
+        assert_eq!(state.preview_file, Some("/tmp/main.c".to_string()));
+    }
+
+    #[test]
+    fn source_view_file_prefers_pause_frame_over_preview_once_paused() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::SourcePreviewResolved {
+            file: "/tmp/main.c".into(),
+        });
+        assert_eq!(state.source_view_file(), Some("/tmp/main.c"));
+
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0x1000,
+                    function: "step_fn".into(),
+                    file: Some("/tmp/step.c".into()),
+                    line: Some(3),
+                },
+                stack: vec![],
+                stop_reason: StopReason::Unknown,
+            },
+        });
+
+        assert_eq!(state.source_view_file(), Some("/tmp/step.c"));
+    }
+
+    #[test]
+    fn program_loaded_clears_preview_file_survives_started_and_exited() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::SourcePreviewResolved {
+            file: "/tmp/main.c".into(),
+        });
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert_eq!(state.preview_file, None);
+
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::SourcePreviewResolved {
+            file: "/tmp/main.c".into(),
+        });
+        state.apply(StateEvent::ProgramStarted);
+        assert_eq!(state.preview_file, Some("/tmp/main.c".to_string()));
+
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::SourcePreviewResolved {
+            file: "/tmp/main.c".into(),
+        });
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert_eq!(state.preview_file, Some("/tmp/main.c".to_string()));
     }
 
     #[test]
