@@ -8,7 +8,7 @@ use std::{
 
 use super::parser::{extract_str, parse_line, parse_token};
 use super::writer::{GdbAction, dispatch};
-use crate::state::{DebuggerEvent, StateEvent, UiEvent};
+use crate::state::{DebuggerEvent, EditTarget, StateEvent, UiEvent};
 use crate::ui::command::Command as DebuggerCommand;
 
 /// Generic over `W: Write` so unit tests can substitute an in-memory buffer
@@ -105,6 +105,38 @@ fn correlate_pending_global(
     } else if rest.starts_with("^error") {
         pending_globals.remove(&token);
         None
+    } else {
+        None
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::SetValue` write. If the token matches an entry in
+/// `pending_edit`, removes it (cleanup happens on both success and failure,
+/// mirroring `correlate_pending_global`) and returns the value-edit event
+/// for the caller to emit: `^done` -> `ValueEditSucceeded`, `^error` ->
+/// `ValueEditFailed` with GDB's message. Unlike the struct/global paths,
+/// `^error` here DOES emit an event — the row must show the failure inline.
+/// `-gdb-set` has no `=notify-async` counterpart, so `^done` is the only
+/// signal that triggers the caller's re-fetch.
+fn correlate_pending_edit(
+    line: &str,
+    pending_edit: &mut HashMap<u32, EditTarget>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let target = pending_edit.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_edit.remove(&token);
+        Some(StateEvent::ValueEditSucceeded { target })
+    } else if rest.starts_with("^error") {
+        pending_edit.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::ValueEditFailed {
+            target,
+            message: msg,
+        })
     } else {
         None
     }
@@ -209,6 +241,13 @@ pub fn run_loop(
     // same time after the same pause.
     let mut pending_struct: HashMap<u32, String> = HashMap::new();
 
+    // Token (assigned by GdbWriter::send) -> EditTarget of the
+    // `Command::SetValue` write pending a response. Correlated by token, not
+    // FIFO, like the other pending maps: kept separate so a value-edit reply
+    // is never consumed by the struct/globals/cond paths, even when several
+    // are in flight after the same pause.
+    let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
@@ -253,6 +292,10 @@ pub fn run_loop(
                 pending_globals.insert(token, name.clone());
             }
 
+            if let DebuggerCommand::SetValue { target, .. } = &cmd {
+                pending_edit.insert(token, target.clone());
+            }
+
             // GDB responds to `-break-delete` with a plain `^done` without
             // `=breakpoint-deleted` or the deleted id, so the response cannot be
             // correlated. We emit the removal event ourselves so the UI reflects it.
@@ -292,6 +335,16 @@ pub fn run_loop(
             // exact row. The console GdbError from parse_line below is still
             // emitted regardless (not replaced), so the log loses nothing.
             if let Some(event) = correlate_pending_cond(&line, &mut pending_cond) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
+                }
+            }
+
+            // Value-edit correlation: like pending_cond, does not `continue` —
+            // an `^error` still falls through to parse_line below so the
+            // console log also shows it (not replaced, just supplemented).
+            if let Some(event) = correlate_pending_edit(&line, &mut pending_edit) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
                     return;
@@ -537,6 +590,96 @@ mod tests {
             other => panic!("expected GlobalValueUpdated, got {other:?}"),
         }
         assert!(!pending_globals.contains_key(&20));
+    }
+
+    #[test]
+    fn correlate_pending_edit_emits_succeeded_and_removes_token_on_done() {
+        let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
+        pending_edit.insert(15, EditTarget::Local("x".into()));
+
+        let event = correlate_pending_edit("15^done", &mut pending_edit);
+
+        match event {
+            Some(StateEvent::ValueEditSucceeded { target }) => {
+                assert_eq!(target, EditTarget::Local("x".into()));
+            }
+            other => panic!("expected ValueEditSucceeded, got {other:?}"),
+        }
+        assert!(
+            !pending_edit.contains_key(&15),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_edit_emits_failed_with_message_and_removes_token_on_error() {
+        let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
+        pending_edit.insert(16, EditTarget::Register("pc".into()));
+
+        let event = correlate_pending_edit(
+            "16^error,msg=\"Invalid number \\\"abc\\\".\"",
+            &mut pending_edit,
+        );
+
+        match event {
+            Some(StateEvent::ValueEditFailed { target, message }) => {
+                assert_eq!(target, EditTarget::Register("pc".into()));
+                assert_eq!(message, "Invalid number \"abc\".");
+            }
+            other => panic!("expected ValueEditFailed, got {other:?}"),
+        }
+        assert!(
+            !pending_edit.contains_key(&16),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_edit_ignores_unrelated_tokens() {
+        let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
+        pending_edit.insert(1, EditTarget::Local("kept".into()));
+
+        let event = correlate_pending_edit("2^done", &mut pending_edit);
+        assert!(event.is_none());
+        assert!(pending_edit.contains_key(&1));
+    }
+
+    #[test]
+    fn correlate_pending_edit_and_global_in_flight_resolve_independently() {
+        // Mirrors struct_and_global_evaluations_in_flight_simultaneously_resolve_independently:
+        // an edit write and a globals refresh in flight at the same time must
+        // each resolve only their own token, regardless of arrival order.
+        let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
+        pending_edit.insert(40, EditTarget::Global("g_counter".into()));
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(41, "g_other".into());
+
+        // The globals reply arrives first; the edit path must not touch it
+        // (different token, never in pending_edit).
+        let edit_attempt = correlate_pending_edit("41^done", &mut pending_edit);
+        assert!(edit_attempt.is_none());
+        assert!(pending_edit.contains_key(&40));
+        assert!(pending_globals.contains_key(&41));
+
+        let global_event = correlate_pending_global("41^done,value=\"3\"", &mut pending_globals);
+        match global_event {
+            Some(StateEvent::GlobalValueUpdated { name, value }) => {
+                assert_eq!(name, "g_other");
+                assert_eq!(value, "3");
+            }
+            other => panic!("expected GlobalValueUpdated, got {other:?}"),
+        }
+        assert!(!pending_globals.contains_key(&41));
+
+        // The edit reply resolves its own token afterward, unaffected.
+        let edit_event = correlate_pending_edit("40^done", &mut pending_edit);
+        match edit_event {
+            Some(StateEvent::ValueEditSucceeded { target }) => {
+                assert_eq!(target, EditTarget::Global("g_counter".into()));
+            }
+            other => panic!("expected ValueEditSucceeded, got {other:?}"),
+        }
+        assert!(!pending_edit.contains_key(&40));
     }
 
     #[test]
