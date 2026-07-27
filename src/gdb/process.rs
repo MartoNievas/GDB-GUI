@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{Receiver, Sender},
     thread,
 };
 
-use super::parser::{extract_str, parse_line, parse_token};
+use super::parser::{extract_str, parse_breakpoint_field, parse_line, parse_token};
 use super::writer::{GdbAction, dispatch};
 use crate::state::{DebuggerEvent, EditTarget, StateEvent, UiEvent};
 use crate::ui::command::Command as DebuggerCommand;
@@ -142,6 +142,50 @@ fn correlate_pending_edit(
     }
 }
 
+/// Outcome of a resolved `Command::ProbeMainSource` reply, correlated by MI
+/// token in `correlate_pending_probe`. Never crosses into a `StateEvent`
+/// that reaches the UI as its own row — `run_loop` translates `Resolved`
+/// into a direct `-break-delete` write plus `StateEvent::SourcePreviewResolved`,
+/// and `Failed` into a silent no-op.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeOutcome {
+    Resolved { number: u32, file: String },
+    Failed,
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to the
+/// pending `Command::ProbeMainSource` probe. If the token matches an entry
+/// in `pending_probe`, removes it (cleanup happens on both success and
+/// failure, mirroring the other `pending_*` correlators) and returns the
+/// outcome for the caller to act on. `^done,bkpt={...}` resolves via
+/// `parse_breakpoint_field` (the same tested code path `parse_result` uses
+/// for a real `AddBreakpoint` reply) into `Resolved{number,file}`.
+/// `^error` (no `main` symbol) yields `Failed`. Checked and `continue`d on
+/// in `run_loop` before `parse_line`, so a probe reply never reaches
+/// `parse_result` and never becomes `BreakpointAdded`.
+fn correlate_pending_probe(line: &str, pending_probe: &mut HashSet<u32>) -> Option<ProbeOutcome> {
+    let token = parse_token(line)?;
+    if !pending_probe.contains(&token) {
+        return None;
+    }
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_probe.remove(&token);
+        let fields = rest.strip_prefix("^done,").unwrap_or("");
+        let bp = parse_breakpoint_field(fields, "bkpt")?;
+        Some(ProbeOutcome::Resolved {
+            number: bp.id,
+            file: bp.file,
+        })
+    } else if rest.starts_with("^error") {
+        pending_probe.remove(&token);
+        Some(ProbeOutcome::Failed)
+    } else {
+        None
+    }
+}
+
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
 fn spawn_gdb(
@@ -248,6 +292,13 @@ pub fn run_loop(
     // are in flight after the same pause.
     let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
 
+    // Token (assigned by GdbWriter::send) of the in-flight
+    // `Command::ProbeMainSource` probe, if any. Correlated by token like the
+    // other pending sets: its reply is intercepted and `continue`d on before
+    // `parse_line`, so it never reaches `parse_result` and never becomes a
+    // `BreakpointAdded` row (see `correlate_pending_probe`).
+    let mut pending_probe: HashSet<u32> = HashSet::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
@@ -296,6 +347,10 @@ pub fn run_loop(
                 pending_edit.insert(token, target.clone());
             }
 
+            if matches!(cmd, DebuggerCommand::ProbeMainSource) {
+                pending_probe.insert(token);
+            }
+
             // GDB responds to `-break-delete` with a plain `^done` without
             // `=breakpoint-deleted` or the deleted id, so the response cannot be
             // correlated. We emit the removal event ourselves so the UI reflects it.
@@ -326,6 +381,38 @@ pub fn run_loop(
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
                     return;
+                }
+                continue;
+            }
+
+            // Preload-source probe correlation: intercepted and `continue`d
+            // on for BOTH outcomes, before `parse_line`, so the probe's
+            // `^done,bkpt={...}` never reaches `parse_result` and never
+            // becomes a `BreakpointAdded` row (design decision #2). On
+            // `Resolved`, the probe's own `-break-delete <number>` is
+            // written directly through `writer` here — not via
+            // `Command::RemoveBreakpoint` — so no `BreakpointRemoved` event
+            // is emitted for a row the UI never had (design decision #3).
+            // On `Failed` (no `main` symbol), nothing is emitted: a silent
+            // no-op matching today's empty-source-view behavior.
+            if let Some(outcome) = correlate_pending_probe(&line, &mut pending_probe) {
+                if let ProbeOutcome::Resolved { number, file } = outcome {
+                    if let Err(e) = writer.send(&format!("-break-delete {number}")) {
+                        let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
+                            "Error escribiendo a GDB: {e}"
+                        ))));
+                        let _ = child.kill();
+                        return;
+                    }
+                    if event_tx
+                        .send(DebuggerEvent::State(StateEvent::SourcePreviewResolved {
+                            file,
+                        }))
+                        .is_err()
+                    {
+                        let _ = child.kill();
+                        return;
+                    }
                 }
                 continue;
             }
@@ -680,6 +767,71 @@ mod tests {
             other => panic!("expected ValueEditSucceeded, got {other:?}"),
         }
         assert!(!pending_edit.contains_key(&40));
+    }
+
+    // ── Preload-source probe correlation ────────────────────────────────────
+    //
+    // The probe's `^done,bkpt={...}` must be intercepted and resolved by
+    // token before the line ever reaches `parse_line`/`parse_result` — it
+    // must never become a `StateEvent::BreakpointAdded` (design decision #2).
+
+    #[test]
+    fn correlate_pending_probe_resolves_done_and_removes_token() {
+        let mut pending_probe: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        pending_probe.insert(3);
+
+        let outcome = correlate_pending_probe(
+            "3^done,bkpt={number=\"1\",fullname=\"/tmp/main.c\",line=\"5\"}",
+            &mut pending_probe,
+        );
+
+        match outcome {
+            Some(ProbeOutcome::Resolved { number, file }) => {
+                assert_eq!(number, 1);
+                assert_eq!(file, "/tmp/main.c");
+            }
+            other => panic!("expected ProbeOutcome::Resolved, got {other:?}"),
+        }
+        assert!(
+            !pending_probe.contains(&3),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_probe_resolves_error_and_removes_token_no_event() {
+        let mut pending_probe: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        pending_probe.insert(4);
+
+        let outcome = correlate_pending_probe(
+            "4^error,msg=\"Function \\\"main\\\" not defined.\"",
+            &mut pending_probe,
+        );
+
+        match outcome {
+            Some(ProbeOutcome::Failed) => {}
+            other => panic!("expected ProbeOutcome::Failed, got {other:?}"),
+        }
+        assert!(
+            !pending_probe.contains(&4),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_probe_ignores_unrelated_tokens() {
+        let mut pending_probe: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        pending_probe.insert(1);
+
+        // A real AddBreakpoint reply on a different, untracked token must
+        // not be consumed by the probe path.
+        let outcome = correlate_pending_probe(
+            "2^done,bkpt={number=\"5\",fullname=\"/tmp/other.c\",line=\"9\"}",
+            &mut pending_probe,
+        );
+
+        assert!(outcome.is_none());
+        assert!(pending_probe.contains(&1), "unrelated entry must survive untouched");
     }
 
     #[test]
