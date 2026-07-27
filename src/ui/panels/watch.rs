@@ -1,9 +1,11 @@
 //! Watch/Registers/Data tabs content — extracted from app.rs in slice S3.
 
-use eframe::egui::{self, Color32, ScrollArea, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontId, ScrollArea, Stroke, TextEdit, Vec2};
 
 use super::util::visible_register_rows;
+use crate::state::EditTarget;
 use crate::ui::app::App;
+use crate::ui::command::Command;
 use crate::ui::registers::RegClass;
 use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m};
@@ -63,14 +65,26 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(2.0);
+            let paused = app.state.is_paused();
             match app.watch_tab {
                 WatchTab::Watch => {
+                    let mut pending_commits: Vec<Command> = Vec::new();
+
                     for var in &app.state.locals {
+                        let target = EditTarget::Local(var.name.clone());
+                        let error = app.state.edit_error(&target).map(|s| s.to_string());
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
                             ui.label(m(&var.name, 11.0, TXT_CYAN));
                             ui.label(m(" = ", 11.0, TXT_DIM));
-                            ui.label(m(&var.value, 11.0, TXT_YELLOW));
+                            if let Some(cmd) =
+                                value_cell(ui, &mut app.value_edit_buffer, &target, &var.value, paused)
+                            {
+                                pending_commits.push(cmd);
+                            }
+                            if let Some(msg) = &error {
+                                ui.label(m("⚠", 12.0, RED)).on_hover_text(msg.clone());
+                            }
                         });
                     }
                     if app.state.locals.is_empty() {
@@ -84,13 +98,30 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             ui.label(m("Globals", 10.0, TXT_DIM).italics());
                         });
                         for var in &app.state.globals {
+                            let target = EditTarget::Global(var.name.clone());
+                            let error = app.state.edit_error(&target).map(|s| s.to_string());
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
                                 ui.label(m(&var.name, 11.0, TXT_CYAN));
                                 ui.label(m(" = ", 11.0, TXT_DIM));
-                                ui.label(m(&var.value, 11.0, TXT_YELLOW));
+                                if let Some(cmd) = value_cell(
+                                    ui,
+                                    &mut app.value_edit_buffer,
+                                    &target,
+                                    &var.value,
+                                    paused,
+                                ) {
+                                    pending_commits.push(cmd);
+                                }
+                                if let Some(msg) = &error {
+                                    ui.label(m("⚠", 12.0, RED)).on_hover_text(msg.clone());
+                                }
                             });
                         }
+                    }
+
+                    for cmd in pending_commits {
+                        app.send(cmd);
                     }
                 }
                 WatchTab::Registers => {
@@ -98,6 +129,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         ui.label(m("Not paused — no register data", 11.0, TXT_DIM).italics());
                     } else {
                         let rows = visible_register_rows(&app.state.register_names, &app.state.registers);
+                        let mut pending_commits: Vec<Command> = Vec::new();
 
                         for (class, label, color) in REG_GROUPS {
                             let mut group: Vec<_> =
@@ -120,7 +152,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             });
 
                             egui::Grid::new(label)
-                                .num_columns(2)
+                                .num_columns(3)
                                 .spacing([12.0, 1.0])
                                 .striped(true)
                                 .show(ui, |ui| {
@@ -129,10 +161,30 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                             ui.add_space(8.0);
                                             ui.label(m(name, 11.0, color));
                                         });
-                                        ui.label(m(value, 11.0, TXT_YELLOW));
+                                        let target = EditTarget::Register(name.clone());
+                                        let error =
+                                            app.state.edit_error(&target).map(|s| s.to_string());
+                                        if let Some(cmd) = value_cell(
+                                            ui,
+                                            &mut app.value_edit_buffer,
+                                            &target,
+                                            value,
+                                            paused,
+                                        ) {
+                                            pending_commits.push(cmd);
+                                        }
+                                        if let Some(msg) = &error {
+                                            ui.label(m("⚠", 12.0, RED)).on_hover_text(msg.clone());
+                                        } else {
+                                            ui.label("");
+                                        }
                                         ui.end_row();
                                     }
                                 });
+                        }
+
+                        for cmd in pending_commits {
+                            app.send(cmd);
                         }
                     }
                 }
@@ -159,6 +211,68 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
         });
+}
+
+// ─── Editable value cell ────────────────────────────────────────────────────────
+
+/// Renders one editable value cell (Locals/Globals/Registers): a `TextEdit`
+/// seeded from `authoritative` while paused, a plain label while running
+/// (inert per the "Paused-Only Edit Precondition" requirement). Esc reverts
+/// the buffer immediately without committing (spec: "User cancels an
+/// edit"); a commit decision (4.1) queues — never sends directly, avoiding a
+/// mutable/immutable borrow conflict on `App` while iterating `app.state` —
+/// a `Command::SetValue` for the caller to flush after the render pass. A
+/// reseed decision (4.2) then hard-reverts an unfocused, diverged buffer
+/// back to `authoritative`, which covers both the post-refresh case and the
+/// error hard-revert case (ValueEditFailed never updates the authoritative
+/// value, so the very next unfocused frame snaps back to the last
+/// known-good value).
+fn value_cell(
+    ui: &mut egui::Ui,
+    buffer_map: &mut std::collections::HashMap<EditTarget, String>,
+    target: &EditTarget,
+    authoritative: &str,
+    paused: bool,
+) -> Option<Command> {
+    let buffer = buffer_map
+        .entry(target.clone())
+        .or_insert_with(|| authoritative.to_string());
+
+    if !paused {
+        // Inert while running: keep the buffer in lockstep with the
+        // authoritative value so it is ready to display verbatim the moment
+        // the program pauses again.
+        *buffer = authoritative.to_string();
+        ui.label(m(buffer.as_str(), 11.0, TXT_YELLOW));
+        return None;
+    }
+
+    let resp = ui.add(
+        TextEdit::singleline(buffer)
+            .font(FontId::monospace(11.0))
+            .desired_width(100.0),
+    );
+
+    let escaped = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if escaped {
+        *buffer = authoritative.to_string();
+    }
+
+    let commit = if !escaped && should_commit_value_edit(paused, resp.lost_focus(), buffer, authoritative)
+    {
+        Some(Command::SetValue {
+            target: target.clone(),
+            value: buffer.clone(),
+        })
+    } else {
+        None
+    };
+
+    if should_reseed_value_buffer(resp.has_focus(), buffer, authoritative) {
+        *buffer = authoritative.to_string();
+    }
+
+    commit
 }
 
 // ─── Value-cell commit/reseed decisions ────────────────────────────────────────
