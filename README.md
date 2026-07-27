@@ -17,6 +17,10 @@ structured, panel-based UI instead of the raw command line.
 - **Execution control** — Run, Continue, Step, Next (step over), Finish (step out),
   Interrupt (pause a freely running program) and Restart.
 - **Call stack** — full backtrace of the paused thread.
+- **Thread switching** — the Thread panel lists every live thread (fetched via
+  `-thread-info`); click a row while paused to switch GDB's active thread —
+  stack, locals, registers, disassembly and the thread list itself refresh
+  for the newly selected thread.
 - **Locals & globals** — variables in scope plus program-level globals, with live values.
 - **Registers** — general-purpose registers for the current architecture
   (x86-64, x86-32, ARM64, RISC-V), sorted in a conventional order.
@@ -120,7 +124,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui)
 | `panels/stack.rs`               | Call stack / backtrace.                          |
 | `panels/watch.rs`               | Watch / Registers / Data tabs.                   |
 | `panels/struct_panel.rs`        | Expansion of struct-typed values.                |
-| `panels/thread.rs`              | Thread information.                              |
+| `panels/thread.rs`              | Thread list and switching.                       |
 | `panels/files.rs`               | Source file selection.                           |
 | `panels/console.rs`             | GDB console output and input line.               |
 | `panels/commands.rs`            | Command shortcuts.                               |
