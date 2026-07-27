@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{Receiver, Sender},
@@ -77,6 +77,33 @@ fn correlate_pending_struct(
         Some(StateEvent::StructValueUpdated { expr, value })
     } else if rest.starts_with("^error") {
         pending_struct.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// global-variable `Command::EvaluateGlobal`. If the token matches an entry
+/// in `pending_globals`, removes it (cleanup happens on both success and
+/// failure). `^done,value=...` returns `GlobalValueUpdated{name,value}` for
+/// the caller to emit. `^error` returns `None` — the token is still removed
+/// (so a failed evaluation, e.g. a global out of scope after a pause, cannot
+/// leak an entry forever) but no event is emitted here.
+fn correlate_pending_global(
+    line: &str,
+    pending_globals: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let name = pending_globals.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_globals.remove(&token);
+        let value = extract_str(rest, "value")?;
+        Some(StateEvent::GlobalValueUpdated { name, value })
+    } else if rest.starts_with("^error") {
+        pending_globals.remove(&token);
         None
     } else {
         None
@@ -162,11 +189,12 @@ pub fn run_loop(
         }
     });
 
-    // FIFO queue of global variable names pending evaluation. GDB responds to
-    // synchronous commands (-data-evaluate-expression, etc.) in the same order they
-    // are sent, so we can correlate each nameless "^done,value=..." with its
-    // corresponding name simply by dequeuing in arrival order.
-    let mut pending_globals: VecDeque<String> = VecDeque::new();
+    // Token (assigned by GdbWriter::send) -> global-variable name pending a
+    // response. Correlated by token, not FIFO: kept separate from
+    // `pending_struct` (and vice versa) so a globals response is never
+    // consumed by the struct path, even when both are in flight at the same
+    // time after the same pause.
+    let mut pending_globals: HashMap<u32, String> = HashMap::new();
 
     // Token (assigned by GdbWriter::send) -> id of the breakpoint whose
     // `-break-condition` is pending a response. GDB echoes the token in its
@@ -200,10 +228,6 @@ pub fn run_loop(
                 GdbAction::Mi(mi) => mi,
             };
 
-            if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
-                pending_globals.push_back(name.clone());
-            }
-
             let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!("> {mi}"))));
 
             let token = match writer.send(&mi) {
@@ -225,6 +249,10 @@ pub fn run_loop(
                 pending_struct.insert(token, expr.clone());
             }
 
+            if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
+                pending_globals.insert(token, name.clone());
+            }
+
             // GDB responds to `-break-delete` with a plain `^done` without
             // `=breakpoint-deleted` or the deleted id, so the response cannot be
             // correlated. We emit the removal event ourselves so the UI reflects it.
@@ -240,8 +268,9 @@ pub fn run_loop(
             // echoed to the console: parse_line already translates them into state
             // events, and real errors arrive separately as GdbError. Only stream
             // records (~ @) produce readable text for the user.
-            // Struct-panel correlation: checked FIRST, before pending_globals, so
-            // that a struct response is never consumed by the globals FIFO.
+            // Struct-panel correlation: checked FIRST, before pending_globals. Both
+            // sides are token-keyed maps, so isolation is mutual — neither path can
+            // consume the other's reply, regardless of check order.
             if let Some(event) = correlate_pending_struct(&line, &mut pending_struct) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
@@ -250,16 +279,10 @@ pub fn run_loop(
                 continue;
             }
 
-            if !pending_globals.is_empty() && is_bare_value_done(&line) {
-                if let Some(name) = pending_globals.pop_front() {
-                    if let Some(value) = extract_str(&line, "value") {
-                        let event =
-                            DebuggerEvent::State(StateEvent::GlobalValueUpdated { name, value });
-                        if event_tx.send(event).is_err() {
-                            let _ = child.kill();
-                            return;
-                        }
-                    }
+            if let Some(event) = correlate_pending_global(&line, &mut pending_globals) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
                 }
                 continue;
             }
@@ -309,13 +332,6 @@ fn send_interrupt(pid: u32) {
 #[cfg(not(unix))]
 fn send_interrupt(_pid: u32) {
     // Signal-based interrupt is only supported on Unix for now.
-}
-
-/// true if the line is exactly `^done,value="..."`, the response to
-/// -data-evaluate-expression with no other field.
-fn is_bare_value_done(line: &str) -> bool {
-    line.trim_start_matches(|c: char| c.is_ascii_digit())
-        .starts_with("^done,value=\"")
 }
 
 #[cfg(test)]
@@ -442,5 +458,134 @@ mod tests {
         let event = correlate_pending_cond("2^done", &mut pending_cond);
         assert!(event.is_none());
         assert!(pending_cond.contains_key(&1));
+    }
+
+    #[test]
+    fn correlate_pending_global_emits_event_and_removes_token_on_done() {
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(11, "g_counter".into());
+
+        let event = correlate_pending_global("11^done,value=\"42\"", &mut pending_globals);
+
+        match event {
+            Some(StateEvent::GlobalValueUpdated { name, value }) => {
+                assert_eq!(name, "g_counter");
+                assert_eq!(value, "42");
+            }
+            other => panic!("expected GlobalValueUpdated, got {other:?}"),
+        }
+        assert!(
+            !pending_globals.contains_key(&11),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_global_removes_token_and_emits_no_event_on_error() {
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(12, "g_out_of_scope".into());
+
+        let event = correlate_pending_global(
+            "12^error,msg=\"No symbol \\\"g_out_of_scope\\\" in current context.\"",
+            &mut pending_globals,
+        );
+
+        assert!(event.is_none());
+        assert!(
+            !pending_globals.contains_key(&12),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_global_ignores_unrelated_tokens() {
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(1, "g_flag".into());
+
+        // Simulates a raced Command::Raw reply sharing the same
+        // `^done,value="..."` shape but a different, untracked token.
+        let event = correlate_pending_global("2^done,value=\"5\"", &mut pending_globals);
+        assert!(event.is_none());
+        assert!(pending_globals.contains_key(&1));
+    }
+
+    #[test]
+    fn correlate_pending_global_out_of_order_replies_resolve_correct_names() {
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(20, "g_first".into());
+        pending_globals.insert(21, "g_second".into());
+
+        // Replies arrive reversed: token 21 first, then token 20.
+        let event_second =
+            correlate_pending_global("21^done,value=\"200\"", &mut pending_globals);
+        match event_second {
+            Some(StateEvent::GlobalValueUpdated { name, value }) => {
+                assert_eq!(name, "g_second");
+                assert_eq!(value, "200");
+            }
+            other => panic!("expected GlobalValueUpdated, got {other:?}"),
+        }
+        assert!(!pending_globals.contains_key(&21));
+        assert!(pending_globals.contains_key(&20));
+
+        let event_first = correlate_pending_global("20^done,value=\"100\"", &mut pending_globals);
+        match event_first {
+            Some(StateEvent::GlobalValueUpdated { name, value }) => {
+                assert_eq!(name, "g_first");
+                assert_eq!(value, "100");
+            }
+            other => panic!("expected GlobalValueUpdated, got {other:?}"),
+        }
+        assert!(!pending_globals.contains_key(&20));
+    }
+
+    #[test]
+    fn struct_and_global_evaluations_in_flight_simultaneously_resolve_independently() {
+        // Mirrors the struct-inspection spec scenario: a globals refresh and a
+        // struct expression evaluation are both pending after the same pause,
+        // and their replies (checked struct-first, as in the reply loop) each
+        // update only their own panel, regardless of arrival order.
+        let mut pending_struct: HashMap<u32, String> = HashMap::new();
+        pending_struct.insert(30, "my_struct.field".into());
+        let mut pending_globals: HashMap<u32, String> = HashMap::new();
+        pending_globals.insert(31, "g_counter".into());
+
+        // The globals reply arrives first. The struct path (checked first in
+        // the real loop) must not consume it, since its token isn't its own.
+        let struct_attempt =
+            correlate_pending_struct("31^done,value=\"7\"", &mut pending_struct);
+        assert!(struct_attempt.is_none());
+        assert!(
+            pending_struct.contains_key(&30),
+            "struct path must not touch its own pending entry when the reply belongs to globals"
+        );
+        assert!(
+            pending_globals.contains_key(&31),
+            "struct path must never remove a globals entry"
+        );
+
+        // The globals path resolves its own token correctly.
+        let global_event = correlate_pending_global("31^done,value=\"7\"", &mut pending_globals);
+        match global_event {
+            Some(StateEvent::GlobalValueUpdated { name, value }) => {
+                assert_eq!(name, "g_counter");
+                assert_eq!(value, "7");
+            }
+            other => panic!("expected GlobalValueUpdated, got {other:?}"),
+        }
+        assert!(!pending_globals.contains_key(&31));
+
+        // The struct reply arrives after and still resolves to its own entry,
+        // unaffected by the globals reply that was processed in between.
+        let struct_event =
+            correlate_pending_struct("30^done,value=\"{a = 1}\"", &mut pending_struct);
+        match struct_event {
+            Some(StateEvent::StructValueUpdated { expr, value }) => {
+                assert_eq!(expr, "my_struct.field");
+                assert_eq!(value, "{a = 1}");
+            }
+            other => panic!("expected StructValueUpdated, got {other:?}"),
+        }
+        assert!(!pending_struct.contains_key(&30));
     }
 }

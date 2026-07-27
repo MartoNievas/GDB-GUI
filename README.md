@@ -143,8 +143,5 @@ which guarantees a condition is sent once on commit and never per keystroke.
 ## Known limitations
 
 - The call stack shows a single-threaded backtrace; there is no thread selector yet.
-- Global-variable values are correlated to their expressions by request order,
-  which can be confused if raw `-data-evaluate-expression` commands are issued
-  from the console while globals are being refreshed.
 - Breakpoint conditions are validated by GDB, not by the UI: a malformed
   expression is only reported after the command round-trips.
