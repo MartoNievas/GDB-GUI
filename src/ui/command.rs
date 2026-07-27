@@ -35,6 +35,7 @@ pub enum Command {
     RequestRegisterNames,
     RequestRegisters,
     RequestDisasm,
+    RequestThreads,
     /// Evaluates a single expression via `-data-evaluate-expression`. The
     /// struct panel is this variant's sole producer — no separate
     /// `EvaluateStruct` variant exists because replies are correlated by MI
@@ -73,6 +74,12 @@ mod tests {
                 condition: Some("i == 10".into()),
             }
         );
+    }
+
+    #[test]
+    fn request_threads_command_constructs_and_compares() {
+        assert_eq!(Command::RequestThreads, Command::RequestThreads);
+        assert_ne!(Command::RequestThreads, Command::RequestStack);
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         Command::RequestDisasm => "-data-disassemble -s $pc -e \"$pc + 64\" -- 0".into(),
 
+        Command::RequestThreads => "-thread-info".into(),
+
         Command::Evaluate(expr) => format!("-data-evaluate-expression {}", quote_mi(expr)),
 
         Command::RequestGlobalNames => "-symbol-info-variables".into(),
@@ -45,7 +47,9 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         // Interrupt is not an MI command: it is dispatched as a signal (SIGINT)
         // from `dispatch`, which intercepts it before it gets here.
-        Command::Interrupt => unreachable!("Interrupt is signal-dispatched via dispatch(), never MI"),
+        Command::Interrupt => {
+            unreachable!("Interrupt is signal-dispatched via dispatch(), never MI")
+        }
     }
 }
 
@@ -164,6 +168,11 @@ mod tests {
     fn evaluate_command_quotes_expression_with_spaces() {
         let mi = command_to_mi(&Command::Evaluate("arr[i + 1]".into()));
         assert_eq!(mi, "-data-evaluate-expression \"arr[i + 1]\"");
+    }
+
+    #[test]
+    fn request_threads_command_maps_to_thread_info() {
+        assert_eq!(command_to_mi(&Command::RequestThreads), "-thread-info");
     }
 
     #[test]

@@ -183,6 +183,7 @@ impl eframe::App for App {
                         self.send(Command::RequestGlobalNames);
                     }
                     if was_paused {
+                        self.send(Command::RequestThreads);
                         self.send(Command::RequestLocals);
                         self.send(Command::RequestStack);
                         self.send(Command::RequestRegisters);

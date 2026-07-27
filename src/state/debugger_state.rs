@@ -68,6 +68,16 @@ pub enum StopReason {
     Unknown,
 }
 
+// ─── Thread ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct ThreadInfo {
+    pub id: u32,
+    pub target_id: String,
+    pub state: String,
+    pub frame: Option<Frame>,
+}
+
 // ─── Pause state ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -111,6 +121,8 @@ pub struct DebuggerState {
     pub globals: Vec<Variable>,
     pub struct_expr: String,
     pub struct_value: Option<String>,
+    pub threads: Vec<ThreadInfo>,
+    pub current_thread: Option<u32>,
     pub persistent: PersistentState,
 }
 
@@ -118,22 +130,60 @@ pub struct DebuggerState {
 
 #[derive(Clone, Debug)]
 pub enum StateEvent {
-    ProgramLoaded { executable: String },
+    ProgramLoaded {
+        executable: String,
+    },
     ProgramStarted,
-    ProgramPaused { pause: PauseState },
-    ProgramExited { code: Option<i32> },
-    StackUpdated { frames: Vec<Frame> },
-    BreakpointAdded { breakpoint: Breakpoint },
-    BreakpointRemoved { id: u32 },
-    BreakpointToggled { id: u32, enabled: bool },
-    BreakpointConditionError { id: u32, message: String },
-    LocalsUpdated { vars: Vec<Variable> },
-    RegisterNamesReceived { names: Vec<String> },
-    RegistersUpdated { registers: Vec<Register> },
-    DisasmUpdated { lines: Vec<AsmLine> },
-    GlobalNamesReceived { names: Vec<String> },
-    GlobalValueUpdated { name: String, value: String },
-    StructValueUpdated { expr: String, value: String },
+    ProgramPaused {
+        pause: PauseState,
+    },
+    ProgramExited {
+        code: Option<i32>,
+    },
+    StackUpdated {
+        frames: Vec<Frame>,
+    },
+    BreakpointAdded {
+        breakpoint: Breakpoint,
+    },
+    BreakpointRemoved {
+        id: u32,
+    },
+    BreakpointToggled {
+        id: u32,
+        enabled: bool,
+    },
+    BreakpointConditionError {
+        id: u32,
+        message: String,
+    },
+    LocalsUpdated {
+        vars: Vec<Variable>,
+    },
+    RegisterNamesReceived {
+        names: Vec<String>,
+    },
+    RegistersUpdated {
+        registers: Vec<Register>,
+    },
+    DisasmUpdated {
+        lines: Vec<AsmLine>,
+    },
+    GlobalNamesReceived {
+        names: Vec<String>,
+    },
+    GlobalValueUpdated {
+        name: String,
+        value: String,
+    },
+    StructValueUpdated {
+        expr: String,
+        value: String,
+    },
+    ThreadsUpdated {
+        threads: Vec<ThreadInfo>,
+        current: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +213,8 @@ impl DebuggerState {
             globals: vec![],
             struct_expr: String::new(),
             struct_value: None,
+            threads: vec![],
+            current_thread: None,
             persistent: PersistentState {
                 executable: None,
                 breakpoints: vec![],
@@ -186,6 +238,8 @@ impl DebuggerState {
                 // expression may no longer resolve — reset both.
                 self.struct_expr = String::new();
                 self.struct_value = None;
+                self.threads = vec![];
+                self.current_thread = None;
             }
 
             StateEvent::ProgramStarted => {
@@ -200,6 +254,8 @@ impl DebuggerState {
                 // struct_expr survives run/pause/continue cycles so it is
                 // auto-re-evaluated on the next pause; only the stale value clears.
                 self.struct_value = None;
+                self.threads = vec![];
+                self.current_thread = None;
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -227,6 +283,8 @@ impl DebuggerState {
                 self.disasm = vec![];
                 self.globals = vec![];
                 self.struct_value = None;
+                self.threads = vec![];
+                self.current_thread = None;
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -279,6 +337,10 @@ impl DebuggerState {
                 if expr == self.struct_expr {
                     self.struct_value = Some(value);
                 }
+            }
+            StateEvent::ThreadsUpdated { threads, current } => {
+                self.threads = threads;
+                self.current_thread = current;
             }
         }
     }
@@ -386,6 +448,67 @@ mod tests {
             condition: None,
             condition_error: None,
         }
+    }
+
+    #[test]
+    fn threads_updated_sets_threads_and_current() {
+        let mut state = DebuggerState::new();
+        let threads = vec![
+            ThreadInfo {
+                id: 1,
+                target_id: "Thread 1".into(),
+                state: "stopped".into(),
+                frame: None,
+            },
+            ThreadInfo {
+                id: 2,
+                target_id: "Thread 2".into(),
+                state: "stopped".into(),
+                frame: None,
+            },
+        ];
+
+        state.apply(StateEvent::ThreadsUpdated {
+            threads: threads.clone(),
+            current: Some(2),
+        });
+
+        assert_eq!(state.threads.len(), 2);
+        assert_eq!(state.threads[0].id, 1);
+        assert_eq!(state.current_thread, Some(2));
+    }
+
+    #[test]
+    fn program_loaded_started_exited_clear_threads() {
+        let thread = ThreadInfo {
+            id: 1,
+            target_id: "Thread 1".into(),
+            state: "stopped".into(),
+            frame: None,
+        };
+
+        let mut state = DebuggerState::new();
+        state.threads = vec![thread.clone()];
+        state.current_thread = Some(1);
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.threads.is_empty());
+        assert_eq!(state.current_thread, None);
+
+        let mut state = DebuggerState::new();
+        state.threads = vec![thread.clone()];
+        state.current_thread = Some(1);
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.threads.is_empty());
+        assert_eq!(state.current_thread, None);
+
+        let mut state = DebuggerState::new();
+        state.threads = vec![thread];
+        state.current_thread = Some(1);
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.threads.is_empty());
+        assert_eq!(state.current_thread, None);
     }
 
     #[test]

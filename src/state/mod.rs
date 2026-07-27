@@ -15,6 +15,7 @@ pub use debugger_state::{
     Register,
     StateEvent,
     StopReason,
+    ThreadInfo,
 
     UiEvent,
     Variable,

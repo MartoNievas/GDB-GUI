@@ -1,6 +1,7 @@
 #[allow(unused_imports)]
 use crate::state::{
-    Breakpoint, DebuggerEvent, Frame, PauseState, StateEvent, StopReason, UiEvent, Variable,
+    Breakpoint, DebuggerEvent, Frame, PauseState, StateEvent, StopReason, ThreadInfo, UiEvent,
+    Variable,
 };
 
 pub fn parse_line(line: &str) -> Option<DebuggerEvent> {
@@ -196,6 +197,17 @@ fn parse_result(line: &str) -> Option<DebuggerEvent> {
                 }));
             }
 
+            // -thread-info → ^done,threads=[{id="1",...},...],current-thread-id="N"
+            if fields.contains("threads=[") {
+                let threads = parse_threads(fields);
+                let current =
+                    extract_field_str(fields, "current-thread-id").and_then(|s| s.parse().ok());
+                return Some(DebuggerEvent::State(StateEvent::ThreadsUpdated {
+                    threads,
+                    current,
+                }));
+            }
+
             None
         }
 
@@ -215,6 +227,30 @@ pub fn extract_str(fields: &str, key: &str) -> Option<String> {
     let rest = &fields[start..];
     let end = find_closing_quote(rest)?;
     Some(unescape(&rest[..end]))
+}
+
+/// Like `extract_str`, but boundary-anchored: only matches `key="` at index 0
+/// or immediately after `,` / `{`. This avoids `extract_str`'s substring
+/// collision — e.g. `extract_str(fields, "id")` would match inside
+/// `target-id="..."` if `id="..."` never occurs on its own. Needed for keys
+/// (like `id`) that are a suffix of another key present in the same block.
+pub fn extract_field_str(fields: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let mut search_from = 0usize;
+
+    while search_from <= fields.len() {
+        let idx = fields[search_from..].find(&needle)? + search_from;
+        let boundary_ok = idx == 0 || matches!(fields.as_bytes()[idx - 1], b',' | b'{');
+        if boundary_ok {
+            let start = idx + needle.len();
+            let rest = &fields[start..];
+            let end = find_closing_quote(rest)?;
+            return Some(unescape(&rest[..end]));
+        }
+        search_from = idx + 1;
+    }
+
+    None
 }
 
 fn extract_block<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
@@ -288,6 +324,48 @@ fn parse_stack(fields: &str) -> Vec<Frame> {
     }
 
     frames
+}
+
+// ─── Threads ──────────────────────────────────────────────────────────────────
+
+fn parse_thread(block: &str) -> Option<ThreadInfo> {
+    // `id` collides as a substring of `target-id=`, so it needs the
+    // boundary-anchored extractor; `target-id` and `state` are unambiguous.
+    let id = extract_field_str(block, "id").and_then(|s| s.parse().ok())?;
+    let target_id = extract_str(block, "target-id").unwrap_or_default();
+    let state = extract_str(block, "state").unwrap_or_default();
+    let frame = extract_block(block, "frame").and_then(parse_frame);
+
+    Some(ThreadInfo {
+        id,
+        target_id,
+        state,
+        frame,
+    })
+}
+
+fn parse_threads(fields: &str) -> Vec<ThreadInfo> {
+    let list = match extract_list(fields, "threads") {
+        Some(l) => l,
+        None => return vec![],
+    };
+
+    let mut threads = vec![];
+    let mut rest = list;
+
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        if let Some(end) = find_closing_brace(rest) {
+            if let Some(thread) = parse_thread(&rest[..end]) {
+                threads.push(thread);
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    threads
 }
 
 fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
@@ -771,5 +849,94 @@ mod tests {
         let line = r#"5^done,value="42""#;
         let event = parse_line(line);
         assert!(event.is_none());
+    }
+
+    // ─── Thread list parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_field_str_rejects_substring_match() {
+        // "id=\"" is a substring of "target-id=\"" — extract_field_str must not
+        // match inside it (boundary-anchored: only at index 0 or right after
+        // ',' / '{').
+        let fields = r#"target-id="Thread 2","#;
+        assert_eq!(extract_field_str(fields, "id"), None);
+
+        // Leading match (index 0).
+        let leading = r#"id="1",target-id="Thread 2""#;
+        assert_eq!(extract_field_str(leading, "id"), Some("1".into()));
+
+        // Match right after a comma.
+        let after_comma = r#"target-id="Thread 2",id="3""#;
+        assert_eq!(extract_field_str(after_comma, "id"), Some("3".into()));
+
+        // Match right after an opening brace.
+        let after_brace = r#"{id="5",func="main"}"#;
+        assert_eq!(extract_field_str(after_brace, "id"), Some("5".into()));
+    }
+
+    #[test]
+    fn test_parse_threads_happy_path() {
+        // Real -thread-info capture shape (GDB MI docs example).
+        let line = r#"^done,threads=[{id="2",target-id="Thread 0xb7e14b90 (LWP 21257)",frame={level="0",addr="0x0804891f",func="foo",args=[{name="i",value="10"}],file="test.c",fullname="/home/foo/bar/test.c",line="158"},state="stopped"},{id="1",target-id="process 21257",frame={level="0",addr="0x0804891f",func="foo",args=[{name="i",value="10"}],file="test.c",fullname="/home/foo/bar/test.c",line="158"},state="stopped"}],current-thread-id="1""#;
+
+        let rest = &line[1..];
+        let (class, fields) = split_class_fields(rest);
+        assert_eq!(class, "done");
+
+        let threads = parse_threads(fields);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, 2);
+        assert_eq!(threads[0].target_id, "Thread 0xb7e14b90 (LWP 21257)");
+        assert_eq!(threads[0].state, "stopped");
+        assert!(threads[0].frame.is_some());
+        assert_eq!(threads[0].frame.as_ref().unwrap().function, "foo");
+        assert_eq!(threads[1].id, 1);
+        assert_eq!(threads[1].target_id, "process 21257");
+
+        assert_eq!(
+            extract_field_str(fields, "current-thread-id"),
+            Some("1".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_threads_single_thread() {
+        let line = r#"^done,threads=[{id="1",target-id="Thread 0x7ffff7fc2740 (LWP 12345)",frame={level="0",addr="0x0000555555555185",func="main",args=[],file="a.c",fullname="/tmp/a.c",line="10"},state="stopped"}],current-thread-id="1""#;
+        let rest = &line[1..];
+        let (_, fields) = split_class_fields(rest);
+        let threads = parse_threads(fields);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, 1);
+    }
+
+    // Threat-matrix RED: target-id containing braces, an escaped quote, and
+    // commas must not confuse the brace/comma-based scanning (mirrors
+    // parse_stack's in_str handling in find_closing).
+    #[test]
+    fn test_parse_threads_robustness_braces_quotes_commas() {
+        let line = r#"^done,threads=[{id="1",target-id="Thread \"weird, {name}\"",frame={level="0",addr="0x1",func="main",args=[],file="a.c",fullname="/tmp/a.c",line="1"},state="stopped"}],current-thread-id="1""#;
+        let rest = &line[1..];
+        let (_, fields) = split_class_fields(rest);
+        let threads = parse_threads(fields);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, 1);
+        assert_eq!(threads[0].target_id, "Thread \"weird, {name}\"");
+        assert_eq!(threads[0].state, "stopped");
+    }
+
+    // Branch order-independence: a -thread-info-shaped ^done,threads=[...]
+    // reply must not also emit ThreadSelected (keys are disjoint from
+    // `new-thread-id=`).
+    #[test]
+    fn test_threads_branch_disjoint_from_new_thread_id() {
+        let line = r#"^done,threads=[{id="1",target-id="Thread 1",frame={level="0",addr="0x1",func="main",args=[],file="a.c",fullname="/tmp/a.c",line="1"},state="stopped"}],current-thread-id="1""#;
+        let event = parse_line(line);
+        match event {
+            Some(DebuggerEvent::State(StateEvent::ThreadsUpdated { threads, current })) => {
+                assert_eq!(threads.len(), 1);
+                assert_eq!(current, Some(1));
+            }
+            other => panic!("expected ThreadsUpdated, got {other:?}"),
+        }
     }
 }
