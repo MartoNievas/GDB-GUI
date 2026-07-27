@@ -1,3 +1,4 @@
+use crate::state::EditTarget;
 use crate::ui::command::Command;
 
 pub fn command_to_mi(cmd: &Command) -> String {
@@ -44,6 +45,8 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::RequestGlobalNames => "-symbol-info-variables".into(),
         Command::EvaluateGlobal(name) => format!("-data-evaluate-expression {name}"),
 
+        Command::SetValue { target, value } => build_gdb_set(target, value),
+
         Command::Raw(s) => s.clone(),
 
         // Interrupt is not an MI command: it is dispatched as a signal (SIGINT)
@@ -88,9 +91,35 @@ pub fn dispatch(cmd: &Command) -> GdbAction {
 /// inside a "condition" argument would let an attacker smuggle a second,
 /// independent MI command into the subprocess's stdin (command injection).
 pub fn quote_mi(arg: &str) -> String {
-    let sanitized: String = arg.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    let sanitized = strip_mi_newlines(arg);
     let escaped = sanitized.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
+}
+
+/// SECURITY: strips embedded `\n`/`\r` from `s`. GDB's MI reads one command
+/// per line, so an unstripped newline inside a composed argument would let
+/// an attacker smuggle a second, independent MI command into the
+/// subprocess's stdin (command injection). Shared by `quote_mi` (quoted
+/// arguments) and `build_gdb_set` (raw, unquoted arguments) so both paths
+/// get the same guard.
+pub fn strip_mi_newlines(s: &str) -> String {
+    s.chars().filter(|&c| c != '\n' && c != '\r').collect()
+}
+
+/// Builds a `-gdb-set` command writing `value` to `target`. RAW and
+/// unquoted: `-gdb-set` (like `-break-insert`) reads CLI-style text, so
+/// wrapping `value` in `quote_mi`'s escaping would embed literal `\"`/`\\`
+/// into the written value instead of the user's intended text. The
+/// composed string is still passed through `strip_mi_newlines` as the
+/// injection guard.
+pub fn build_gdb_set(target: &EditTarget, value: &str) -> String {
+    let mi = match target {
+        EditTarget::Local(name) | EditTarget::Global(name) => {
+            format!("-gdb-set var {name}={value}")
+        }
+        EditTarget::Register(name) => format!("-gdb-set ${name}={value}"),
+    };
+    strip_mi_newlines(&mi)
 }
 
 /// Builds `-break-insert [-c <quoted>] file:line`. `condition` is applied
@@ -117,6 +146,30 @@ pub fn build_break_condition(id: u32, condition: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn build_gdb_set_local_uses_var_form_unquoted() {
+        assert_eq!(
+            build_gdb_set(&EditTarget::Local("x".into()), "42"),
+            "-gdb-set var x=42"
+        );
+    }
+
+    #[test]
+    fn build_gdb_set_global_uses_var_form_unquoted() {
+        assert_eq!(
+            build_gdb_set(&EditTarget::Global("g_counter".into()), "7"),
+            "-gdb-set var g_counter=7"
+        );
+    }
+
+    #[test]
+    fn build_gdb_set_register_uses_dollar_form_unquoted() {
+        assert_eq!(
+            build_gdb_set(&EditTarget::Register("pc".into()), "0x400000"),
+            "-gdb-set $pc=0x400000"
+        );
+    }
+
     // SECURITY (mandatory first): an embedded newline must never survive into
     // the quoted argument — otherwise it could smuggle a second, independent
     // MI command into GDB's stdin (command injection via the condition field).
@@ -129,6 +182,27 @@ mod tests {
             "quoted MI argument must not contain a raw newline: {quoted:?}"
         );
         assert_eq!(quoted, "\"x == 1-exec-continue\"");
+    }
+
+    // SECURITY (threat-matrix: argument composition into subprocess stdin):
+    // a value containing a newline must not smuggle a second, independent MI
+    // command into GDB's stdin. build_gdb_set is unquoted (raw value), so it
+    // relies on strip_mi_newlines rather than quote_mi's escaping.
+    #[test]
+    fn gdb_set_strips_embedded_newline() {
+        let mi = build_gdb_set(&EditTarget::Local("x".into()), "1\n-exec-continue");
+        assert!(
+            !mi.contains('\n'),
+            "composed -gdb-set command must not contain a raw newline: {mi:?}"
+        );
+        assert_eq!(mi, "-gdb-set var x=1-exec-continue");
+    }
+
+    #[test]
+    fn gdb_set_strips_embedded_carriage_return() {
+        let mi = build_gdb_set(&EditTarget::Register("pc".into()), "1\r-exec-continue");
+        assert!(!mi.contains('\r'));
+        assert_eq!(mi, "-gdb-set $pc=1-exec-continue");
     }
 
     #[test]
