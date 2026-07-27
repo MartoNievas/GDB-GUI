@@ -62,6 +62,89 @@ cargo run -- ./myprogram
 The executable argument is optional — you can also launch the GUI on its own and
 load a binary later through the GDB console (`-file-exec-and-symbols <path>`).
 
+## Installation
+
+The following dependencies are required to compile and install the project:
+
+- **rustup** (provides the Rust compiler and Cargo).
+- **cargo-make** (runs the `Makefile.toml` tasks used below).
+
+Install `cargo-make` the same way on every platform, once `rustup`/`cargo` is set up:
+
+```bash
+cargo install cargo-make
+```
+
+### Linux/WSL
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install cargo-make
+```
+
+Build and install the binary to `/usr/local/bin` (requires `sudo`, since it writes
+outside your home directory):
+
+```bash
+sudo makers install
+```
+
+Uninstall with:
+
+```bash
+sudo makers uninstall
+```
+
+### MacOS
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install cargo-make
+```
+
+Same install/uninstall tasks as Linux — the `Makefile.toml` routes macOS to the
+same `/usr/local/bin` install:
+
+```bash
+sudo makers install
+sudo makers uninstall
+```
+
+### Windows
+
+Install Rust via [rustup-init.exe](https://rustup.rs), then:
+
+```powershell
+cargo install cargo-make
+makers install
+```
+
+This runs `cargo install --path .`, which places `gdb-gui.exe` in
+`%USERPROFILE%\.cargo\bin` (already on `PATH` after the rustup install). No
+administrator privileges are needed. Uninstall with:
+
+```powershell
+makers uninstall
+```
+
+## Running the installed binary
+
+Once installed, `gdb-gui` is on your `PATH` and can be launched from any terminal
+(same on Linux, macOS and Windows):
+
+```bash
+gdb-gui ./myprogram
+```
+
+The executable argument is optional — you can launch `gdb-gui` on its own and
+load a binary later through the GDB console (`file [binary_path]`).
+
+> **Note:** Do not move the source code from the directory where the debugged
+> program was compiled. Debug info embeds the absolute source paths recorded
+> at compile time, and `gdb-gui` resolves source files against that path first
+> before falling back to paths relative to the current directory. If the
+> source tree moves, source view may fail to locate the file.
+
 ## Usage
 
 1. **Load** — pass your binary on the command line (see above).

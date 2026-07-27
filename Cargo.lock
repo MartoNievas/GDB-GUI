@@ -1157,7 +1157,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gdb_gui"
+name = "gdb-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
