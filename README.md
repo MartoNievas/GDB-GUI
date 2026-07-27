@@ -24,6 +24,12 @@ structured, panel-based UI instead of the raw command line.
 - **Locals & globals** — variables in scope plus program-level globals, with live values.
 - **Registers** — general-purpose registers for the current architecture
   (x86-64, x86-32, ARM64, RISC-V), sorted in a conventional order.
+- **Value editing** — click a local, global or register value cell while paused
+  to edit it in place; press <kbd>Enter</kbd> (or click away) to write it to
+  GDB via `-gdb-set`. The cell always reflects GDB's own value, never the
+  typed text — on success it is refreshed from GDB, on error it hard-reverts
+  and shows GDB's message inline with a ⚠ marker. Struct fields remain
+  read-only.
 - **Disassembly** — instructions around the program counter, with the current
   instruction marked.
 - **Integrated GDB console** — type raw GDB/MI commands and see GDB's output.
@@ -140,9 +146,11 @@ cargo test
 ```
 
 Unit tests cover the MI parser, the MI writer (including the quoting of
-breakpoint conditions), the `DebuggerState` transitions, and the pure decision
-functions extracted from the UI — for example `should_commit_breakpoint_condition`,
-which guarantees a condition is sent once on commit and never per keystroke.
+breakpoint conditions and the injection-safe composition of `-gdb-set`
+commands), the `DebuggerState` transitions, and the pure decision functions
+extracted from the UI — for example `should_commit_breakpoint_condition` and
+`should_commit_value_edit`, which guarantee a condition or value is sent once
+on commit and never per keystroke.
 
 ## Known limitations
 
