@@ -377,7 +377,7 @@ fn parse_threads(fields: &str) -> Vec<ThreadInfo> {
     threads
 }
 
-fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
+pub(crate) fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoint> {
     let block = extract_block(fields, key)?;
 
     let id = extract_str(block, "number")

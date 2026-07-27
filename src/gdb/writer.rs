@@ -24,6 +24,7 @@ pub fn command_to_mi(cmd: &Command) -> String {
             }
         }
         Command::SetBreakpointCondition { id, condition } => build_break_condition(*id, condition),
+        Command::ProbeMainSource => "-break-insert -t main".into(),
 
         Command::LoadExecutable(path) => format!("-file-exec-and-symbols {path}"),
 
@@ -309,5 +310,19 @@ mod tests {
             GdbAction::Mi(mi) => assert_eq!(mi, "-exec-continue"),
             GdbAction::Interrupt => panic!("Continue must be an MI command, not a signal"),
         }
+    }
+
+    // Preload-source probe: a one-shot temp breakpoint at `main`, used to
+    // resolve main's source file before the user hits Run. Static literal,
+    // zero interpolation — no injection surface (threat-matrix row: MI
+    // argument composition into GDB stdin).
+    #[test]
+    fn probe_main_source_maps_to_break_insert_temp_main() {
+        let mi = command_to_mi(&Command::ProbeMainSource);
+        assert_eq!(mi, "-break-insert -t main");
+        assert!(
+            !mi.contains('\n'),
+            "probe MI command must not contain a raw newline: {mi:?}"
+        );
     }
 }

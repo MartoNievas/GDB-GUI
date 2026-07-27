@@ -28,6 +28,12 @@ pub enum Command {
         id: u32,
         condition: String,
     },
+    /// One-shot probe: `-break-insert -t main`, sent right after
+    /// `ProgramLoaded` so the source view has something to show before the
+    /// user hits Run. Its reply is intercepted and correlated by MI token
+    /// in `process.rs` (`pending_probe`) — it never becomes a `Breakpoint`
+    /// row and never reaches the UI as a `Command`/state event of its own.
+    ProbeMainSource,
 
     // Program
     LoadExecutable(String),
