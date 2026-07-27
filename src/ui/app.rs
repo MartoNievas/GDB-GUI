@@ -144,6 +144,12 @@ impl App {
         if was_loaded {
             self.send(Command::RequestRegisterNames);
             self.send(Command::RequestGlobalNames);
+            // One-shot probe so the source view has something to show
+            // before the user hits Run — see design "Preload main's source
+            // at load time". Its reply never crosses into a `Command`,
+            // `Breakpoint`, or panel row (process.rs intercepts it by MI
+            // token before parse_line).
+            self.send(Command::ProbeMainSource);
         }
         if was_paused {
             self.refresh_thread_scoped_views();
@@ -168,7 +174,7 @@ impl App {
     }
 
     fn load_source_if_needed(&mut self) {
-        let target_file = match self.state.current_file() {
+        let target_file = match self.state.source_view_file() {
             Some(f) => f.to_owned(),
             None => {
                 self.source_lines.clear();
@@ -526,5 +532,30 @@ mod tests {
         let sent: Vec<Command> = cmd_rx.try_iter().collect();
 
         assert!(!sent.iter().any(|c| matches!(c, Command::Evaluate(_))));
+    }
+
+    // Preload-source: ProgramLoaded must trigger the one-shot probe
+    // alongside the existing register-names/global-names requests, and the
+    // probe itself must never surface as a breakpoint row — process.rs
+    // intercepts and consumes its reply by MI token before it ever becomes
+    // a StateEvent::BreakpointAdded, so no probe-originated event ever
+    // reaches apply_state_event in the first place.
+    #[test]
+    fn program_loaded_sends_probe_main_source_and_creates_no_breakpoint_row() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::ProbeMainSource),
+            "expected a ProbeMainSource follow-up, got {sent:?}"
+        );
+        assert!(
+            app.state.persistent.breakpoints.is_empty(),
+            "ProgramLoaded alone must not create a breakpoint row"
+        );
     }
 }
