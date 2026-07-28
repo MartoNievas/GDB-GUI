@@ -3,6 +3,17 @@ name = "gdb-gui"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = 3
+
+lto = "fat"
+
+codegen-units = 1
+
+panic = "abort"
+
+strip = true
+
 [dependencies]
 egui = "0.33.3"
 eframe = "0.33.3"

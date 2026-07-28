@@ -95,38 +95,6 @@ Uninstall with:
 sudo makers uninstall
 ```
 
-### MacOS
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-cargo install cargo-make
-```
-
-Same install/uninstall tasks as Linux — the `Makefile.toml` routes macOS to the
-same `/usr/local/bin` install:
-
-```bash
-sudo makers install
-sudo makers uninstall
-```
-
-### Windows
-
-Install Rust via [rustup-init.exe](https://rustup.rs), then:
-
-```powershell
-cargo install cargo-make
-makers install
-```
-
-This runs `cargo install --path .`, which places `gdb-gui.exe` in
-`%USERPROFILE%\.cargo\bin` (already on `PATH` after the rustup install). No
-administrator privileges are needed. Uninstall with:
-
-```powershell
-makers uninstall
-```
-
 ## Running the installed binary
 
 Once installed, `gdb-gui` is on your `PATH` and can be launched from any terminal

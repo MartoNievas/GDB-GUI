@@ -8,8 +8,6 @@ args = ["build", "--release"]
 description = "Installs the executable depending on the OS"
 dependencies = ["build-release"]
 linux_alias = "install-unix"
-mac_alias = "install-unix"
-windows_alias = "install-windows"
 
 # --- UNIX INSTALL (Linux / macOS) ---
 [tasks.install-unix]
@@ -18,30 +16,13 @@ script = [
   "install -m 755 target/release/gdb-gui /usr/local/bin/gdb-gui"
 ]
 
-# --- WINDOWS INSTALL ---
-[tasks.install-windows]
-script_runner = "@duckscript"
-script = '''
-# Installs binary directly to %USERPROFILE%\.cargo\bin (which is in Windows PATH)
-exec -- cargo install --path .
-'''
-
 # --- MAIN UNINSTALL TASK (OS ROUTER) ---
 [tasks.uninstall]
 description = "Removes the installed executable"
 linux_alias = "uninstall-unix"
-mac_alias = "uninstall-unix"
-windows_alias = "uninstall-windows"
 
 # --- UNIX UNINSTALL ---
 [tasks.uninstall-unix]
 script = [
   "rm -f /usr/local/bin/gdb-gui"
 ]
-
-# --- WINDOWS UNINSTALL ---
-[tasks.uninstall-windows]
-script_runner = "@duckscript"
-script = '''
-rm %USERPROFILE%/.cargo/bin/gdb-gui.exe
-'''
