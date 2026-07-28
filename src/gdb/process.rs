@@ -111,6 +111,37 @@ fn correlate_pending_global(
 }
 
 /// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::AddWatchpoint`. If the token matches an entry in
+/// `pending_watch`, removes it (cleanup happens on both success and
+/// failure). `^error` returns `WatchpointError{expr,message}` for the caller
+/// to emit — success needs no event here: GDB's `-break-watch` reply is
+/// self-describing (`wpt=`/`hw-rwpt=`/`hw-awpt=`), parsed by the normal
+/// `parse_line` path into `WatchpointAdded` (design decision: "Creation
+/// replies are self-describing... so success needs no token map").
+fn correlate_pending_watch(
+    line: &str,
+    pending_watch: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let expr = pending_watch.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_watch.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::WatchpointError {
+            expr,
+            message: msg,
+        })
+    } else if rest.starts_with("^done") {
+        pending_watch.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
 /// `Command::SetValue` write. If the token matches an entry in
 /// `pending_edit`, removes it (cleanup happens on both success and failure,
 /// mirroring `correlate_pending_global`) and returns the value-edit event
@@ -183,6 +214,25 @@ fn correlate_pending_probe(line: &str, pending_probe: &mut HashSet<u32>) -> Opti
         Some(ProbeOutcome::Failed)
     } else {
         None
+    }
+}
+
+/// Pure decision for the two watchpoint commands (`RemoveWatchpoint`,
+/// `ToggleWatchpoint`) that have no correlatable reply: `-break-delete`
+/// gives a bare `^done` with no id (mirroring `RemoveBreakpoint`), and
+/// `-break-enable`/`-break-disable` also reply with a bare `^done` while the
+/// `=breakpoint-modified` notify a watchpoint would otherwise get is dropped
+/// by `parse_breakpoint_field`'s file/fullname bail (design decision D3).
+/// Both are therefore emitted optimistically at send time (D2, D4) instead
+/// of being correlated from a reply. `None` for every other command.
+fn optimistic_watchpoint_event(cmd: &DebuggerCommand) -> Option<StateEvent> {
+    match cmd {
+        DebuggerCommand::RemoveWatchpoint(id) => Some(StateEvent::WatchpointRemoved { id: *id }),
+        DebuggerCommand::ToggleWatchpoint { id, enable } => Some(StateEvent::WatchpointToggled {
+            id: *id,
+            enabled: *enable,
+        }),
+        _ => None,
     }
 }
 
@@ -299,6 +349,13 @@ pub fn run_loop(
     // `BreakpointAdded` row (see `correlate_pending_probe`).
     let mut pending_probe: HashSet<u32> = HashSet::new();
 
+    // Token (assigned by GdbWriter::send) -> expression of the
+    // `Command::AddWatchpoint` pending a response. Correlated by token, not
+    // FIFO, like the other pending maps: only `^error` needs correlation
+    // here (success is self-describing and flows through the normal
+    // `parse_line` path into `WatchpointAdded`).
+    let mut pending_watch: HashMap<u32, String> = HashMap::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
@@ -351,6 +408,10 @@ pub fn run_loop(
                 pending_probe.insert(token);
             }
 
+            if let DebuggerCommand::AddWatchpoint { expr, .. } = &cmd {
+                pending_watch.insert(token, expr.clone());
+            }
+
             // GDB responds to `-break-delete` with a plain `^done` without
             // `=breakpoint-deleted` or the deleted id, so the response cannot be
             // correlated. We emit the removal event ourselves so the UI reflects it.
@@ -358,6 +419,14 @@ pub fn run_loop(
                 let _ = event_tx.send(DebuggerEvent::State(StateEvent::BreakpointRemoved {
                     id: *id,
                 }));
+            }
+
+            // Watchpoint remove/toggle (D2, D4): neither `-break-delete` nor
+            // `-break-enable`/`-break-disable` gives a reply this can
+            // correlate a row update from (see `optimistic_watchpoint_event`
+            // doc comment), so both are emitted optimistically at send time.
+            if let Some(event) = optimistic_watchpoint_event(&cmd) {
+                let _ = event_tx.send(DebuggerEvent::State(event));
             }
         }
 
@@ -432,6 +501,19 @@ pub fn run_loop(
             // an `^error` still falls through to parse_line below so the
             // console log also shows it (not replaced, just supplemented).
             if let Some(event) = correlate_pending_edit(&line, &mut pending_edit) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
+                }
+            }
+
+            // Watchpoint-creation correlation: like pending_cond/pending_edit,
+            // does not `continue` on `^error` — the console log still shows
+            // it via parse_line below. On `^done`, the token is cleaned up
+            // and the line falls through to parse_line, which turns the
+            // self-describing `wpt=`/`hw-rwpt=`/`hw-awpt=` reply into
+            // `WatchpointAdded`.
+            if let Some(event) = correlate_pending_watch(&line, &mut pending_watch) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
                     return;
@@ -832,6 +914,100 @@ mod tests {
 
         assert!(outcome.is_none());
         assert!(pending_probe.contains(&1), "unrelated entry must survive untouched");
+    }
+
+    // ── Watchpoint remove/toggle fire-and-forget (D2, D4) ────────────────────
+
+    #[test]
+    fn optimistic_watchpoint_event_remove_emits_watchpoint_removed() {
+        let event = optimistic_watchpoint_event(&DebuggerCommand::RemoveWatchpoint(3));
+        match event {
+            Some(StateEvent::WatchpointRemoved { id }) => assert_eq!(id, 3),
+            other => panic!("expected WatchpointRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimistic_watchpoint_event_toggle_emits_watchpoint_toggled() {
+        let enable_event = optimistic_watchpoint_event(&DebuggerCommand::ToggleWatchpoint {
+            id: 5,
+            enable: true,
+        });
+        match enable_event {
+            Some(StateEvent::WatchpointToggled { id, enabled }) => {
+                assert_eq!(id, 5);
+                assert!(enabled);
+            }
+            other => panic!("expected WatchpointToggled, got {other:?}"),
+        }
+
+        let disable_event = optimistic_watchpoint_event(&DebuggerCommand::ToggleWatchpoint {
+            id: 5,
+            enable: false,
+        });
+        match disable_event {
+            Some(StateEvent::WatchpointToggled { id, enabled }) => {
+                assert_eq!(id, 5);
+                assert!(!enabled);
+            }
+            other => panic!("expected WatchpointToggled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimistic_watchpoint_event_ignores_unrelated_commands() {
+        assert!(optimistic_watchpoint_event(&DebuggerCommand::Continue).is_none());
+        assert!(optimistic_watchpoint_event(&DebuggerCommand::RemoveBreakpoint(1)).is_none());
+    }
+
+    // ── Watchpoint creation correlation ──────────────────────────────────────
+
+    #[test]
+    fn correlate_pending_watch_emits_error_for_correct_expr() {
+        let mut pending_watch: HashMap<u32, String> = HashMap::new();
+        pending_watch.insert(9, "nosuchvar".into());
+
+        let event = correlate_pending_watch(
+            "9^error,msg=\"No symbol \\\"nosuchvar\\\" in current context.\"",
+            &mut pending_watch,
+        );
+
+        match event {
+            Some(StateEvent::WatchpointError { expr, message }) => {
+                assert_eq!(expr, "nosuchvar");
+                assert_eq!(message, "No symbol \"nosuchvar\" in current context.");
+            }
+            other => panic!("expected WatchpointError, got {other:?}"),
+        }
+        assert!(
+            !pending_watch.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_watch_done_is_cleanup_only_no_event() {
+        let mut pending_watch: HashMap<u32, String> = HashMap::new();
+        pending_watch.insert(7, "x".into());
+
+        // Success carries no event here: the self-describing wpt= reply is
+        // parsed separately by parse_line into WatchpointAdded.
+        let result = correlate_pending_watch("7^done,wpt={number=\"2\",exp=\"x\"}", &mut pending_watch);
+        assert!(result.is_none());
+        assert!(
+            !pending_watch.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_watch_ignores_unrelated_tokens() {
+        let mut pending_watch: HashMap<u32, String> = HashMap::new();
+        pending_watch.insert(1, "kept".into());
+
+        let event = correlate_pending_watch("2^done", &mut pending_watch);
+        assert!(event.is_none());
+        assert!(pending_watch.contains_key(&1));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::state::EditTarget;
+use crate::state::{EditTarget, WatchpointKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -27,6 +27,25 @@ pub enum Command {
     SetBreakpointCondition {
         id: u32,
         condition: String,
+    },
+
+    // Watchpoints
+    /// Creates an expression watchpoint via `-break-watch [-r|-a] <expr>`
+    /// depending on `kind`. Fire-and-forget: the reply is self-describing
+    /// (`wpt=`/`hw-rwpt=`/`hw-awpt=`), so no `pending_*` map is needed for a
+    /// successful creation — only `^error` is correlated back to `expr`.
+    AddWatchpoint {
+        expr: String,
+        kind: WatchpointKind,
+    },
+    /// Deletes a watchpoint via `-break-delete <id>` — reuses the shared
+    /// breakpoint/watchpoint/catchpoint id space and lifecycle verb.
+    RemoveWatchpoint(u32),
+    /// Toggles a watchpoint's active state via `-break-enable`/
+    /// `-break-disable <id>`.
+    ToggleWatchpoint {
+        id: u32,
+        enable: bool,
     },
     /// One-shot probe: `-break-insert -t main`, sent right after
     /// `ProgramLoaded` so the source view has something to show before the
@@ -143,5 +162,53 @@ mod tests {
         };
         assert_eq!(a, b);
         assert_ne!(a, clear);
+    }
+
+    #[test]
+    fn add_watchpoint_carries_expr_and_kind() {
+        let write = Command::AddWatchpoint {
+            expr: "x".into(),
+            kind: WatchpointKind::Write,
+        };
+        let read = Command::AddWatchpoint {
+            expr: "x".into(),
+            kind: WatchpointKind::Read,
+        };
+        let other_expr = Command::AddWatchpoint {
+            expr: "y".into(),
+            kind: WatchpointKind::Write,
+        };
+        assert_eq!(
+            write,
+            Command::AddWatchpoint {
+                expr: "x".into(),
+                kind: WatchpointKind::Write,
+            }
+        );
+        assert_ne!(write, read);
+        assert_ne!(write, other_expr);
+    }
+
+    #[test]
+    fn remove_and_toggle_watchpoint_construct_and_compare() {
+        assert_eq!(Command::RemoveWatchpoint(3), Command::RemoveWatchpoint(3));
+        assert_ne!(Command::RemoveWatchpoint(3), Command::RemoveWatchpoint(4));
+
+        let enable = Command::ToggleWatchpoint {
+            id: 3,
+            enable: true,
+        };
+        let disable = Command::ToggleWatchpoint {
+            id: 3,
+            enable: false,
+        };
+        assert_eq!(
+            enable,
+            Command::ToggleWatchpoint {
+                id: 3,
+                enable: true,
+            }
+        );
+        assert_ne!(enable, disable);
     }
 }

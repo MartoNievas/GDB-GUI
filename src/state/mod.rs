@@ -20,4 +20,6 @@ pub use debugger_state::{
 
     UiEvent,
     Variable,
+    Watchpoint,
+    WatchpointKind,
 };

@@ -1,4 +1,4 @@
-use crate::state::EditTarget;
+use crate::state::{EditTarget, WatchpointKind};
 use crate::ui::command::Command;
 
 pub fn command_to_mi(cmd: &Command) -> String {
@@ -25,6 +25,16 @@ pub fn command_to_mi(cmd: &Command) -> String {
         }
         Command::SetBreakpointCondition { id, condition } => build_break_condition(*id, condition),
         Command::ProbeMainSource => "-break-insert -t main".into(),
+
+        Command::AddWatchpoint { expr, kind } => build_break_watch(*kind, expr),
+        Command::RemoveWatchpoint(id) => format!("-break-delete {id}"),
+        Command::ToggleWatchpoint { id, enable } => {
+            if *enable {
+                format!("-break-enable {id}")
+            } else {
+                format!("-break-disable {id}")
+            }
+        }
 
         Command::LoadExecutable(path) => format!("-file-exec-and-symbols {path}"),
 
@@ -140,6 +150,20 @@ pub fn build_break_condition(id: u32, condition: &str) -> String {
         format!("-break-condition {id}")
     } else {
         format!("-break-condition {id} {}", quote_mi(condition))
+    }
+}
+
+/// Builds `-break-watch [-r|-a] <quoted expr>` depending on `kind` (Write
+/// has no flag). `expr` always goes through `quote_mi` (which itself calls
+/// `strip_mi_newlines`) — never raw-interpolated — so an expression
+/// containing `"`, `\`, or an embedded newline cannot smuggle a second,
+/// independent MI command into GDB's stdin.
+pub fn build_break_watch(kind: WatchpointKind, expr: &str) -> String {
+    let quoted = quote_mi(expr);
+    match kind {
+        WatchpointKind::Write => format!("-break-watch {quoted}"),
+        WatchpointKind::Read => format!("-break-watch -r {quoted}"),
+        WatchpointKind::Access => format!("-break-watch -a {quoted}"),
     }
 }
 
@@ -324,5 +348,106 @@ mod tests {
             !mi.contains('\n'),
             "probe MI command must not contain a raw newline: {mi:?}"
         );
+    }
+
+    // ─── Watchpoints ────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_break_watch_write_has_no_flag() {
+        assert_eq!(
+            build_break_watch(WatchpointKind::Write, "x"),
+            "-break-watch \"x\""
+        );
+    }
+
+    #[test]
+    fn build_break_watch_read_uses_dash_r_flag() {
+        assert_eq!(
+            build_break_watch(WatchpointKind::Read, "c"),
+            "-break-watch -r \"c\""
+        );
+    }
+
+    #[test]
+    fn build_break_watch_access_uses_dash_a_flag() {
+        assert_eq!(
+            build_break_watch(WatchpointKind::Access, "buf[0]"),
+            "-break-watch -a \"buf[0]\""
+        );
+    }
+
+    #[test]
+    fn add_watchpoint_command_maps_to_build_break_watch() {
+        let mi = command_to_mi(&Command::AddWatchpoint {
+            expr: "x".into(),
+            kind: WatchpointKind::Write,
+        });
+        assert_eq!(mi, "-break-watch \"x\"");
+    }
+
+    #[test]
+    fn remove_watchpoint_command_maps_to_break_delete() {
+        assert_eq!(
+            command_to_mi(&Command::RemoveWatchpoint(3)),
+            "-break-delete 3"
+        );
+    }
+
+    #[test]
+    fn toggle_watchpoint_command_maps_to_enable_or_disable() {
+        assert_eq!(
+            command_to_mi(&Command::ToggleWatchpoint {
+                id: 3,
+                enable: true
+            }),
+            "-break-enable 3"
+        );
+        assert_eq!(
+            command_to_mi(&Command::ToggleWatchpoint {
+                id: 3,
+                enable: false
+            }),
+            "-break-disable 3"
+        );
+    }
+
+    // SECURITY (threat-matrix: MI injection into stdin — `\n`/`\r`/`"`/`\`/a
+    // second-MI-command payload must stay inert inside a single MI line).
+    // One test per adversarial character class, mirroring quote_mi's own
+    // security tests.
+    #[test]
+    fn build_break_watch_strips_embedded_newline() {
+        let mi = build_break_watch(WatchpointKind::Write, "x\n-exec-continue");
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi, "-break-watch \"x-exec-continue\"");
+    }
+
+    #[test]
+    fn build_break_watch_strips_embedded_carriage_return() {
+        let mi = build_break_watch(WatchpointKind::Read, "x\r-exec-continue");
+        assert!(!mi.contains('\r'));
+        assert_eq!(mi, "-break-watch -r \"x-exec-continue\"");
+    }
+
+    #[test]
+    fn build_break_watch_escapes_embedded_quote() {
+        let mi = build_break_watch(WatchpointKind::Access, r#"say("hi")"#);
+        assert_eq!(mi, r#"-break-watch -a "say(\"hi\")""#);
+    }
+
+    #[test]
+    fn build_break_watch_escapes_embedded_backslash() {
+        let mi = build_break_watch(WatchpointKind::Write, r"C:\path");
+        assert_eq!(mi, r#"-break-watch "C:\\path""#);
+    }
+
+    #[test]
+    fn build_break_watch_second_mi_command_payload_stays_a_single_line() {
+        // A full second MI command embedded via newline must collapse into
+        // the same single MI line as inert text, never splitting into two
+        // commands written to GDB's stdin.
+        let mi = build_break_watch(WatchpointKind::Write, "x\n-exec-run");
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-break-watch \"x-exec-run\"");
     }
 }

@@ -14,3 +14,4 @@ pub(crate) mod thread;
 pub(crate) mod topbar;
 pub(crate) mod util;
 pub(crate) mod watch;
+pub(crate) mod watchpoints;

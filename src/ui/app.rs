@@ -29,6 +29,7 @@ pub struct App {
 
     // Collapsible sections
     pub(crate) open_bp: bool,
+    pub(crate) open_wp: bool,
     pub(crate) open_cmd: bool,
     pub(crate) open_struct: bool,
     pub(crate) open_stack: bool,
@@ -49,6 +50,10 @@ pub struct App {
     // EditTarget so the same key survives Command -> pending_edit ->
     // StateEvent -> edit_errors -> this buffer with no re-derivation.
     pub(crate) value_edit_buffer: std::collections::HashMap<crate::state::EditTarget, String>,
+
+    // Watchpoints panel input row buffers.
+    pub(crate) wp_expr_buffer: String,
+    pub(crate) wp_kind_buffer: crate::state::WatchpointKind,
 }
 
 impl App {
@@ -65,6 +70,7 @@ impl App {
             console_log: Vec::new(),
             watch_tab: WatchTab::Watch,
             open_bp: true,
+            open_wp: true,
             open_cmd: false,
             open_struct: false,
             open_stack: true,
@@ -75,6 +81,8 @@ impl App {
             bp_cond_buffer: std::collections::HashMap::new(),
             struct_input: String::new(),
             value_edit_buffer: std::collections::HashMap::new(),
+            wp_expr_buffer: String::new(),
+            wp_kind_buffer: crate::state::WatchpointKind::Write,
         }
     }
 
@@ -311,6 +319,9 @@ impl eframe::App for App {
 
                                 // BREAKPOINTS ──────────────────────────────────────────
                                 panels::breakpoints::render(self, ui);
+
+                                // WATCHPOINTS ──────────────────────────────────────────
+                                panels::watchpoints::render(self, ui);
 
                                 // COMMANDS ──────────────────────────────────────────────
                                 panels::commands::render(self, ui);
@@ -557,5 +568,61 @@ mod tests {
             app.state.persistent.breakpoints.is_empty(),
             "ProgramLoaded alone must not create a breakpoint row"
         );
+    }
+
+    // ── Watchpoint event-loop routing ────────────────────────────────────────
+
+    #[test]
+    fn apply_state_event_watchpoint_added_updates_state() {
+        let (mut app, _cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::WatchpointAdded {
+            watchpoint: crate::state::Watchpoint {
+                id: 2,
+                expr: "x".into(),
+                kind: crate::state::WatchpointKind::Write,
+                enabled: true,
+            },
+        });
+
+        assert_eq!(app.state.persistent.watchpoints.len(), 1);
+        assert_eq!(app.state.persistent.watchpoints[0].expr, "x");
+    }
+
+    #[test]
+    fn apply_state_event_watchpoint_error_populates_watchpoint_errors() {
+        let (mut app, _cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::WatchpointError {
+            expr: "nosuchvar".into(),
+            message: "No symbol \"nosuchvar\" in current context.".into(),
+        });
+
+        assert_eq!(
+            app.state.watchpoint_error("nosuchvar"),
+            Some("No symbol \"nosuchvar\" in current context.")
+        );
+    }
+
+    // Triangulation: Removed/Toggled must each apply through the same
+    // generic routing, not just Added/Error.
+    #[test]
+    fn apply_state_event_watchpoint_removed_and_toggled_update_state() {
+        let (mut app, _cmd_rx) = test_app();
+        app.state.persistent.watchpoints.push(crate::state::Watchpoint {
+            id: 3,
+            expr: "y".into(),
+            kind: crate::state::WatchpointKind::Read,
+            enabled: true,
+        });
+
+        app.apply_state_event(crate::state::StateEvent::WatchpointToggled {
+            id: 3,
+            enabled: false,
+        });
+        assert!(!app.state.persistent.watchpoints[0].enabled);
+
+        app.apply_state_event(crate::state::StateEvent::WatchpointRemoved { id: 3 });
+        assert!(app.state.persistent.watchpoints.is_empty());
     }
 }

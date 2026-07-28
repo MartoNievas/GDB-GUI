@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::state::{
     Breakpoint, DebuggerEvent, Frame, PauseState, StateEvent, StopReason, ThreadInfo, UiEvent,
-    Variable,
+    Variable, Watchpoint, WatchpointKind,
 };
 
 pub fn parse_line(line: &str) -> Option<DebuggerEvent> {
@@ -75,7 +75,24 @@ fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
             }
 
             let reason = parse_stop_reason(fields);
-            let frame = parse_frame_field(fields)?;
+
+            // D5: `watchpoint-scope` may arrive without a `frame=` field (the
+            // scope that triggered removal may have no active frame left).
+            // A synthetic frame preserves the pause transition instead of
+            // bailing on `?` — which would silently drop the stop and leave
+            // a stale watchpoint row (auto-removal never runs). Scoped to
+            // this one reason only; every other stop still requires a real
+            // frame.
+            let frame = match (&reason, parse_frame_field(fields)) {
+                (_, Some(f)) => f,
+                (StopReason::WatchpointScope(_), None) => Frame {
+                    addr: 0,
+                    function: "??".into(),
+                    file: None,
+                    line: None,
+                },
+                (_, None) => return None,
+            };
             let stack = vec![frame.clone()];
             let thread_id = extract_str(fields, "thread-id")
                 .and_then(|s| s.parse().ok())
@@ -107,6 +124,34 @@ fn parse_stop_reason(fields: &str) -> StopReason {
         Some("signal-received") => {
             let sig = extract_str(fields, "signal-name").unwrap_or_default();
             StopReason::Signal(sig)
+        }
+        Some("watchpoint-trigger") => {
+            // The id and expr live inside the `wpt={number="...",exp="..."}`
+            // block, not as bare fields.
+            let wpt_block = extract_block(fields, "wpt");
+            let id = wpt_block
+                .and_then(|b| extract_str(b, "number"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let expr = wpt_block
+                .and_then(|b| extract_str(b, "exp"))
+                .unwrap_or_default();
+            // old/new are blocks (`old={value="..."}`), not bare string
+            // fields: a plain extract_str(fields, "value") would match
+            // whichever of `old`/`new` occurs first for both.
+            let old = extract_block(fields, "old")
+                .and_then(|b| extract_str(b, "value"))
+                .unwrap_or_default();
+            let new = extract_block(fields, "new")
+                .and_then(|b| extract_str(b, "value"))
+                .unwrap_or_default();
+            StopReason::WatchpointTriggered { id, expr, old, new }
+        }
+        Some("watchpoint-scope") => {
+            let id = extract_str(fields, "wpnum")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            StopReason::WatchpointScope(id)
         }
         _ => StopReason::Unknown,
     }
@@ -151,6 +196,23 @@ fn parse_result(line: &str) -> Option<DebuggerEvent> {
                 if let Some(bp) = parse_breakpoint_field(&fields, "bkpt") {
                     return Some(DebuggerEvent::State(StateEvent::BreakpointAdded {
                         breakpoint: bp,
+                    }));
+                }
+            }
+
+            // -break-watch → ^done,wpt={number=...,exp=...} (Write, default)
+            //              → ^done,hw-rwpt={...} (Read, `-r`)
+            //              → ^done,hw-awpt={...} (Access, `-a`)
+            // Checked most-specific-key-first: "hw-rwpt="/"hw-awpt=" both
+            // contain "wpt=" as a substring, so a plain `extract_block(_,
+            // "wpt")` would also match inside them if tried first.
+            if fields.contains("wpt=") {
+                let parsed = parse_watchpoint_field(&fields, "hw-rwpt", WatchpointKind::Read)
+                    .or_else(|| parse_watchpoint_field(&fields, "hw-awpt", WatchpointKind::Access))
+                    .or_else(|| parse_watchpoint_field(&fields, "wpt", WatchpointKind::Write));
+                if let Some(watchpoint) = parsed {
+                    return Some(DebuggerEvent::State(StateEvent::WatchpointAdded {
+                        watchpoint,
                     }));
                 }
             }
@@ -411,6 +473,27 @@ pub(crate) fn parse_breakpoint_field(fields: &str, key: &str) -> Option<Breakpoi
         enabled,
         condition,
         condition_error: None,
+    })
+}
+
+/// Parses a `<key>={number="...",exp="..."}` block into a `Watchpoint` of
+/// the given `kind`. Used for `wpt=` (Write), `hw-rwpt=` (Read), and
+/// `hw-awpt=` (Access) — GDB's `-break-watch` reply is self-describing, so
+/// no token correlation is needed for a successful creation.
+pub(crate) fn parse_watchpoint_field(
+    fields: &str,
+    key: &str,
+    kind: WatchpointKind,
+) -> Option<Watchpoint> {
+    let block = extract_block(fields, key)?;
+    let id = extract_str(block, "number")?.parse().ok()?;
+    let expr = extract_str(block, "exp")?;
+
+    Some(Watchpoint {
+        id,
+        expr,
+        kind,
+        enabled: true,
     })
 }
 
@@ -1015,5 +1098,187 @@ mod tests {
     fn test_thread_lifecycle_notify_async_records_are_not_parsed_into_state_changes() {
         assert!(parse_line(r#"=thread-created,id="2",group-id="i1""#).is_none());
         assert!(parse_line(r#"=thread-exited,id="2",group-id="i1""#).is_none());
+    }
+
+    // ─── Watchpoints ────────────────────────────────────────────────────────
+
+    // Real GDB MI capture shape for `-break-watch x` (Write, default kind).
+    #[test]
+    fn test_break_watch_write_reply() {
+        let line = r#"5^done,wpt={number="2",exp="x"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::WatchpointAdded { watchpoint })) => {
+                assert_eq!(watchpoint.id, 2);
+                assert_eq!(watchpoint.expr, "x");
+                assert_eq!(watchpoint.kind, WatchpointKind::Write);
+                assert!(watchpoint.enabled);
+            }
+            other => panic!("expected WatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // `-break-watch -r c` reply shape.
+    #[test]
+    fn test_break_watch_read_reply() {
+        let line = r#"6^done,hw-rwpt={number="3",exp="c"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::WatchpointAdded { watchpoint })) => {
+                assert_eq!(watchpoint.id, 3);
+                assert_eq!(watchpoint.expr, "c");
+                assert_eq!(watchpoint.kind, WatchpointKind::Read);
+            }
+            other => panic!("expected WatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // `-break-watch -a c` reply shape.
+    #[test]
+    fn test_break_watch_access_reply() {
+        let line = r#"7^done,hw-awpt={number="5",exp="c"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::WatchpointAdded { watchpoint })) => {
+                assert_eq!(watchpoint.id, 5);
+                assert_eq!(watchpoint.expr, "c");
+                assert_eq!(watchpoint.kind, WatchpointKind::Access);
+            }
+            other => panic!("expected WatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // Branch disjointness: a plain -break-insert reply (bkpt=) must never be
+    // mistaken for a watchpoint reply, and vice versa — pins the checking
+    // order against regressions.
+    #[test]
+    fn test_break_insert_reply_is_disjoint_from_watchpoint_branch() {
+        let line = r#"8^done,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x1149",func="main",file="a.c",fullname="/a.c",line="10",times="0",original-location="a.c:10"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::BreakpointAdded { breakpoint })) => {
+                assert_eq!(breakpoint.id, 1);
+            }
+            other => panic!("expected BreakpointAdded, got {other:?}"),
+        }
+    }
+
+    // D3 (design.md): a watchpoint's `=breakpoint-modified` notify carries no
+    // `file`/`fullname` — `parse_breakpoint_field`'s existing `?`-bail on a
+    // missing file must drop it, so no ghost breakpoint row is created for a
+    // watchpoint. Pinned here as a coupling constraint for future changes to
+    // that function (e.g. a catchpoints change making it more tolerant).
+    #[test]
+    fn test_watchpoint_breakpoint_modified_notify_yields_none() {
+        let line = r#"=breakpoint-modified,bkpt={number="2",type="hw watchpoint",disp="keep",enabled="y",what="x",times="0"}"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    // `*stopped,reason="watchpoint-trigger"` real MI capture shape: old/new
+    // are blocks, not bare fields — a naive extract_str(fields, "value")
+    // would match `old`'s value for both, so this pins the block-scoped
+    // extraction.
+    #[test]
+    fn test_watchpoint_trigger_stop_reason() {
+        let line = r#"*stopped,reason="watchpoint-trigger",wpt={number="2",exp="x"},old={value="0"},new={value="3"},frame={func="main",args=[],file="recursive2.c",fullname="/home/foo/bar/recursive2.c",line="6"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::WatchpointTriggered { id, expr, old, new } => {
+                        assert_eq!(id, 2);
+                        assert_eq!(expr, "x");
+                        assert_eq!(old, "0");
+                        assert_eq!(new, "3");
+                    }
+                    other => panic!("expected WatchpointTriggered, got {other:?}"),
+                }
+                assert_eq!(pause.frame.function, "main");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // `*stopped,reason="watchpoint-scope"` WITH a frame= field present.
+    #[test]
+    fn test_watchpoint_scope_stop_reason_with_frame() {
+        let line = r#"*stopped,reason="watchpoint-scope",wpnum="2",frame={func="callee4",args=[],file="basics.c",fullname="/home/foo/bar/basics.c",line="18"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::WatchpointScope(id) => assert_eq!(id, 2),
+                    other => panic!("expected WatchpointScope, got {other:?}"),
+                }
+                assert_eq!(pause.frame.function, "callee4");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // D5 (design.md): `*stopped,reason="watchpoint-scope"` WITHOUT a
+    // frame= field must still parse into a ProgramPaused (synthetic frame
+    // fallback) rather than being silently dropped by `?` — otherwise
+    // auto-removal never runs and a stale row survives.
+    #[test]
+    fn test_watchpoint_scope_stop_reason_without_frame_falls_back() {
+        let line = r#"*stopped,reason="watchpoint-scope",wpnum="7",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::WatchpointScope(id) => assert_eq!(id, 7),
+                    other => panic!("expected WatchpointScope, got {other:?}"),
+                }
+                // Synthetic fallback frame — no real frame was available.
+                assert_eq!(pause.frame.function, "??");
+                assert_eq!(pause.frame.file, None);
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // Triangulation: an ordinary breakpoint-hit stop must still bail on a
+    // missing frame= exactly as before — the D5 fallback is scoped to
+    // watchpoint-scope only.
+    #[test]
+    fn test_breakpoint_hit_without_frame_is_still_dropped() {
+        let line = r#"*stopped,reason="breakpoint-hit",bkptno="1",thread-id="1""#;
+        assert!(parse_line(line).is_none());
+    }
+
+    // Integration: a real GDB MI transcript (create → trigger → scope) run
+    // through the actual `parse_line` + `DebuggerState::apply` pipeline, not
+    // just the individual unit boundaries tested above (spec/tasks: "real
+    // GDB MI transcripts (add → trigger → scope → delete) through
+    // parse_line + apply").
+    #[test]
+    fn test_watchpoint_full_lifecycle_via_parse_line_and_apply() {
+        use crate::state::DebuggerState;
+
+        let mut state = DebuggerState::new();
+
+        // 1. `-break-watch x` reply: self-describing creation.
+        match parse_line(r#"5^done,wpt={number="2",exp="x"}"#) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the create reply, got {other:?}"),
+        }
+        assert_eq!(state.persistent.watchpoints.len(), 1);
+        assert_eq!(state.persistent.watchpoints[0].expr, "x");
+
+        // 2. `x` changes value: watchpoint-trigger pauses and carries old/new.
+        let trigger_line = r#"*stopped,reason="watchpoint-trigger",wpt={number="2",exp="x"},old={value="0"},new={value="3"},frame={func="main",args=[],file="a.c",fullname="/a.c",line="6"},thread-id="1""#;
+        match parse_line(trigger_line) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the trigger, got {other:?}"),
+        }
+        assert!(state.is_paused());
+        assert_eq!(
+            state.persistent.watchpoints.len(),
+            1,
+            "a trigger must not remove the row — only scope exit does"
+        );
+
+        // 3. `x` goes out of scope: silent auto-removal (D6), no separate
+        // toast/event — the row disappears as a direct consequence of apply.
+        let scope_line = r#"*stopped,reason="watchpoint-scope",wpnum="2",thread-id="1""#;
+        match parse_line(scope_line) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the scope exit, got {other:?}"),
+        }
+        assert!(state.persistent.watchpoints.is_empty());
     }
 }

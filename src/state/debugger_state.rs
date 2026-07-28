@@ -70,6 +70,23 @@ pub struct AsmLine {
     pub inst: String,
 }
 
+// ─── Watchpoint ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchpointKind {
+    Write,
+    Read,
+    Access,
+}
+
+#[derive(Clone, Debug)]
+pub struct Watchpoint {
+    pub id: u32,
+    pub expr: String,
+    pub kind: WatchpointKind,
+    pub enabled: bool,
+}
+
 // ─── Stop reason ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -77,6 +94,19 @@ pub enum StopReason {
     BreakpointHit(u32),
     EndStepping,
     Signal(String),
+    /// `*stopped,reason="watchpoint-trigger"`: the watched expression's id,
+    /// text, and its old/new values (from the `old={value=...}` /
+    /// `new={value=...}` blocks).
+    WatchpointTriggered {
+        id: u32,
+        expr: String,
+        old: String,
+        new: String,
+    },
+    /// `*stopped,reason="watchpoint-scope"` (the `wpnum` field). Consumed by
+    /// `DebuggerState::apply` on `ProgramPaused` to silently remove the row
+    /// (design decision D6) — it never becomes a separate `StateEvent`.
+    WatchpointScope(u32),
     Unknown,
 }
 
@@ -117,6 +147,9 @@ pub enum ProgramState {
 pub struct PersistentState {
     pub executable: Option<String>,
     pub breakpoints: Vec<Breakpoint>,
+    /// Expression watchpoints. In-memory only for the session's lifetime —
+    /// never persisted to disk (spec: "No Persistence Across Sessions").
+    pub watchpoints: Vec<Watchpoint>,
 }
 
 // ─── Top-level state ─────────────────────────────────────────────────────────
@@ -150,6 +183,12 @@ pub struct DebuggerState {
     /// `ValueEditSucceeded`. Wiped in full on Loaded/Started/Exited, like the
     /// other per-session panels.
     pub edit_errors: std::collections::HashMap<EditTarget, String>,
+    /// GDB `^error` message from a failed watchpoint creation/toggle/delete,
+    /// keyed by the requested expression (design decision D1 — a rejected
+    /// `-break-watch` returns no GDB id, so there is no row to attach an
+    /// error to). Cleared on that expression's next successful add. Wiped in
+    /// full on Loaded/Started/Exited, like `edit_errors`.
+    pub watchpoint_errors: std::collections::HashMap<String, String>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -232,6 +271,31 @@ pub enum StateEvent {
     SourcePreviewResolved {
         file: String,
     },
+    /// A watchpoint was created (self-describing `wpt=`/`hw-rwpt=`/
+    /// `hw-awpt=` reply — no token correlation needed for success).
+    WatchpointAdded {
+        watchpoint: Watchpoint,
+    },
+    /// `-break-delete <id>` has no reply the removal can be correlated
+    /// from, so `process.rs` emits this optimistically at send time,
+    /// mirroring `BreakpointRemoved`.
+    WatchpointRemoved {
+        id: u32,
+    },
+    /// `-break-enable`/`-break-disable` reply with a bare `^done`
+    /// (design decision D4): emitted optimistically by `process.rs` at send
+    /// time, since the `=breakpoint-modified` notify for a watchpoint is
+    /// dropped by `parse_breakpoint_field`'s `file`/`fullname` bail (D3).
+    WatchpointToggled {
+        id: u32,
+        enabled: bool,
+    },
+    /// GDB `^error` for a watchpoint creation/toggle/delete attempt, or a
+    /// locally rejected duplicate expression (see `has_watchpoint_expr`).
+    WatchpointError {
+        expr: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -266,9 +330,11 @@ impl DebuggerState {
             persistent: PersistentState {
                 executable: None,
                 breakpoints: vec![],
+                watchpoints: vec![],
             },
             preview_file: None,
             edit_errors: std::collections::HashMap::new(),
+            watchpoint_errors: std::collections::HashMap::new(),
         }
     }
 
@@ -294,6 +360,7 @@ impl DebuggerState {
                 // longer apply.
                 self.preview_file = None;
                 self.edit_errors.clear();
+                self.watchpoint_errors.clear();
             }
 
             StateEvent::ProgramStarted => {
@@ -311,10 +378,17 @@ impl DebuggerState {
                 self.threads = vec![];
                 self.current_thread = None;
                 self.edit_errors.clear();
+                self.watchpoint_errors.clear();
             }
 
             StateEvent::ProgramPaused { pause } => {
                 self.program = ProgramState::Paused;
+                // D6: watchpoint-scope auto-removal is a state consequence of
+                // the pause, not a separate event — no toast, single test
+                // site (spec: "Watchpoint-Scope Auto-Removal").
+                if let StopReason::WatchpointScope(id) = pause.stop_reason {
+                    self.persistent.watchpoints.retain(|w| w.id != id);
+                }
                 self.pause = Some(pause);
             }
 
@@ -341,6 +415,7 @@ impl DebuggerState {
                 self.threads = vec![];
                 self.current_thread = None;
                 self.edit_errors.clear();
+                self.watchpoint_errors.clear();
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -414,6 +489,30 @@ impl DebuggerState {
             StateEvent::SourcePreviewResolved { file } => {
                 self.preview_file = Some(file);
             }
+
+            StateEvent::WatchpointAdded { watchpoint } => {
+                if let Some(existing) = self
+                    .persistent
+                    .watchpoints
+                    .iter_mut()
+                    .find(|w| w.id == watchpoint.id)
+                {
+                    *existing = watchpoint;
+                } else {
+                    self.persistent.watchpoints.push(watchpoint);
+                }
+            }
+            StateEvent::WatchpointRemoved { id } => {
+                self.persistent.watchpoints.retain(|w| w.id != id);
+            }
+            StateEvent::WatchpointToggled { id, enabled } => {
+                if let Some(wp) = self.persistent.watchpoints.iter_mut().find(|w| w.id == id) {
+                    wp.enabled = enabled;
+                }
+            }
+            StateEvent::WatchpointError { expr, message } => {
+                self.watchpoint_errors.insert(expr, message);
+            }
         }
     }
 
@@ -476,6 +575,20 @@ impl DebuggerState {
     /// any. `None` means no failed edit is pending display for this target.
     pub fn edit_error(&self, target: &EditTarget) -> Option<&str> {
         self.edit_errors.get(target).map(|s| s.as_str())
+    }
+
+    /// Whether a watchpoint already exists for `expr` (exact string match).
+    /// Used to reject a duplicate creation attempt client-side, with no MI
+    /// round trip (spec: "Duplicate Expression Prevention").
+    pub fn has_watchpoint_expr(&self, expr: &str) -> bool {
+        self.persistent.watchpoints.iter().any(|w| w.expr == expr)
+    }
+
+    /// GDB's `^error` message (or a locally rejected duplicate's message)
+    /// for `expr`, if any. `None` means no error is pending display for this
+    /// expression.
+    pub fn watchpoint_error(&self, expr: &str) -> Option<&str> {
+        self.watchpoint_errors.get(expr).map(|s| s.as_str())
     }
 
     /// Checks whether `candidate` is redundant: another breakpoint (with a
@@ -1062,5 +1175,213 @@ mod tests {
 
         // The same id (re-emission of the breakpoint itself) does not count as a duplicate.
         assert!(!state.is_duplicate_breakpoint(&bp(1, "/tmp/example.c", 12)));
+    }
+
+    // ── Watchpoints ──────────────────────────────────────────────────────────
+
+    fn wp(id: u32, expr: &str, kind: WatchpointKind) -> Watchpoint {
+        Watchpoint {
+            id,
+            expr: expr.into(),
+            kind,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn watchpoint_added_pushes_new_row() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::WatchpointAdded {
+            watchpoint: wp(5, "x", WatchpointKind::Write),
+        });
+
+        assert_eq!(state.persistent.watchpoints.len(), 1);
+        let row = &state.persistent.watchpoints[0];
+        assert_eq!(row.id, 5);
+        assert_eq!(row.expr, "x");
+        assert_eq!(row.kind, WatchpointKind::Write);
+        assert!(row.enabled);
+    }
+
+    #[test]
+    fn watchpoint_added_replaces_existing_by_id() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(5, "x", WatchpointKind::Write));
+
+        state.apply(StateEvent::WatchpointAdded {
+            watchpoint: wp(5, "x", WatchpointKind::Read),
+        });
+
+        assert_eq!(state.persistent.watchpoints.len(), 1);
+        assert_eq!(state.persistent.watchpoints[0].kind, WatchpointKind::Read);
+    }
+
+    #[test]
+    fn watchpoint_removed_drops_only_matching_id() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(1, "a", WatchpointKind::Write));
+        state
+            .persistent
+            .watchpoints
+            .push(wp(2, "b", WatchpointKind::Write));
+
+        state.apply(StateEvent::WatchpointRemoved { id: 1 });
+
+        assert_eq!(state.persistent.watchpoints.len(), 1);
+        assert_eq!(state.persistent.watchpoints[0].id, 2);
+    }
+
+    #[test]
+    fn watchpoint_toggled_flips_enabled_leaves_others_untouched() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(3, "x", WatchpointKind::Write));
+
+        state.apply(StateEvent::WatchpointToggled {
+            id: 3,
+            enabled: false,
+        });
+        assert!(!state.persistent.watchpoints[0].enabled);
+
+        state.apply(StateEvent::WatchpointToggled {
+            id: 3,
+            enabled: true,
+        });
+        assert!(state.persistent.watchpoints[0].enabled);
+    }
+
+    #[test]
+    fn has_watchpoint_expr_true_for_existing_expr_only() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(1, "x", WatchpointKind::Write));
+
+        assert!(state.has_watchpoint_expr("x"));
+        assert!(!state.has_watchpoint_expr("y"));
+    }
+
+    #[test]
+    fn watchpoint_error_sets_and_reads_by_expr() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::WatchpointError {
+            expr: "nosuchvar".into(),
+            message: "No symbol \"nosuchvar\" in current context.".into(),
+        });
+
+        assert_eq!(
+            state.watchpoint_error("nosuchvar"),
+            Some("No symbol \"nosuchvar\" in current context.")
+        );
+        assert_eq!(state.watchpoint_error("other"), None);
+    }
+
+    #[test]
+    fn program_loaded_started_exited_wipe_watchpoint_errors() {
+        let mut state = DebuggerState::new();
+        state
+            .watchpoint_errors
+            .insert("x".into(), "stale error".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.watchpoint_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .watchpoint_errors
+            .insert("x".into(), "stale error".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.watchpoint_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .watchpoint_errors
+            .insert("x".into(), "stale error".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.watchpoint_errors.is_empty());
+    }
+
+    // Rollback guarantee (design.md): the same lifecycle events must still
+    // leave persisted breakpoints/watchpoints untouched — only the *_errors
+    // maps are wiped.
+    #[test]
+    fn program_loaded_does_not_clear_persisted_watchpoints() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(1, "x", WatchpointKind::Write));
+
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+
+        assert_eq!(state.persistent.watchpoints.len(), 1);
+    }
+
+    // D6: a *stopped with reason="watchpoint-scope" must silently remove the
+    // matching row (no toast, no separate StateEvent) while the pause
+    // transition itself still happens.
+    #[test]
+    fn watchpoint_scope_stop_reason_silently_removes_row_on_pause() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(7, "local_var", WatchpointKind::Write));
+
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0,
+                    function: "??".into(),
+                    file: None,
+                    line: None,
+                },
+                stack: vec![],
+                stop_reason: StopReason::WatchpointScope(7),
+            },
+        });
+
+        assert!(state.persistent.watchpoints.is_empty());
+        assert!(state.is_paused(), "the pause transition must still happen");
+    }
+
+    // Triangulation: an unrelated stop reason (e.g. a plain breakpoint hit)
+    // must never touch the watchpoints list.
+    #[test]
+    fn breakpoint_hit_stop_reason_leaves_watchpoints_untouched() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .watchpoints
+            .push(wp(7, "local_var", WatchpointKind::Write));
+
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0x1000,
+                    function: "main".into(),
+                    file: Some("a.c".into()),
+                    line: Some(5),
+                },
+                stack: vec![],
+                stop_reason: StopReason::BreakpointHit(1),
+            },
+        });
+
+        assert_eq!(state.persistent.watchpoints.len(), 1);
     }
 }
