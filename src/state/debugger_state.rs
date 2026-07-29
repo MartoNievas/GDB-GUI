@@ -101,6 +101,14 @@ pub enum CatchpointKind {
     /// (D1) — `args` already lives in `Catchpoint::args`, so no payload is
     /// needed here.
     Syscall,
+    /// Phase 2c: `-catch-throw [-r <regexp>]`. Unit variant (D1) — the
+    /// optional regexp filter lives in `Catchpoint::args`, same shape as
+    /// Load/Unload.
+    Throw,
+    /// Phase 2c: `-catch-rethrow [-r <regexp>]`.
+    Rethrow,
+    /// Phase 2c: `-catch-catch [-r <regexp>]`.
+    Catch,
 }
 
 impl std::fmt::Display for CatchpointKind {
@@ -113,6 +121,9 @@ impl std::fmt::Display for CatchpointKind {
             CatchpointKind::Load => "load",
             CatchpointKind::Unload => "unload",
             CatchpointKind::Syscall => "syscall",
+            CatchpointKind::Throw => "throw",
+            CatchpointKind::Rethrow => "rethrow",
+            CatchpointKind::Catch => "catch",
         };
         write!(f, "{s}")
     }
@@ -1576,6 +1587,16 @@ mod tests {
         assert_eq!(CatchpointKind::Syscall.to_string(), "syscall");
     }
 
+    // Phase 2c task 1.1: Throw/Rethrow/Catch are the 8th-10th CatchpointKind
+    // variants, displaying their GDB `catch-type=` wire literal exactly like
+    // every other kind.
+    #[test]
+    fn throw_rethrow_catch_kinds_display_matches_gdb_catch_type_string() {
+        assert_eq!(CatchpointKind::Throw.to_string(), "throw");
+        assert_eq!(CatchpointKind::Rethrow.to_string(), "rethrow");
+        assert_eq!(CatchpointKind::Catch.to_string(), "catch");
+    }
+
     // Phase 2b (D3): StopReason::SyscallTriggered carries an optional
     // number, optional name, and a phase distinguishing entry from return.
     // Exercises all 4 field-presence permutations plus both phases.
@@ -1699,6 +1720,54 @@ mod tests {
         assert_eq!(
             state.persistent.catchpoints[0].args,
             vec!["libbar".to_string()]
+        );
+    }
+
+    // Phase 2c tasks 1.3/1.4 (verify-only — design deviation, see
+    // apply-progress): D5's empty-args-preserving merge is unnecessary. The
+    // Phase 0 spike found the regexp round-trips through a dedicated
+    // `regexp=` field on EVERY ingress path (tokened `^done` and every
+    // `=breakpoint-*` notify/re-emit), so `parse_catchpoint_field` always
+    // recovers the correct args — there is no empty-args race to guard
+    // against. `CatchpointAdded{Throw,..}` appends/replaces via the
+    // existing generic replace-by-id logic, exactly like Phase 2b's
+    // Syscall precedent — no per-kind branching needed in `apply`.
+    #[test]
+    fn catchpoint_added_throw_with_regexp_pushes_new_row() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::CatchpointAdded {
+            catchpoint: cp(7, CatchpointKind::Throw, &["std::runtime_error"]),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        let row = &state.persistent.catchpoints[0];
+        assert_eq!(row.id, 7);
+        assert_eq!(row.kind, CatchpointKind::Throw);
+        assert_eq!(row.args, vec!["std::runtime_error".to_string()]);
+        assert!(row.enabled);
+    }
+
+    // A later re-emit (e.g. a `=breakpoint-modified` fired while the
+    // program starts, verified live in the spike) always carries the same
+    // `regexp=` field, so a replace-by-id never wipes it — no merge rule
+    // needed, unlike the D4/D5 concern the design anticipated before the
+    // spike ran.
+    #[test]
+    fn catchpoint_added_throw_reemit_with_same_regexp_does_not_wipe_it() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(7, CatchpointKind::Throw, &["std::runtime_error"]));
+
+        state.apply(StateEvent::CatchpointAdded {
+            catchpoint: cp(7, CatchpointKind::Throw, &["std::runtime_error"]),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["std::runtime_error".to_string()]
         );
     }
 

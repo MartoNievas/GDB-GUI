@@ -604,8 +604,26 @@ pub(crate) fn parse_catchpoint_field(block: &str) -> Option<Catchpoint> {
     let enabled = extract_str(block, "enabled")
         .map(|s| s == "y")
         .unwrap_or(true);
-    let what = extract_str(block, "what");
-    let args = catchpoint_args_from_what(kind, what.as_deref());
+
+    // Phase 2c (design deviation from D4/D5 — see apply-progress): the
+    // Phase 0 live spike (GDB 17.2) found `-catch-throw/-rethrow/-catch`
+    // carry their optional `-r <regexp>` filter in a DEDICATED `regexp=`
+    // field on both the tokened `^done` reply and every `=breakpoint-*`
+    // notify — present only when a filter was given, absent (not empty)
+    // otherwise. `what=` stays the fixed "exception throw"/"rethrow"/
+    // "catch" prose regardless, so it is never consulted for these 3
+    // kinds. This makes the regexp self-describing on every ingress path,
+    // exactly like every other catchpoint kind — no process.rs echo/
+    // correlation mechanism is needed.
+    let args = match kind {
+        CatchpointKind::Throw | CatchpointKind::Rethrow | CatchpointKind::Catch => {
+            extract_str(block, "regexp").map(|r| vec![r]).unwrap_or_default()
+        }
+        _ => {
+            let what = extract_str(block, "what");
+            catchpoint_args_from_what(kind, what.as_deref())
+        }
+    };
 
     Some(Catchpoint {
         id,
@@ -624,6 +642,9 @@ fn parse_catchpoint_kind(catch_type: &str) -> Option<CatchpointKind> {
         "load" => Some(CatchpointKind::Load),
         "unload" => Some(CatchpointKind::Unload),
         "syscall" => Some(CatchpointKind::Syscall),
+        "throw" => Some(CatchpointKind::Throw),
+        "rethrow" => Some(CatchpointKind::Rethrow),
+        "catch" => Some(CatchpointKind::Catch),
         _ => None,
     }
 }
@@ -679,6 +700,11 @@ fn catchpoint_args_from_what(kind: CatchpointKind, what: Option<&str>) -> Vec<St
                 }
             }
         },
+        // Phase 2c: never reached from `parse_catchpoint_field`, which
+        // extracts the dedicated `regexp=` field for these 3 kinds instead
+        // (see its doc comment) — `what=` is fixed prose here regardless of
+        // filter. Kept exhaustive and documented for any other caller.
+        CatchpointKind::Throw | CatchpointKind::Rethrow | CatchpointKind::Catch => vec![],
     }
 }
 
@@ -1539,7 +1565,7 @@ mod tests {
     #[test]
     fn parse_catchpoint_field_unknown_catch_type_yields_none() {
         let block =
-            r#"number="6",type="catchpoint",disp="keep",enabled="y",catch-type="throw",times="0""#;
+            r#"number="6",type="catchpoint",disp="keep",enabled="y",catch-type="bogus-type",times="0""#;
         assert!(parse_catchpoint_field(block).is_none());
     }
 
@@ -1607,6 +1633,95 @@ mod tests {
             vec!["open".to_string(), "close".to_string()]
         );
         assert!(catchpoint_args_from_what(CatchpointKind::Syscall, Some("syscall")).is_empty());
+    }
+
+    // ── Phase 2c: Throw/Rethrow/Catch (C++ exceptions) ───────────────────────
+    //
+    // Phase 0 spike (live GDB 17.2, C++ throw/rethrow/catch fixture)
+    // confirmed A1 (verbs exist), A2 (hit is breakpoint-hit+bkptno), and A3
+    // (creation reply is tokened `^done,bkpt={...}`). It ALSO found the
+    // reply/notify carries a dedicated `regexp="..."` field (present only
+    // when `-r` was given, absent — not empty — otherwise), separate from
+    // the fixed `what="exception throw"` prose. This is richer than design
+    // D4/D5 assumed (echo-and-merge from process.rs): the regexp is
+    // self-describing on every ingress path exactly like every other
+    // catchpoint kind, so no client-side echo/correlation is needed — see
+    // apply-progress deviation note.
+
+    #[test]
+    fn parse_catchpoint_kind_throw_rethrow_catch_map_to_variants() {
+        assert_eq!(parse_catchpoint_kind("throw"), Some(CatchpointKind::Throw));
+        assert_eq!(
+            parse_catchpoint_kind("rethrow"),
+            Some(CatchpointKind::Rethrow)
+        );
+        assert_eq!(parse_catchpoint_kind("catch"), Some(CatchpointKind::Catch));
+    }
+
+    #[test]
+    fn parse_catchpoint_field_throw_bare_has_no_args() {
+        let block = r#"number="1",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Throw);
+        assert!(cp.args.is_empty());
+    }
+
+    #[test]
+    fn parse_catchpoint_field_rethrow_bare_has_no_args() {
+        let block = r#"number="2",type="catchpoint",disp="keep",enabled="y",what="exception rethrow",catch-type="rethrow",thread-groups=["i1"],times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Rethrow);
+        assert!(cp.args.is_empty());
+    }
+
+    #[test]
+    fn parse_catchpoint_field_catch_bare_has_no_args() {
+        let block = r#"number="3",type="catchpoint",disp="keep",enabled="y",what="exception catch",catch-type="catch",thread-groups=["i1"],times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Catch);
+        assert!(cp.args.is_empty());
+    }
+
+    // Live-verified shape (Phase 0 spike): a `-catch-throw -r <regexp>`
+    // reply carries the filter in a dedicated `regexp=` field, never in
+    // `what=` (which stays the fixed "exception throw" prose regardless).
+    #[test]
+    fn parse_catchpoint_field_throw_with_regexp_extracts_from_dedicated_field() {
+        let block = r#"number="4",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],regexp="std::runtime_error",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Throw);
+        assert_eq!(cp.args, vec!["std::runtime_error".to_string()]);
+    }
+
+    #[test]
+    fn parse_catchpoint_field_rethrow_with_regexp_extracts_from_dedicated_field() {
+        let block = r#"number="5",type="catchpoint",disp="keep",enabled="y",what="exception rethrow",catch-type="rethrow",thread-groups=["i1"],regexp="std::logic_error",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.args, vec!["std::logic_error".to_string()]);
+    }
+
+    #[test]
+    fn parse_catchpoint_field_catch_with_regexp_extracts_from_dedicated_field() {
+        let block = r#"number="6",type="catchpoint",disp="keep",enabled="y",what="exception catch",catch-type="catch",thread-groups=["i1"],regexp="MyException",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.args, vec!["MyException".to_string()]);
+    }
+
+    // Threat matrix — untrusted ingress: a malformed/missing `regexp=` on an
+    // exception kind must degrade to empty args, never panic.
+    #[test]
+    fn parse_catchpoint_field_throw_malformed_regexp_field_degrades_to_empty_args() {
+        // Unterminated quote — extract_str's block scan must not panic.
+        let block = r#"number="7",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],regexp=unterminated,times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert!(cp.args.is_empty());
+    }
+
+    #[test]
+    fn parse_catchpoint_field_throw_missing_number_yields_none_not_panic() {
+        let block =
+            r#"type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",times="0""#;
+        assert!(parse_catchpoint_field(block).is_none());
     }
 
     #[test]
@@ -2206,5 +2321,75 @@ mod tests {
             }
             other => panic!("expected SyscallTriggered, got {other:?}"),
         }
+    }
+
+    // Phase 2c: Throw full flow — native tokened ^done with a `regexp=`
+    // field -> row with the echoed regexp -> *stopped,reason=
+    // "breakpoint-hit" (A2, no dedicated StopReason). The rendered banner
+    // hop (`exception_banner_text`) is covered by
+    // `ui::panels::catchpoints`'s own test module, same disjointness
+    // reasoning as the Syscall precedent above.
+    #[test]
+    fn catchpoint_throw_add_with_regexp_then_breakpoint_hit_via_parse_line_and_apply() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"4^done,bkpt={number="4",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],regexp="std::runtime_error",times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the throw create reply, got {other:?}"),
+        }
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(state.persistent.catchpoints[0].kind, CatchpointKind::Throw);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["std::runtime_error".to_string()]
+        );
+
+        match parse_line(
+            r#"*stopped,bkptno="4",reason="breakpoint-hit",frame={func="__cxa_throw",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the throw stop, got {other:?}"),
+        }
+        assert!(state.is_paused());
+        match &state.pause.as_ref().unwrap().stop_reason {
+            StopReason::BreakpointHit(id) => assert_eq!(*id, 4),
+            other => panic!("expected BreakpointHit, got {other:?}"),
+        }
+        // `exception_banner_text_throw_hit_shows_exception_thrown`
+        // (ui::panels::catchpoints) asserts this exact shape renders
+        // `Some("Exception thrown")`.
+    }
+
+    // Duplicate ^done + a later re-emit (e.g. the `=breakpoint-modified`
+    // burst the spike observed at `-exec-run`) for the same throw
+    // catchpoint must converge on exactly one row with the regexp intact —
+    // no D5 merge needed (see debugger_state.rs deviation note): the
+    // `regexp=` field is self-describing on every ingress path.
+    #[test]
+    fn catchpoint_throw_duplicate_done_and_modified_still_one_row_with_regexp_intact() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"4^done,bkpt={number="4",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],regexp="std::runtime_error",times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event, got {other:?}"),
+        }
+        match parse_line(
+            r#"=breakpoint-modified,bkpt={number="4",type="catchpoint",disp="keep",enabled="y",what="exception throw",catch-type="throw",thread-groups=["i1"],regexp="std::runtime_error",times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event, got {other:?}"),
+        }
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["std::runtime_error".to_string()]
+        );
     }
 }

@@ -229,6 +229,28 @@ pub fn build_catch_command(kind: CatchpointKind, args: &[String]) -> String {
                 console_catch(&format!("catch syscall {joined}"))
             }
         }
+        // Phase 2c (D2): native `-catch-throw`/`-catch-rethrow`/
+        // `-catch-catch` verbs, verified live against GDB 17.2 (Phase 0
+        // spike). Unlike `-catch-load`/`-catch-unload`, these verbs are
+        // valid at zero arity, so there is no console-passthrough fallback
+        // to degrade to.
+        CatchpointKind::Throw => catch_exception("-catch-throw", args),
+        CatchpointKind::Rethrow => catch_exception("-catch-rethrow", args),
+        CatchpointKind::Catch => catch_exception("-catch-catch", args),
+    }
+}
+
+/// Builds `<verb> [-r <quoted regexp>]` for the Phase 2c exception
+/// catchpoint verbs. The regexp is optional (zero-or-one arg, D1); a
+/// whitespace-only entry degrades to the bare verb, same emptiness rule as
+/// every other optional-arg kind. `quote_mi` (which strips embedded `\n`/
+/// `\r` before escaping `\`/`"`) applies to the regexp alone — verb and
+/// `-r` are literals, so there is no CLI-in-MI nesting to guard here, only
+/// the single quoted argument (unlike the console-passthrough kinds above).
+fn catch_exception(verb: &str, args: &[String]) -> String {
+    match args.first() {
+        Some(r) if !r.trim().is_empty() => format!("{verb} -r {}", quote_mi(r)),
+        _ => verb.to_string(),
     }
 }
 
@@ -781,6 +803,111 @@ mod tests {
             command_to_mi(&Command::RemoveCatchpoint(3)),
             "-break-delete 3"
         );
+    }
+
+    // ─── Catchpoints — Phase 2c: C++ exceptions (D2) ─────────────────────────
+    //
+    // Unlike Fork/Vfork/Exec/Signal/Syscall (console passthrough) and even
+    // Load/Unload (native verb but errors on a missing arg), the exception
+    // verbs are valid at zero arity — no console-passthrough fallback is
+    // needed. Verified live against GDB 17.2 (Phase 0 spike).
+
+    #[test]
+    fn build_catch_command_throw_rethrow_catch_bare_verb_with_no_args() {
+        assert_eq!(build_catch_command(CatchpointKind::Throw, &[]), "-catch-throw");
+        assert_eq!(
+            build_catch_command(CatchpointKind::Rethrow, &[]),
+            "-catch-rethrow"
+        );
+        assert_eq!(build_catch_command(CatchpointKind::Catch, &[]), "-catch-catch");
+    }
+
+    #[test]
+    fn build_catch_command_throw_with_regexp_uses_dash_r() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Throw, &["std::runtime_error".to_string()]),
+            "-catch-throw -r \"std::runtime_error\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_rethrow_with_regexp_uses_dash_r() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Rethrow, &["std::logic_error".to_string()]),
+            "-catch-rethrow -r \"std::logic_error\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_catch_with_regexp_uses_dash_r() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Catch, &["MyException".to_string()]),
+            "-catch-catch -r \"MyException\""
+        );
+    }
+
+    // Whitespace-only arg degrades to the bare verb — same emptiness rule
+    // as every other optional-arg kind (`args_from_buffer` never produces
+    // this from the UI, but the command builder stays total on its own).
+    #[test]
+    fn build_catch_command_throw_whitespace_only_regexp_degrades_to_bare_verb() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Throw, &["   ".to_string()]),
+            "-catch-throw"
+        );
+    }
+
+    // SECURITY (threat-matrix: MI injection into stdin). One test per
+    // adversarial character class, mirroring build_catch_command_load's own
+    // security tests.
+    #[test]
+    fn build_catch_command_throw_strips_embedded_newline() {
+        let mi = build_catch_command(
+            CatchpointKind::Throw,
+            &["std::runtime_error\n-exec-continue".to_string()],
+        );
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-catch-throw -r \"std::runtime_error-exec-continue\"");
+    }
+
+    #[test]
+    fn build_catch_command_throw_strips_embedded_carriage_return() {
+        let mi = build_catch_command(
+            CatchpointKind::Throw,
+            &["std::runtime_error\r-exec-run".to_string()],
+        );
+        assert!(!mi.contains('\r'));
+    }
+
+    #[test]
+    fn build_catch_command_rethrow_escapes_quote_and_backslash() {
+        let mi = build_catch_command(
+            CatchpointKind::Rethrow,
+            &[r#"foo"bar\baz"#.to_string()],
+        );
+        assert_eq!(mi, "-catch-rethrow -r \"foo\\\"bar\\\\baz\"");
+    }
+
+    // A full second MI command riding an embedded newline must collapse
+    // into one inert quoted line, never split.
+    #[test]
+    fn build_catch_command_catch_second_mi_command_payload_stays_a_single_line() {
+        let mi = build_catch_command(
+            CatchpointKind::Catch,
+            &["foo\n-exec-continue".to_string()],
+        );
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-catch-catch -r \"foo-exec-continue\"");
+    }
+
+    #[test]
+    fn add_catchpoint_command_throw_maps_to_build_catch_command() {
+        let mi = command_to_mi(&Command::AddCatchpoint {
+            kind: CatchpointKind::Throw,
+            args: vec!["std::runtime_error".to_string()],
+        });
+        assert_eq!(mi, "-catch-throw -r \"std::runtime_error\"");
     }
 
     #[test]

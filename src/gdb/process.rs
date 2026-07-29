@@ -1136,6 +1136,55 @@ mod tests {
         assert!(!pending_catch.contains_key(&11));
     }
 
+    // Phase 2c task 4.1 (verify-only — design deviation, see
+    // apply-progress): the key is built from `Display for CatchpointKind`
+    // (`"throw"`), so a rejected Throw creation routes to the same Pending
+    // Errors path with no new code. `pending_catch`/`correlate_pending_catch`
+    // are left as `HashMap<u32, String>` — the process.rs `PendingCatch`
+    // struct and tokened-echo correlation the design (D4) anticipated are
+    // unnecessary because the Phase 0 spike found the regexp round-trips
+    // through a dedicated `regexp=` field on the parser's self-describing
+    // ingress path (see `parse_catchpoint_field`), the same mechanism every
+    // other catchpoint kind already uses.
+    #[test]
+    fn correlate_pending_catch_emits_error_for_throw_key() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(12, "throw:std::runtime_error".into());
+
+        let event = correlate_pending_catch(
+            "12^error,msg=\"Junk after catchpoint condition\"",
+            &mut pending_catch,
+        );
+
+        match event {
+            Some(StateEvent::CatchpointError { key, message }) => {
+                assert_eq!(key, "throw:std::runtime_error");
+                assert_eq!(message, "Junk after catchpoint condition");
+            }
+            other => panic!("expected CatchpointError, got {other:?}"),
+        }
+        assert!(!pending_catch.contains_key(&12));
+    }
+
+    // Same cleanup-only shape as Load's tokened ^done (verified live: the
+    // Phase 0 spike's `-catch-throw` reply is ALSO tokened) — the
+    // self-describing `bkpt={..., regexp=...}` payload is parsed separately
+    // by `parse_line` into `CatchpointAdded` with the correct args already
+    // attached; this token exists only to route a rejected creation's
+    // `^error`.
+    #[test]
+    fn correlate_pending_catch_throw_done_is_cleanup_only_no_event() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(13, "throw:std::runtime_error".into());
+
+        let result = correlate_pending_catch(
+            "13^done,bkpt={number=\"4\",type=\"catchpoint\",catch-type=\"throw\",regexp=\"std::runtime_error\"}",
+            &mut pending_catch,
+        );
+        assert!(result.is_none());
+        assert!(!pending_catch.contains_key(&13));
+    }
+
     #[test]
     fn correlate_pending_catch_done_is_cleanup_only_no_event() {
         let mut pending_catch: HashMap<u32, String> = HashMap::new();
