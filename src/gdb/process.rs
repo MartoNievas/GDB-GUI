@@ -129,10 +129,7 @@ fn correlate_pending_watch(
     if rest.starts_with("^error") {
         pending_watch.remove(&token);
         let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
-        Some(StateEvent::WatchpointError {
-            expr,
-            message: msg,
-        })
+        Some(StateEvent::WatchpointError { expr, message: msg })
     } else if rest.starts_with("^done") {
         pending_watch.remove(&token);
         None
@@ -214,6 +211,52 @@ fn correlate_pending_probe(line: &str, pending_probe: &mut HashSet<u32>) -> Opti
         Some(ProbeOutcome::Failed)
     } else {
         None
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::AddCatchpoint`. If the token matches an entry in
+/// `pending_catch`, removes it (cleanup on both success and failure).
+/// `^error` returns `CatchpointError{key,message}` for the caller to emit,
+/// keyed the same way as `catchpoint_errors` (D1: `"{kind}:{args joined}"`).
+/// `^done` is cleanup-only and emits no event: catchpoint creation has no
+/// send-time optimistic add (design addendum A2/A3) — the GDB id is unknown
+/// until the asynchronous, untokened `=breakpoint-created` notify arrives
+/// (parsed separately by `parse_notify_async` into `CatchpointAdded`), so a
+/// tokened `^done` here (Load/Unload's native reply) carries nothing new.
+fn correlate_pending_catch(
+    line: &str,
+    pending_catch: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let key = pending_catch.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_catch.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::CatchpointError { key, message: msg })
+    } else if rest.starts_with("^done") {
+        pending_catch.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
+/// Pure decision for the two catchpoint commands (`RemoveCatchpoint`,
+/// `ToggleCatchpoint`) that have no correlatable reply — mirrors
+/// `optimistic_watchpoint_event` exactly (D2/D4 from design #65, unaffected
+/// by the transport addendum). `Command::AddCatchpoint` is deliberately
+/// absent here (addendum A2): its creation event is never optimistic.
+fn optimistic_catchpoint_event(cmd: &DebuggerCommand) -> Option<StateEvent> {
+    match cmd {
+        DebuggerCommand::RemoveCatchpoint(id) => Some(StateEvent::CatchpointRemoved { id: *id }),
+        DebuggerCommand::ToggleCatchpoint { id, enable } => Some(StateEvent::CatchpointToggled {
+            id: *id,
+            enabled: *enable,
+        }),
+        _ => None,
     }
 }
 
@@ -356,6 +399,13 @@ pub fn run_loop(
     // `parse_line` path into `WatchpointAdded`).
     let mut pending_watch: HashMap<u32, String> = HashMap::new();
 
+    // Token (assigned by GdbWriter::send) -> D1 key (`"{kind}:{args}"`) of
+    // the `Command::AddCatchpoint` pending a response. Correlated by token,
+    // not FIFO, like the other pending maps: only `^error` needs correlation
+    // here (a successful creation is never send-time optimistic — see
+    // `correlate_pending_catch` doc comment / design addendum A2/A3).
+    let mut pending_catch: HashMap<u32, String> = HashMap::new();
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             let mi = match dispatch(&cmd) {
@@ -412,6 +462,13 @@ pub fn run_loop(
                 pending_watch.insert(token, expr.clone());
             }
 
+            // D1 key: "{kind}:{args joined by ','}" — matches
+            // `catchpoint_errors`' key shape so a later `^error` attributes
+            // straight to the row the panel is tracking by (kind, args).
+            if let DebuggerCommand::AddCatchpoint { kind, args } = &cmd {
+                pending_catch.insert(token, format!("{kind}:{}", args.join(",")));
+            }
+
             // GDB responds to `-break-delete` with a plain `^done` without
             // `=breakpoint-deleted` or the deleted id, so the response cannot be
             // correlated. We emit the removal event ourselves so the UI reflects it.
@@ -426,6 +483,12 @@ pub fn run_loop(
             // correlate a row update from (see `optimistic_watchpoint_event`
             // doc comment), so both are emitted optimistically at send time.
             if let Some(event) = optimistic_watchpoint_event(&cmd) {
+                let _ = event_tx.send(DebuggerEvent::State(event));
+            }
+
+            // Catchpoint remove/toggle (D2, D4, unaffected by the transport
+            // addendum): same fire-and-forget reasoning as watchpoints.
+            if let Some(event) = optimistic_catchpoint_event(&cmd) {
                 let _ = event_tx.send(DebuggerEvent::State(event));
             }
         }
@@ -514,6 +577,20 @@ pub fn run_loop(
             // self-describing `wpt=`/`hw-rwpt=`/`hw-awpt=` reply into
             // `WatchpointAdded`.
             if let Some(event) = correlate_pending_watch(&line, &mut pending_watch) {
+                if event_tx.send(DebuggerEvent::State(event)).is_err() {
+                    let _ = child.kill();
+                    return;
+                }
+            }
+
+            // Catchpoint-creation correlation: like pending_watch, does not
+            // `continue` on `^error` — the console log still shows it via
+            // parse_line below. On `^done` (Load/Unload's native, tokened
+            // reply), the token is cleaned up and the line falls through to
+            // parse_line, which turns its self-describing `bkpt={catch-type=
+            // ...}` payload into `CatchpointAdded` (same fn the untokened
+            // notify-async path uses — A6).
+            if let Some(event) = correlate_pending_catch(&line, &mut pending_catch) {
                 if event_tx.send(DebuggerEvent::State(event)).is_err() {
                     let _ = child.kill();
                     return;
@@ -626,10 +703,8 @@ mod tests {
         let mut pending_struct: HashMap<u32, String> = HashMap::new();
         pending_struct.insert(3, "my_struct.field".into());
 
-        let event = correlate_pending_struct(
-            "3^done,value=\"{a = 1, b = 2}\"",
-            &mut pending_struct,
-        );
+        let event =
+            correlate_pending_struct("3^done,value=\"{a = 1, b = 2}\"", &mut pending_struct);
 
         match event {
             Some(StateEvent::StructValueUpdated { expr, value }) => {
@@ -738,8 +813,7 @@ mod tests {
         pending_globals.insert(21, "g_second".into());
 
         // Replies arrive reversed: token 21 first, then token 20.
-        let event_second =
-            correlate_pending_global("21^done,value=\"200\"", &mut pending_globals);
+        let event_second = correlate_pending_global("21^done,value=\"200\"", &mut pending_globals);
         match event_second {
             Some(StateEvent::GlobalValueUpdated { name, value }) => {
                 assert_eq!(name, "g_second");
@@ -913,7 +987,10 @@ mod tests {
         );
 
         assert!(outcome.is_none());
-        assert!(pending_probe.contains(&1), "unrelated entry must survive untouched");
+        assert!(
+            pending_probe.contains(&1),
+            "unrelated entry must survive untouched"
+        );
     }
 
     // ── Watchpoint remove/toggle fire-and-forget (D2, D4) ────────────────────
@@ -992,7 +1069,8 @@ mod tests {
 
         // Success carries no event here: the self-describing wpt= reply is
         // parsed separately by parse_line into WatchpointAdded.
-        let result = correlate_pending_watch("7^done,wpt={number=\"2\",exp=\"x\"}", &mut pending_watch);
+        let result =
+            correlate_pending_watch("7^done,wpt={number=\"2\",exp=\"x\"}", &mut pending_watch);
         assert!(result.is_none());
         assert!(
             !pending_watch.contains_key(&7),
@@ -1010,6 +1088,107 @@ mod tests {
         assert!(pending_watch.contains_key(&1));
     }
 
+    // ── Catchpoint creation correlation (^error only, A2/A3) ─────────────────
+
+    #[test]
+    fn correlate_pending_catch_emits_error_for_correct_key() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(9, "signal:BOGUS".into());
+
+        let event = correlate_pending_catch(
+            "9^error,msg=\"Undefined signal name BOGUS.\"",
+            &mut pending_catch,
+        );
+
+        match event {
+            Some(StateEvent::CatchpointError { key, message }) => {
+                assert_eq!(key, "signal:BOGUS");
+                assert_eq!(message, "Undefined signal name BOGUS.");
+            }
+            other => panic!("expected CatchpointError, got {other:?}"),
+        }
+        assert!(
+            !pending_catch.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_catch_done_is_cleanup_only_no_event() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(7, "load:libc".into());
+
+        // Success carries no event here: a tokened ^done (Load/Unload's
+        // native reply) is parsed separately by parse_line into
+        // CatchpointAdded, and the four other kinds never reach this token
+        // at all (their creation is untokened async).
+        let result = correlate_pending_catch(
+            "7^done,bkpt={number=\"3\",type=\"catchpoint\",catch-type=\"load\"}",
+            &mut pending_catch,
+        );
+        assert!(result.is_none());
+        assert!(
+            !pending_catch.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_catch_ignores_unrelated_tokens() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(1, "fork:".into());
+
+        let event = correlate_pending_catch("2^done", &mut pending_catch);
+        assert!(event.is_none());
+        assert!(pending_catch.contains_key(&1));
+    }
+
+    // ── Catchpoint remove/toggle fire-and-forget (D2, D4) ────────────────────
+
+    #[test]
+    fn optimistic_catchpoint_event_remove_emits_catchpoint_removed() {
+        let event = optimistic_catchpoint_event(&DebuggerCommand::RemoveCatchpoint(3));
+        match event {
+            Some(StateEvent::CatchpointRemoved { id }) => assert_eq!(id, 3),
+            other => panic!("expected CatchpointRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimistic_catchpoint_event_toggle_emits_catchpoint_toggled() {
+        let enable_event = optimistic_catchpoint_event(&DebuggerCommand::ToggleCatchpoint {
+            id: 5,
+            enable: true,
+        });
+        match enable_event {
+            Some(StateEvent::CatchpointToggled { id, enabled }) => {
+                assert_eq!(id, 5);
+                assert!(enabled);
+            }
+            other => panic!("expected CatchpointToggled, got {other:?}"),
+        }
+    }
+
+    // D2 regression guard: optimistic dispatch must key off the `Command`
+    // variant, not the id — a catchpoint remove/toggle must never be
+    // confused with the (structurally identical MI, different Command)
+    // breakpoint/watchpoint variants, and `AddCatchpoint` must never emit an
+    // optimistic event (A2 — creation is never send-time optimistic).
+    #[test]
+    fn optimistic_catchpoint_event_ignores_unrelated_and_add_commands() {
+        assert!(optimistic_catchpoint_event(&DebuggerCommand::Continue).is_none());
+        assert!(optimistic_catchpoint_event(&DebuggerCommand::RemoveBreakpoint(1)).is_none());
+        assert!(optimistic_catchpoint_event(&DebuggerCommand::RemoveWatchpoint(1)).is_none());
+        assert!(
+            optimistic_catchpoint_event(&DebuggerCommand::AddCatchpoint {
+                kind: crate::state::CatchpointKind::Fork,
+                args: vec![],
+            })
+            .is_none(),
+            "AddCatchpoint must never be optimistic (A2)"
+        );
+    }
+
     #[test]
     fn struct_and_global_evaluations_in_flight_simultaneously_resolve_independently() {
         // Mirrors the struct-inspection spec scenario: a globals refresh and a
@@ -1023,8 +1202,7 @@ mod tests {
 
         // The globals reply arrives first. The struct path (checked first in
         // the real loop) must not consume it, since its token isn't its own.
-        let struct_attempt =
-            correlate_pending_struct("31^done,value=\"7\"", &mut pending_struct);
+        let struct_attempt = correlate_pending_struct("31^done,value=\"7\"", &mut pending_struct);
         assert!(struct_attempt.is_none());
         assert!(
             pending_struct.contains_key(&30),

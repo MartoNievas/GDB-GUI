@@ -1,4 +1,4 @@
-use crate::state::{EditTarget, WatchpointKind};
+use crate::state::{CatchpointKind, EditTarget, WatchpointKind};
 use crate::ui::command::Command;
 
 pub fn command_to_mi(cmd: &Command) -> String {
@@ -29,6 +29,16 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::AddWatchpoint { expr, kind } => build_break_watch(*kind, expr),
         Command::RemoveWatchpoint(id) => format!("-break-delete {id}"),
         Command::ToggleWatchpoint { id, enable } => {
+            if *enable {
+                format!("-break-enable {id}")
+            } else {
+                format!("-break-disable {id}")
+            }
+        }
+
+        Command::AddCatchpoint { kind, args } => build_catch_command(*kind, args),
+        Command::RemoveCatchpoint(id) => format!("-break-delete {id}"),
+        Command::ToggleCatchpoint { id, enable } => {
             if *enable {
                 format!("-break-enable {id}")
             } else {
@@ -165,6 +175,56 @@ pub fn build_break_watch(kind: WatchpointKind, expr: &str) -> String {
         WatchpointKind::Read => format!("-break-watch -r {quoted}"),
         WatchpointKind::Access => format!("-break-watch -a {quoted}"),
     }
+}
+
+/// Builds the MI command for creating a catchpoint of `kind`, per design
+/// addendum A1 (supersedes design #65's D7 — verified live against GDB
+/// 17.2, which has no native `-catch-fork`/`-catch-vfork`/`-catch-exec`/
+/// `-catch-signal` MI verbs).
+///
+/// Fork/Vfork/Exec: `-interpreter-exec console "catch <kind>"` — `args` is
+/// discarded entirely (never appended), so a stray argument on a no-arg kind
+/// cannot become part of the composed command. Signal: same console
+/// transport, joining 0..N args with spaces (`"catch signal"` alone when
+/// empty). Load/Unload: the native `-catch-load`/`-catch-unload` verb with
+/// its one mandatory argument through `quote_mi`; with zero args (A5) they
+/// degrade to the same console-passthrough form as Fork/Vfork/Exec, since
+/// the native verb errors on a missing library name.
+///
+/// SECURITY: for the console-passthrough kinds, the WHOLE composed CLI text
+/// (`"catch fork"`, `"catch signal SIGINT SIGTERM"`, ...) is quoted as a
+/// single MI argument via `quote_mi` — never per-arg — so an embedded `"`,
+/// `\`, or newline in any arg cannot smuggle a second CLI line into GDB's
+/// `catch` parser (threat matrix: "CLI-in-MI nesting").
+pub fn build_catch_command(kind: CatchpointKind, args: &[String]) -> String {
+    match kind {
+        CatchpointKind::Fork => console_catch("catch fork"),
+        CatchpointKind::Vfork => console_catch("catch vfork"),
+        CatchpointKind::Exec => console_catch("catch exec"),
+        CatchpointKind::Signal => {
+            let joined = args.join(" ");
+            if joined.is_empty() {
+                console_catch("catch signal")
+            } else {
+                console_catch(&format!("catch signal {joined}"))
+            }
+        }
+        CatchpointKind::Load => match args.first() {
+            Some(arg) => format!("-catch-load {}", quote_mi(arg)),
+            None => console_catch("catch load"),
+        },
+        CatchpointKind::Unload => match args.first() {
+            Some(arg) => format!("-catch-unload {}", quote_mi(arg)),
+            None => console_catch("catch unload"),
+        },
+    }
+}
+
+/// Wraps `cli` (a raw, unescaped GDB CLI command line) as a single
+/// `-interpreter-exec console <quoted>` MI command. `quote_mi` is applied to
+/// the whole composed line, not to any sub-part — see `build_catch_command`.
+fn console_catch(cli: &str) -> String {
+    format!("-interpreter-exec console {}", quote_mi(cli))
 }
 
 #[cfg(test)]
@@ -449,5 +509,180 @@ mod tests {
         let mi = build_break_watch(WatchpointKind::Write, "x\n-exec-run");
         assert_eq!(mi.lines().count(), 1);
         assert_eq!(mi, "-break-watch \"x-exec-run\"");
+    }
+
+    // ─── Catchpoints (design addendum A1) ────────────────────────────────────
+
+    #[test]
+    fn build_catch_command_fork_vfork_exec_are_console_passthrough() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Fork, &[]),
+            "-interpreter-exec console \"catch fork\""
+        );
+        assert_eq!(
+            build_catch_command(CatchpointKind::Vfork, &[]),
+            "-interpreter-exec console \"catch vfork\""
+        );
+        assert_eq!(
+            build_catch_command(CatchpointKind::Exec, &[]),
+            "-interpreter-exec console \"catch exec\""
+        );
+    }
+
+    // Fork/Vfork/Exec must discard a stray argument entirely, never append
+    // it — the arg is composed nowhere in the resulting command text.
+    #[test]
+    fn build_catch_command_fork_vfork_exec_discard_stray_args() {
+        let hostile = vec!["evil\n-exec-run".to_string()];
+        assert_eq!(
+            build_catch_command(CatchpointKind::Fork, &hostile),
+            "-interpreter-exec console \"catch fork\""
+        );
+        assert_eq!(
+            build_catch_command(CatchpointKind::Vfork, &hostile),
+            "-interpreter-exec console \"catch vfork\""
+        );
+        assert_eq!(
+            build_catch_command(CatchpointKind::Exec, &hostile),
+            "-interpreter-exec console \"catch exec\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_signal_no_args_is_bare_catch_signal() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Signal, &[]),
+            "-interpreter-exec console \"catch signal\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_signal_joins_multiple_args_with_spaces() {
+        let args = vec!["SIGINT".to_string(), "SIGTERM".to_string()];
+        assert_eq!(
+            build_catch_command(CatchpointKind::Signal, &args),
+            "-interpreter-exec console \"catch signal SIGINT SIGTERM\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_load_with_arg_uses_native_verb() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Load, &["libfoo".to_string()]),
+            "-catch-load \"libfoo\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_unload_with_arg_uses_native_verb() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Unload, &["libfoo".to_string()]),
+            "-catch-unload \"libfoo\""
+        );
+    }
+
+    // A5: no-arg Load/Unload degrade to console passthrough — native
+    // `-catch-load`/`-catch-unload` errors on a missing library name.
+    #[test]
+    fn build_catch_command_load_unload_no_arg_degrades_to_console() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Load, &[]),
+            "-interpreter-exec console \"catch load\""
+        );
+        assert_eq!(
+            build_catch_command(CatchpointKind::Unload, &[]),
+            "-interpreter-exec console \"catch unload\""
+        );
+    }
+
+    // SECURITY (threat-matrix: MI text -> GDB stdin AND CLI-in-MI nesting).
+    // One test per adversarial character class, per variadic/argument kind.
+    #[test]
+    fn build_catch_command_signal_strips_embedded_newline() {
+        let args = vec!["SIGINT\n-exec-run".to_string()];
+        let mi = build_catch_command(CatchpointKind::Signal, &args);
+        assert!(!mi.contains('\n'));
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch signal SIGINT-exec-run\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_signal_strips_embedded_carriage_return() {
+        let args = vec!["SIGINT\r-exec-run".to_string()];
+        let mi = build_catch_command(CatchpointKind::Signal, &args);
+        assert!(!mi.contains('\r'));
+    }
+
+    #[test]
+    fn build_catch_command_signal_escapes_embedded_quote() {
+        let args = vec![r#"SIG"INT"#.to_string()];
+        let mi = build_catch_command(CatchpointKind::Signal, &args);
+        assert_eq!(mi, "-interpreter-exec console \"catch signal SIG\\\"INT\"");
+    }
+
+    #[test]
+    fn build_catch_command_signal_escapes_embedded_backslash() {
+        let args = vec![r"SIG\INT".to_string()];
+        let mi = build_catch_command(CatchpointKind::Signal, &args);
+        assert_eq!(mi, "-interpreter-exec console \"catch signal SIG\\\\INT\"");
+    }
+
+    // The canonical injection payload — a full second MI command riding an
+    // embedded newline — must collapse into one inert line, never split.
+    #[test]
+    fn build_catch_command_signal_second_mi_command_payload_stays_a_single_line() {
+        let args = vec!["SIGINT\n-exec-run".to_string()];
+        let mi = build_catch_command(CatchpointKind::Signal, &args);
+        assert_eq!(mi.lines().count(), 1);
+    }
+
+    #[test]
+    fn build_catch_command_load_strips_embedded_newline() {
+        let mi = build_catch_command(CatchpointKind::Load, &["lib\n-exec-run".to_string()]);
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi, "-catch-load \"lib-exec-run\"");
+    }
+
+    #[test]
+    fn build_catch_command_load_escapes_embedded_quote_and_backslash() {
+        let mi = build_catch_command(CatchpointKind::Load, &[r#"lib"foo\bar"#.to_string()]);
+        assert_eq!(mi, "-catch-load \"lib\\\"foo\\\\bar\"");
+    }
+
+    #[test]
+    fn add_catchpoint_command_maps_to_build_catch_command() {
+        let mi = command_to_mi(&Command::AddCatchpoint {
+            kind: CatchpointKind::Fork,
+            args: vec![],
+        });
+        assert_eq!(mi, "-interpreter-exec console \"catch fork\"");
+    }
+
+    #[test]
+    fn remove_catchpoint_command_maps_to_break_delete() {
+        assert_eq!(
+            command_to_mi(&Command::RemoveCatchpoint(3)),
+            "-break-delete 3"
+        );
+    }
+
+    #[test]
+    fn toggle_catchpoint_command_maps_to_enable_or_disable() {
+        assert_eq!(
+            command_to_mi(&Command::ToggleCatchpoint {
+                id: 3,
+                enable: true
+            }),
+            "-break-enable 3"
+        );
+        assert_eq!(
+            command_to_mi(&Command::ToggleCatchpoint {
+                id: 3,
+                enable: false
+            }),
+            "-break-disable 3"
+        );
     }
 }

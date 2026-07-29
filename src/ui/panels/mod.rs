@@ -5,6 +5,7 @@
 //! skeleton stays in `app.rs`; only panel *content* lives here.
 
 pub(crate) mod breakpoints;
+pub(crate) mod catchpoints;
 pub(crate) mod commands;
 pub(crate) mod console;
 pub(crate) mod files;

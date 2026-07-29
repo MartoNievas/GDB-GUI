@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::state::{
-    Breakpoint, DebuggerEvent, Frame, PauseState, StateEvent, StopReason, ThreadInfo, UiEvent,
-    Variable, Watchpoint, WatchpointKind,
+    Breakpoint, Catchpoint, CatchpointKind, DebuggerEvent, Frame, PauseState, StateEvent,
+    StopReason, ThreadInfo, UiEvent, Variable, Watchpoint, WatchpointKind,
 };
 
 pub fn parse_line(line: &str) -> Option<DebuggerEvent> {
@@ -81,11 +81,20 @@ fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
             // A synthetic frame preserves the pause transition instead of
             // bailing on `?` — which would silently drop the stop and leave
             // a stale watchpoint row (auto-removal never runs). Scoped to
-            // this one reason only; every other stop still requires a real
-            // frame.
+            // this one reason plus the four catchpoint stop reasons (D5,
+            // extended for Phase 2a — a caught fork/vfork/exec/solib-event
+            // may equally arrive with no active frame yet); every other stop
+            // still requires a real frame.
             let frame = match (&reason, parse_frame_field(fields)) {
                 (_, Some(f)) => f,
-                (StopReason::WatchpointScope(_), None) => Frame {
+                (
+                    StopReason::WatchpointScope(_)
+                    | StopReason::Forked { .. }
+                    | StopReason::Vforked { .. }
+                    | StopReason::Execd { .. }
+                    | StopReason::SolibEvent,
+                    None,
+                ) => Frame {
                     addr: 0,
                     function: "??".into(),
                     file: None,
@@ -153,6 +162,22 @@ fn parse_stop_reason(fields: &str) -> StopReason {
                 .unwrap_or(0);
             StopReason::WatchpointScope(id)
         }
+        // D4: catchpoint stop reasons, mapped 1:1 to GDB's literal reason
+        // strings (verified live against GDB 17.2 for fork/solib-event —
+        // apply-blocker #68).
+        Some("fork") => {
+            let newpid = extract_str(fields, "newpid").and_then(|s| s.parse().ok());
+            StopReason::Forked { newpid }
+        }
+        Some("vforked") => {
+            let newpid = extract_str(fields, "newpid").and_then(|s| s.parse().ok());
+            StopReason::Vforked { newpid }
+        }
+        Some("exec") => {
+            let path = extract_str(fields, "new-exec-path");
+            StopReason::Execd { path }
+        }
+        Some("solib-event") => StopReason::SolibEvent,
         _ => StopReason::Unknown,
     }
 }
@@ -165,6 +190,20 @@ fn parse_notify_async(line: &str) -> Option<DebuggerEvent> {
 
     match class {
         "breakpoint-created" | "breakpoint-modified" => {
+            // A6 (design addendum): checked BEFORE parse_breakpoint_field —
+            // most-specific-first, same discipline as D3. This is the ONLY
+            // ingress path for 4 of 6 catchpoint kinds (Fork/Vfork/Exec/
+            // Signal): their creation is untokened async, verified live
+            // against GDB 17.2 (apply-blocker #68). `breakpoint-modified`
+            // for a catchpoint re-emits CatchpointAdded — idempotent
+            // replace-by-id in `DebuggerState::apply`.
+            if fields.contains("catch-type=") {
+                let block = extract_block(fields, "bkpt")?;
+                let cp = parse_catchpoint_field(block)?;
+                return Some(DebuggerEvent::State(StateEvent::CatchpointAdded {
+                    catchpoint: cp,
+                }));
+            }
             let bp = parse_breakpoint_field(fields, "bkpt")?;
             Some(DebuggerEvent::State(StateEvent::BreakpointAdded {
                 breakpoint: bp,
@@ -191,6 +230,22 @@ fn parse_result(line: &str) -> Option<DebuggerEvent> {
         }
 
         "done" => {
+            // -catch-load/-catch-unload (with an arg) → ^done,bkpt={...,
+            // catch-type="load"|"unload",...} — the only two kinds whose
+            // creation reply is tokened/native (design addendum A1/A6).
+            // Checked BEFORE the plain bkpt= branch below (D3/A6
+            // most-specific-first discipline): catch-type= never appears on
+            // a real breakpoint reply.
+            if fields.contains("catch-type=") {
+                if let Some(block) = extract_block(&fields, "bkpt") {
+                    if let Some(cp) = parse_catchpoint_field(block) {
+                        return Some(DebuggerEvent::State(StateEvent::CatchpointAdded {
+                            catchpoint: cp,
+                        }));
+                    }
+                }
+            }
+
             // -break-insert → ^done,bkpt={...}
             if fields.contains("bkpt=") {
                 if let Some(bp) = parse_breakpoint_field(&fields, "bkpt") {
@@ -495,6 +550,78 @@ pub(crate) fn parse_watchpoint_field(
         kind,
         enabled: true,
     })
+}
+
+/// Parses a `catch-type=...` block (the content of a `bkpt={...}` catchpoint
+/// record, already unwrapped by the caller) into a `Catchpoint`. Shared by
+/// BOTH ingress paths — `parse_notify_async`'s untokened
+/// `breakpoint-created`/`-modified` (all 6 kinds) and `parse_result`'s
+/// tokened `done` arm (Load/Unload only) — so a duplicate record on either
+/// path produces a byte-identical `Catchpoint`, making `apply`'s
+/// replace-by-id idempotent regardless of which path wins the race (design
+/// addendum: "one shared `parse_catchpoint_field` serves both").
+///
+/// Requires `number=` and a recognized `catch-type=`; returns `None` for an
+/// unknown `catch-type` (Phase 2b kinds: throw/catch/rethrow/syscall) so no
+/// unsupported record is silently turned into a wrong-shaped row.
+pub(crate) fn parse_catchpoint_field(block: &str) -> Option<Catchpoint> {
+    let catch_type = extract_str(block, "catch-type")?;
+    let kind = parse_catchpoint_kind(&catch_type)?;
+    let id = extract_str(block, "number")?.parse().ok()?;
+    let enabled = extract_str(block, "enabled")
+        .map(|s| s == "y")
+        .unwrap_or(true);
+    let what = extract_str(block, "what");
+    let args = catchpoint_args_from_what(kind, what.as_deref());
+
+    Some(Catchpoint {
+        id,
+        kind,
+        args,
+        enabled,
+    })
+}
+
+fn parse_catchpoint_kind(catch_type: &str) -> Option<CatchpointKind> {
+    match catch_type {
+        "fork" => Some(CatchpointKind::Fork),
+        "vfork" => Some(CatchpointKind::Vfork),
+        "exec" => Some(CatchpointKind::Exec),
+        "signal" => Some(CatchpointKind::Signal),
+        "load" => Some(CatchpointKind::Load),
+        "unload" => Some(CatchpointKind::Unload),
+        _ => None,
+    }
+}
+
+/// A4 (design addendum): recovers `args` from the `what=` prose field, which
+/// is the only place GDB 17.2 puts them (verified live — apply-blocker #68;
+/// no clean `regexp=` field exists as design #65 originally assumed).
+///
+/// Fork/Vfork/Exec never carry args (verified: `what=` is absent for them).
+/// Signal's `what=` is a bare, clean signal name (e.g. `"SIGINT"`) — used
+/// as-is. Load/Unload's `what=` is prose: `"load of library matching X"` →
+/// `["X"]` via `rsplit_once(" matching ")`; the bare `"load of library"` /
+/// `"unload of library"` (no-arg console form) → `[]`; anything else (a
+/// future GDB version's differently worded prose) falls back to
+/// `[raw what text]` — wrong-looking in the UI at worst, never a panic.
+fn catchpoint_args_from_what(kind: CatchpointKind, what: Option<&str>) -> Vec<String> {
+    match kind {
+        CatchpointKind::Fork | CatchpointKind::Vfork | CatchpointKind::Exec => vec![],
+        CatchpointKind::Signal => what.map(|w| vec![w.to_string()]).unwrap_or_default(),
+        CatchpointKind::Load | CatchpointKind::Unload => match what {
+            None => vec![],
+            Some(w) => {
+                if let Some((_, matched)) = w.rsplit_once(" matching ") {
+                    vec![matched.to_string()]
+                } else if w == "load of library" || w == "unload of library" {
+                    vec![]
+                } else {
+                    vec![w.to_string()]
+                }
+            }
+        },
+    }
 }
 
 /// Extracts the leading numeric token from a raw MI line (e.g. `"12^error,..."`
@@ -1280,5 +1407,397 @@ mod tests {
             other => panic!("expected a state event for the scope exit, got {other:?}"),
         }
         assert!(state.persistent.watchpoints.is_empty());
+    }
+
+    // ─── Catchpoints (Phase 2a, design addendum #70) ──────────────────────────
+
+    // D3/A6 PINNED REGRESSION: a catchpoint's `bkpt={...}` record must never
+    // be parsed by `parse_breakpoint_field` — it always lacks `file`/
+    // `fullname`, so the existing `?`-bail already guarantees this, but this
+    // test pins it loudly against a future change to that function (e.g. a
+    // future contributor making it more tolerant) rather than letting it
+    // silently start producing ghost breakpoint rows for catchpoints.
+    #[test]
+    fn pinned_parse_breakpoint_field_rejects_catchpoint_record() {
+        let fields = r#"bkpt={number="1",type="catchpoint",disp="keep",enabled="y",catch-type="fork",thread-groups=["i1"],times="0"}"#;
+        assert!(parse_breakpoint_field(fields, "bkpt").is_none());
+    }
+
+    // ── parse_catchpoint_field: table-driven, one row per kind ───────────────
+
+    #[test]
+    fn parse_catchpoint_field_fork_vfork_exec_have_no_args() {
+        for (catch_type, kind) in [
+            ("fork", CatchpointKind::Fork),
+            ("vfork", CatchpointKind::Vfork),
+            ("exec", CatchpointKind::Exec),
+        ] {
+            let block = format!(
+                r#"number="1",type="catchpoint",disp="keep",enabled="y",catch-type="{catch_type}",thread-groups=["i1"],times="0""#
+            );
+            let cp = parse_catchpoint_field(&block)
+                .unwrap_or_else(|| panic!("expected Some for catch-type={catch_type}"));
+            assert_eq!(cp.id, 1);
+            assert_eq!(cp.kind, kind);
+            assert!(cp.args.is_empty());
+            assert!(cp.enabled);
+        }
+    }
+
+    #[test]
+    fn parse_catchpoint_field_signal_takes_bare_what_as_arg() {
+        let block = r#"number="2",type="catchpoint",disp="keep",enabled="y",what="SIGINT",catch-type="signal",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Signal);
+        assert_eq!(cp.args, vec!["SIGINT".to_string()]);
+    }
+
+    #[test]
+    fn parse_catchpoint_field_load_extracts_arg_from_matching_prose() {
+        let block = r#"number="3",type="catchpoint",disp="keep",enabled="y",what="load of library matching libc",catch-type="load",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Load);
+        assert_eq!(cp.args, vec!["libc".to_string()]);
+    }
+
+    #[test]
+    fn parse_catchpoint_field_unload_no_arg_bare_prose_yields_empty_args() {
+        let block = r#"number="4",type="catchpoint",disp="keep",enabled="y",what="unload of library",catch-type="unload",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.kind, CatchpointKind::Unload);
+        assert!(cp.args.is_empty());
+    }
+
+    // A4 defensive fallback: an unrecognized `what=` prose shape (e.g. a
+    // future GDB version's differently worded text) must not panic — it
+    // falls back to the raw text as a single arg.
+    #[test]
+    fn parse_catchpoint_field_load_unrecognized_prose_falls_back_to_raw_what() {
+        let block = r#"number="5",type="catchpoint",disp="keep",enabled="y",what="some future wording",catch-type="load",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert_eq!(cp.args, vec!["some future wording".to_string()]);
+    }
+
+    #[test]
+    fn parse_catchpoint_field_unknown_catch_type_yields_none() {
+        let block =
+            r#"number="6",type="catchpoint",disp="keep",enabled="y",catch-type="throw",times="0""#;
+        assert!(parse_catchpoint_field(block).is_none());
+    }
+
+    #[test]
+    fn parse_catchpoint_field_disabled_reads_enabled_false() {
+        let block =
+            r#"number="7",type="catchpoint",disp="keep",enabled="n",catch-type="fork",times="0""#;
+        let cp = parse_catchpoint_field(block).expect("expected Some");
+        assert!(!cp.enabled);
+    }
+
+    // ── Ingress path 1: parse_notify_async (untokened, all 6 kinds) ─────────
+    // Real GDB 17.2 capture shapes (apply-blocker #68).
+
+    #[test]
+    fn notify_async_breakpoint_created_fork_yields_catchpoint_added() {
+        let line = r#"=breakpoint-created,bkpt={number="1",type="catchpoint",disp="keep",enabled="y",catch-type="fork",thread-groups=["i1"],times="0"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::CatchpointAdded { catchpoint })) => {
+                assert_eq!(catchpoint.id, 1);
+                assert_eq!(catchpoint.kind, CatchpointKind::Fork);
+            }
+            other => panic!("expected CatchpointAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_async_breakpoint_created_signal_yields_catchpoint_added() {
+        let line = r#"=breakpoint-created,bkpt={number="2",type="catchpoint",disp="keep",enabled="y",what="SIGINT",catch-type="signal",thread-groups=["i1"],times="0"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::CatchpointAdded { catchpoint })) => {
+                assert_eq!(catchpoint.kind, CatchpointKind::Signal);
+                assert_eq!(catchpoint.args, vec!["SIGINT".to_string()]);
+            }
+            other => panic!("expected CatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // breakpoint-modified for a catchpoint must re-emit CatchpointAdded too
+    // (idempotent replace-by-id in apply) — not silently dropped.
+    #[test]
+    fn notify_async_breakpoint_modified_catchpoint_yields_catchpoint_added() {
+        let line = r#"=breakpoint-modified,bkpt={number="1",type="catchpoint",disp="keep",enabled="n",catch-type="fork",thread-groups=["i1"],times="0"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::CatchpointAdded { catchpoint })) => {
+                assert_eq!(catchpoint.id, 1);
+                assert!(!catchpoint.enabled);
+            }
+            other => panic!("expected CatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // A6/D3 disjointness: an ordinary breakpoint's created/modified notify
+    // (no catch-type=) must be completely unaffected by this change.
+    #[test]
+    fn notify_async_breakpoint_created_without_catch_type_still_yields_breakpoint_added() {
+        let line = r#"=breakpoint-created,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x1149",func="main",file="a.c",fullname="/a.c",line="10",times="0",original-location="a.c:10"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::BreakpointAdded { breakpoint })) => {
+                assert_eq!(breakpoint.id, 1);
+            }
+            other => panic!("expected BreakpointAdded, got {other:?}"),
+        }
+    }
+
+    // ── Ingress path 2: parse_result's done arm (tokened, Load/Unload only) ──
+
+    #[test]
+    fn result_done_catch_load_yields_catchpoint_added() {
+        let line = r#"3^done,bkpt={number="3",type="catchpoint",disp="keep",enabled="y",what="load of library matching libc",catch-type="load",times="0"}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::CatchpointAdded { catchpoint })) => {
+                assert_eq!(catchpoint.kind, CatchpointKind::Load);
+                assert_eq!(catchpoint.args, vec!["libc".to_string()]);
+            }
+            other => panic!("expected CatchpointAdded, got {other:?}"),
+        }
+    }
+
+    // D3 disjointness (both directions): a plain -break-insert ^done must
+    // never be mistaken for a catchpoint reply, and a catchpoint ^done must
+    // never fall into the plain-bkpt branch.
+    #[test]
+    fn result_done_catch_type_branch_is_disjoint_from_plain_bkpt_branch() {
+        let plain = r#"8^done,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x1149",func="main",file="a.c",fullname="/a.c",line="10",times="0",original-location="a.c:10"}"#;
+        match parse_line(plain) {
+            Some(DebuggerEvent::State(StateEvent::BreakpointAdded { breakpoint })) => {
+                assert_eq!(breakpoint.id, 1);
+            }
+            other => panic!("expected BreakpointAdded, got {other:?}"),
+        }
+    }
+
+    // ── Stop reasons: fork/vforked/exec/solib-event (D4) ─────────────────────
+
+    #[test]
+    fn stop_reason_fork_with_newpid() {
+        let line = r#"*stopped,reason="fork",newpid="12345",frame={func="main",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::Forked { newpid } => assert_eq!(newpid, Some(12345)),
+                    other => panic!("expected Forked, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // D5: fork without a frame= must still parse via the synthetic-frame
+    // fallback, not be silently dropped.
+    #[test]
+    fn stop_reason_fork_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="fork",newpid="12345",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::Forked { newpid } => assert_eq!(newpid, Some(12345)),
+                    other => panic!("expected Forked, got {other:?}"),
+                }
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_fork_without_newpid_is_none() {
+        let line = r#"*stopped,reason="fork",frame={func="main",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::Forked { newpid } => assert_eq!(newpid, None),
+                    other => panic!("expected Forked, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_vforked_with_newpid() {
+        let line = r#"*stopped,reason="vforked",newpid="999",frame={func="main",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::Vforked { newpid } => assert_eq!(newpid, Some(999)),
+                    other => panic!("expected Vforked, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_vforked_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="vforked",newpid="999",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_exec_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="exec",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::Execd { .. } => {}
+                    other => panic!("expected Execd, got {other:?}"),
+                }
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_solib_event_with_frame() {
+        // Real GDB 17.2 capture shape (apply-blocker #68): `added=[library=...]`.
+        let line = r#"*stopped,reason="solib-event",frame={func="_dl_open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert!(matches!(pause.stop_reason, StopReason::SolibEvent));
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_solib_event_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="solib-event",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert!(matches!(pause.stop_reason, StopReason::SolibEvent));
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // Triangulation: an ordinary breakpoint-hit without a frame must still
+    // be dropped — the D5 fallback stays scoped to the five listed reasons.
+    #[test]
+    fn breakpoint_hit_without_frame_still_dropped_after_catchpoint_extension() {
+        let line = r#"*stopped,reason="breakpoint-hit",bkptno="1",thread-id="1""#;
+        assert!(parse_line(line).is_none());
+    }
+
+    // ── Integration: real MI transcripts through parse_line + apply ─────────
+
+    // Fork: console-add -> untokened =breakpoint-created -> *stopped,reason="fork"
+    // -> -break-delete removal (RemoveCatchpoint is optimistic, not tested
+    // here — this integration test covers the parse+apply side only).
+    #[test]
+    fn catchpoint_fork_add_stop_via_parse_line_and_apply() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"=breakpoint-created,bkpt={number="1",type="catchpoint",disp="keep",enabled="y",catch-type="fork",thread-groups=["i1"],times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the create notify, got {other:?}"),
+        }
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(state.persistent.catchpoints[0].kind, CatchpointKind::Fork);
+
+        match parse_line(
+            r#"*stopped,reason="fork",newpid="4242",frame={func="main",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the fork stop, got {other:?}"),
+        }
+        assert!(state.is_paused());
+        match &state.pause.as_ref().unwrap().stop_reason {
+            StopReason::Forked { newpid } => assert_eq!(*newpid, Some(4242)),
+            other => panic!("expected Forked, got {other:?}"),
+        }
+
+        state.apply(StateEvent::CatchpointRemoved { id: 1 });
+        assert!(state.persistent.catchpoints.is_empty());
+    }
+
+    // Signal: console-add -> untokened =breakpoint-created -> signal-received.
+    #[test]
+    fn catchpoint_signal_add_then_signal_received_via_parse_line_and_apply() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"=breakpoint-created,bkpt={number="2",type="catchpoint",disp="keep",enabled="y",what="SIGINT",catch-type="signal",thread-groups=["i1"],times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the create notify, got {other:?}"),
+        }
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["SIGINT".to_string()]
+        );
+
+        match parse_line(
+            r#"*stopped,reason="signal-received",signal-name="SIGINT",frame={func="main",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the signal stop, got {other:?}"),
+        }
+        match &state.pause.as_ref().unwrap().stop_reason {
+            StopReason::Signal(name) => assert_eq!(name, "SIGINT"),
+            other => panic!("expected Signal, got {other:?}"),
+        }
+    }
+
+    // Load: native tokened ^done with a regex arg embedded in `what=` prose.
+    #[test]
+    fn catchpoint_load_add_with_regexp_via_parse_line_and_apply() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"5^done,bkpt={number="3",type="catchpoint",disp="keep",enabled="y",what="load of library matching libfoo",catch-type="load",times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the load create reply, got {other:?}"),
+        }
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(state.persistent.catchpoints[0].kind, CatchpointKind::Load);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["libfoo".to_string()]
+        );
+    }
+
+    // Duplicate ^done + notify race for the same load catchpoint: both paths
+    // must converge on exactly one row (replace-by-id idempotency, A6).
+    #[test]
+    fn catchpoint_load_duplicate_done_and_notify_still_one_row() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"5^done,bkpt={number="3",type="catchpoint",disp="keep",enabled="y",what="load of library matching libc",catch-type="load",times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event, got {other:?}"),
+        }
+        match parse_line(
+            r#"=breakpoint-created,bkpt={number="3",type="catchpoint",disp="keep",enabled="y",what="load of library matching libc",catch-type="load",thread-groups=["i1"],times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event, got {other:?}"),
+        }
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
     }
 }

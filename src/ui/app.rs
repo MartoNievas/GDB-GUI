@@ -35,6 +35,7 @@ pub struct App {
     pub(crate) open_stack: bool,
     pub(crate) open_files: bool,
     pub(crate) open_thread: bool,
+    pub(crate) open_cp: bool,
 
     source_lines: Vec<SourceLine>,
     source_file: Option<String>,
@@ -54,6 +55,10 @@ pub struct App {
     // Watchpoints panel input row buffers.
     pub(crate) wp_expr_buffer: String,
     pub(crate) wp_kind_buffer: crate::state::WatchpointKind,
+
+    // Catchpoints panel input row buffers.
+    pub(crate) cp_kind_buffer: crate::state::CatchpointKind,
+    pub(crate) cp_args_buffer: String,
 }
 
 impl App {
@@ -76,6 +81,7 @@ impl App {
             open_stack: true,
             open_files: false,
             open_thread: false,
+            open_cp: true,
             source_lines: Vec::new(),
             source_file: None,
             bp_cond_buffer: std::collections::HashMap::new(),
@@ -83,6 +89,8 @@ impl App {
             value_edit_buffer: std::collections::HashMap::new(),
             wp_expr_buffer: String::new(),
             wp_kind_buffer: crate::state::WatchpointKind::Write,
+            cp_kind_buffer: crate::state::CatchpointKind::Fork,
+            cp_args_buffer: String::new(),
         }
     }
 
@@ -130,8 +138,7 @@ impl App {
         let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
         let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
         let thread_selected = matches!(s, crate::state::StateEvent::ThreadSelected { .. });
-        let new_global_names = if let crate::state::StateEvent::GlobalNamesReceived { names } = &s
-        {
+        let new_global_names = if let crate::state::StateEvent::GlobalNamesReceived { names } = &s {
             Some(names.clone())
         } else {
             None
@@ -140,12 +147,11 @@ impl App {
         // source of truth for the refreshed cell (spec "Explicit Refresh
         // After Successful Write"). Captured before apply() clears the
         // matching edit_errors entry, mirroring was_paused/thread_selected.
-        let succeeded_target =
-            if let crate::state::StateEvent::ValueEditSucceeded { target } = &s {
-                Some(target.clone())
-            } else {
-                None
-            };
+        let succeeded_target = if let crate::state::StateEvent::ValueEditSucceeded { target } = &s {
+            Some(target.clone())
+        } else {
+            None
+        };
 
         self.state.apply(s);
         self.load_source_if_needed();
@@ -173,9 +179,7 @@ impl App {
         if let Some(target) = succeeded_target {
             match target {
                 crate::state::EditTarget::Local(_) => self.send(Command::RequestLocals),
-                crate::state::EditTarget::Global(name) => {
-                    self.send(Command::EvaluateGlobal(name))
-                }
+                crate::state::EditTarget::Global(name) => self.send(Command::EvaluateGlobal(name)),
                 crate::state::EditTarget::Register(_) => self.send(Command::RequestRegisters),
             }
         }
@@ -323,6 +327,9 @@ impl eframe::App for App {
                                 // WATCHPOINTS ──────────────────────────────────────────
                                 panels::watchpoints::render(self, ui);
 
+                                // CATCHPOINTS ──────────────────────────────────────────
+                                panels::catchpoints::render(self, ui);
+
                                 // COMMANDS ──────────────────────────────────────────────
                                 panels::commands::render(self, ui);
 
@@ -356,40 +363,41 @@ impl eframe::App for App {
                     .id_salt("source")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                    if self.source_lines.is_empty() {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(m("No source file loaded", 13.0, TXT_DIM).italics());
-                        });
-                        return;
-                    }
+                        if self.source_lines.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(m("No source file loaded", 13.0, TXT_DIM).italics());
+                            });
+                            return;
+                        }
 
-                    let current_line = self.state.current_line();
+                        let current_line = self.state.current_line();
 
-                    for line in &self.source_lines {
-                        let is_current = Some(line.number) == current_line;
-                        let file_ref = self.source_file.as_deref().unwrap_or("");
-                        // The marker is only drawn on the actual line where GDB stops;
-                        // the toggle also accepts the requested line (in case GDB relocated it).
-                        let has_bp = self.state.has_breakpoint_marker(file_ref, line.number);
-                        let bp_id = self
-                            .state
-                            .breakpoint_at(file_ref, line.number)
-                            .map(|b| b.id);
+                        for line in &self.source_lines {
+                            let is_current = Some(line.number) == current_line;
+                            let file_ref = self.source_file.as_deref().unwrap_or("");
+                            // The marker is only drawn on the actual line where GDB stops;
+                            // the toggle also accepts the requested line (in case GDB relocated it).
+                            let has_bp = self.state.has_breakpoint_marker(file_ref, line.number);
+                            let bp_id = self
+                                .state
+                                .breakpoint_at(file_ref, line.number)
+                                .map(|b| b.id);
 
-                        let response = source_row(ui, line.number, &line.text, is_current, has_bp);
-                        if response.clicked() {
-                            if let Some(id) = bp_id {
-                                self.send(Command::RemoveBreakpoint(id));
-                            } else if let Some(file) = self.source_file.clone() {
-                                self.send(Command::AddBreakpoint {
-                                    file,
-                                    line: line.number,
-                                    condition: None,
-                                });
+                            let response =
+                                source_row(ui, line.number, &line.text, is_current, has_bp);
+                            if response.clicked() {
+                                if let Some(id) = bp_id {
+                                    self.send(Command::RemoveBreakpoint(id));
+                                } else if let Some(file) = self.source_file.clone() {
+                                    self.send(Command::AddBreakpoint {
+                                        file,
+                                        line: line.number,
+                                        condition: None,
+                                    });
+                                }
                             }
                         }
-                    }
-                });
+                    });
             });
     }
 }
@@ -609,12 +617,15 @@ mod tests {
     #[test]
     fn apply_state_event_watchpoint_removed_and_toggled_update_state() {
         let (mut app, _cmd_rx) = test_app();
-        app.state.persistent.watchpoints.push(crate::state::Watchpoint {
-            id: 3,
-            expr: "y".into(),
-            kind: crate::state::WatchpointKind::Read,
-            enabled: true,
-        });
+        app.state
+            .persistent
+            .watchpoints
+            .push(crate::state::Watchpoint {
+                id: 3,
+                expr: "y".into(),
+                kind: crate::state::WatchpointKind::Read,
+                enabled: true,
+            });
 
         app.apply_state_event(crate::state::StateEvent::WatchpointToggled {
             id: 3,
@@ -624,5 +635,102 @@ mod tests {
 
         app.apply_state_event(crate::state::StateEvent::WatchpointRemoved { id: 3 });
         assert!(app.state.persistent.watchpoints.is_empty());
+    }
+
+    // ── Catchpoint event-loop routing (Task 5) ───────────────────────────────
+
+    #[test]
+    fn apply_state_event_catchpoint_added_updates_state() {
+        let (mut app, _cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::CatchpointAdded {
+            catchpoint: crate::state::Catchpoint {
+                id: 2,
+                kind: crate::state::CatchpointKind::Fork,
+                args: vec![],
+                enabled: true,
+            },
+        });
+
+        assert_eq!(app.state.persistent.catchpoints.len(), 1);
+        assert_eq!(
+            app.state.persistent.catchpoints[0].kind,
+            crate::state::CatchpointKind::Fork
+        );
+    }
+
+    #[test]
+    fn apply_state_event_catchpoint_error_populates_catchpoint_errors() {
+        let (mut app, _cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::CatchpointError {
+            key: "signal:BOGUS".into(),
+            message: "Undefined signal name BOGUS.".into(),
+        });
+
+        assert_eq!(
+            app.state.catchpoint_error("signal:BOGUS"),
+            Some("Undefined signal name BOGUS.")
+        );
+    }
+
+    // Triangulation: Removed/Toggled must each apply through the same
+    // generic routing, not just Added/Error — mirrors the watchpoint test
+    // above.
+    #[test]
+    fn apply_state_event_catchpoint_removed_and_toggled_update_state() {
+        let (mut app, _cmd_rx) = test_app();
+        app.state
+            .persistent
+            .catchpoints
+            .push(crate::state::Catchpoint {
+                id: 3,
+                kind: crate::state::CatchpointKind::Exec,
+                args: vec![],
+                enabled: true,
+            });
+
+        app.apply_state_event(crate::state::StateEvent::CatchpointToggled {
+            id: 3,
+            enabled: false,
+        });
+        assert!(!app.state.persistent.catchpoints[0].enabled);
+
+        app.apply_state_event(crate::state::StateEvent::CatchpointRemoved { id: 3 });
+        assert!(app.state.persistent.catchpoints.is_empty());
+    }
+
+    // Stop-reason dispatch (Task 5): a ProgramPaused carrying any of the 4
+    // new catchpoint stop reasons must trigger the same thread-scoped
+    // refresh as every other pause (no special-casing needed — the routing
+    // is by StateEvent variant, not by stop_reason content).
+    #[test]
+    fn apply_state_event_catchpoint_stop_reasons_trigger_thread_scoped_refresh() {
+        for reason in [
+            crate::state::StopReason::Forked { newpid: Some(123) },
+            crate::state::StopReason::Vforked { newpid: None },
+            crate::state::StopReason::Execd { path: None },
+            crate::state::StopReason::SolibEvent,
+        ] {
+            let (mut app, cmd_rx) = test_app();
+            app.apply_state_event(crate::state::StateEvent::ProgramPaused {
+                pause: crate::state::PauseState {
+                    thread_id: 1,
+                    frame: crate::state::Frame {
+                        addr: 0,
+                        function: "??".into(),
+                        file: None,
+                        line: None,
+                    },
+                    stack: vec![],
+                    stop_reason: reason.clone(),
+                },
+            });
+            let sent: Vec<Command> = cmd_rx.try_iter().collect();
+            assert!(
+                sent.contains(&Command::RequestThreads),
+                "expected RequestThreads for stop reason {reason:?}, got {sent:?}"
+            );
+        }
     }
 }

@@ -87,6 +87,40 @@ pub struct Watchpoint {
     pub enabled: bool,
 }
 
+// ─── Catchpoint ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatchpointKind {
+    Fork,
+    Vfork,
+    Exec,
+    Signal,
+    Load,
+    Unload,
+}
+
+impl std::fmt::Display for CatchpointKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CatchpointKind::Fork => "fork",
+            CatchpointKind::Vfork => "vfork",
+            CatchpointKind::Exec => "exec",
+            CatchpointKind::Signal => "signal",
+            CatchpointKind::Load => "load",
+            CatchpointKind::Unload => "unload",
+        };
+        write!(f, "{s}")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Catchpoint {
+    pub id: u32,
+    pub kind: CatchpointKind,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
 // ─── Stop reason ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -107,6 +141,21 @@ pub enum StopReason {
     /// `DebuggerState::apply` on `ProgramPaused` to silently remove the row
     /// (design decision D6) — it never becomes a separate `StateEvent`.
     WatchpointScope(u32),
+    /// `*stopped,reason="fork"`: a Fork catchpoint fired. `newpid` is the
+    /// child process's pid if GDB reported it.
+    Forked {
+        newpid: Option<u32>,
+    },
+    /// `*stopped,reason="vforked"`: a Vfork catchpoint fired.
+    Vforked {
+        newpid: Option<u32>,
+    },
+    /// `*stopped,reason="exec"`: an Exec catchpoint fired.
+    Execd {
+        path: Option<String>,
+    },
+    /// `*stopped,reason="solib-event"`: a Load/Unload catchpoint fired.
+    SolibEvent,
     Unknown,
 }
 
@@ -150,6 +199,9 @@ pub struct PersistentState {
     /// Expression watchpoints. In-memory only for the session's lifetime —
     /// never persisted to disk (spec: "No Persistence Across Sessions").
     pub watchpoints: Vec<Watchpoint>,
+    /// Event catchpoints (fork/vfork/exec/signal/load/unload). In-memory
+    /// only for the session's lifetime, same scope as `watchpoints`.
+    pub catchpoints: Vec<Catchpoint>,
 }
 
 // ─── Top-level state ─────────────────────────────────────────────────────────
@@ -189,6 +241,12 @@ pub struct DebuggerState {
     /// error to). Cleared on that expression's next successful add. Wiped in
     /// full on Loaded/Started/Exited, like `edit_errors`.
     pub watchpoint_errors: std::collections::HashMap<String, String>,
+    /// GDB `^error` message from a failed catchpoint creation/toggle/delete,
+    /// keyed by `"{kind}:{args joined}"` (design decision D1 — a rejected
+    /// catchpoint attempt returns no GDB id, so there is no row to attach an
+    /// error to). Wiped in full on Loaded/Started/Exited, like
+    /// `watchpoint_errors`.
+    pub catchpoint_errors: std::collections::HashMap<String, String>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -296,6 +354,31 @@ pub enum StateEvent {
         expr: String,
         message: String,
     },
+    /// A catchpoint was created (self-describing `bkpt={type="catchpoint",
+    /// catch-type=...}` reply/notify — no token correlation needed for
+    /// success).
+    CatchpointAdded {
+        catchpoint: Catchpoint,
+    },
+    /// `-break-delete <id>` has no reply the removal can be correlated
+    /// from, so `process.rs` emits this optimistically at send time,
+    /// mirroring `WatchpointRemoved`.
+    CatchpointRemoved {
+        id: u32,
+    },
+    /// `-break-enable`/`-break-disable` reply with a bare `^done`: emitted
+    /// optimistically by `process.rs` at send time, mirroring
+    /// `WatchpointToggled`.
+    CatchpointToggled {
+        id: u32,
+        enabled: bool,
+    },
+    /// GDB `^error` for a catchpoint creation/toggle/delete attempt, or a
+    /// locally rejected duplicate (kind, args) pair.
+    CatchpointError {
+        key: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -331,10 +414,12 @@ impl DebuggerState {
                 executable: None,
                 breakpoints: vec![],
                 watchpoints: vec![],
+                catchpoints: vec![],
             },
             preview_file: None,
             edit_errors: std::collections::HashMap::new(),
             watchpoint_errors: std::collections::HashMap::new(),
+            catchpoint_errors: std::collections::HashMap::new(),
         }
     }
 
@@ -361,6 +446,7 @@ impl DebuggerState {
                 self.preview_file = None;
                 self.edit_errors.clear();
                 self.watchpoint_errors.clear();
+                self.catchpoint_errors.clear();
             }
 
             StateEvent::ProgramStarted => {
@@ -379,6 +465,7 @@ impl DebuggerState {
                 self.current_thread = None;
                 self.edit_errors.clear();
                 self.watchpoint_errors.clear();
+                self.catchpoint_errors.clear();
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -416,6 +503,7 @@ impl DebuggerState {
                 self.current_thread = None;
                 self.edit_errors.clear();
                 self.watchpoint_errors.clear();
+                self.catchpoint_errors.clear();
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -513,6 +601,30 @@ impl DebuggerState {
             StateEvent::WatchpointError { expr, message } => {
                 self.watchpoint_errors.insert(expr, message);
             }
+
+            StateEvent::CatchpointAdded { catchpoint } => {
+                if let Some(existing) = self
+                    .persistent
+                    .catchpoints
+                    .iter_mut()
+                    .find(|c| c.id == catchpoint.id)
+                {
+                    *existing = catchpoint;
+                } else {
+                    self.persistent.catchpoints.push(catchpoint);
+                }
+            }
+            StateEvent::CatchpointRemoved { id } => {
+                self.persistent.catchpoints.retain(|c| c.id != id);
+            }
+            StateEvent::CatchpointToggled { id, enabled } => {
+                if let Some(cp) = self.persistent.catchpoints.iter_mut().find(|c| c.id == id) {
+                    cp.enabled = enabled;
+                }
+            }
+            StateEvent::CatchpointError { key, message } => {
+                self.catchpoint_errors.insert(key, message);
+            }
         }
     }
 
@@ -589,6 +701,28 @@ impl DebuggerState {
     /// expression.
     pub fn watchpoint_error(&self, expr: &str) -> Option<&str> {
         self.watchpoint_errors.get(expr).map(|s| s.as_str())
+    }
+
+    /// Whether a catchpoint already exists for this exact `(kind, args)`
+    /// pair. Used to reject a duplicate creation attempt client-side, with
+    /// no MI round trip.
+    pub fn has_catchpoint(&self, kind: CatchpointKind, args: &[String]) -> bool {
+        self.persistent
+            .catchpoints
+            .iter()
+            .any(|c| c.kind == kind && c.args == args)
+    }
+
+    /// GDB's `^error` message (or a locally rejected duplicate's message)
+    /// for `key` (`"{kind}:{args joined}"`), if any.
+    pub fn catchpoint_error(&self, key: &str) -> Option<&str> {
+        self.catchpoint_errors.get(key).map(|s| s.as_str())
+    }
+
+    /// Catchpoint with the given GDB id, if any — used to correlate a
+    /// `BreakpointHit(id)` stop against an armed catchpoint.
+    pub fn catchpoint_by_id(&self, id: u32) -> Option<&Catchpoint> {
+        self.persistent.catchpoints.iter().find(|c| c.id == id)
     }
 
     /// Checks whether `candidate` is redundant: another breakpoint (with a
@@ -1383,5 +1517,207 @@ mod tests {
         });
 
         assert_eq!(state.persistent.watchpoints.len(), 1);
+    }
+
+    // ── Catchpoints ─────────────────────────────────────────────────────────
+
+    fn cp(id: u32, kind: CatchpointKind, args: &[&str]) -> Catchpoint {
+        Catchpoint {
+            id,
+            kind,
+            args: args.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn catchpoint_kind_display_matches_gdb_catch_type_string() {
+        assert_eq!(CatchpointKind::Fork.to_string(), "fork");
+        assert_eq!(CatchpointKind::Vfork.to_string(), "vfork");
+        assert_eq!(CatchpointKind::Exec.to_string(), "exec");
+        assert_eq!(CatchpointKind::Signal.to_string(), "signal");
+        assert_eq!(CatchpointKind::Load.to_string(), "load");
+        assert_eq!(CatchpointKind::Unload.to_string(), "unload");
+    }
+
+    #[test]
+    fn catchpoint_constructs_with_kind_args_and_enabled() {
+        let c = cp(1, CatchpointKind::Signal, &["SIGINT"]);
+        assert_eq!(c.id, 1);
+        assert_eq!(c.kind, CatchpointKind::Signal);
+        assert_eq!(c.args, vec!["SIGINT".to_string()]);
+        assert!(c.enabled);
+    }
+
+    #[test]
+    fn catchpoint_added_pushes_new_row() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::CatchpointAdded {
+            catchpoint: cp(5, CatchpointKind::Fork, &[]),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        let row = &state.persistent.catchpoints[0];
+        assert_eq!(row.id, 5);
+        assert_eq!(row.kind, CatchpointKind::Fork);
+        assert!(row.enabled);
+    }
+
+    #[test]
+    fn catchpoint_added_replaces_existing_by_id() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(5, CatchpointKind::Load, &["libfoo"]));
+
+        state.apply(StateEvent::CatchpointAdded {
+            catchpoint: cp(5, CatchpointKind::Load, &["libbar"]),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["libbar".to_string()]
+        );
+    }
+
+    #[test]
+    fn catchpoint_removed_drops_only_matching_id() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(1, CatchpointKind::Fork, &[]));
+        state
+            .persistent
+            .catchpoints
+            .push(cp(2, CatchpointKind::Vfork, &[]));
+
+        state.apply(StateEvent::CatchpointRemoved { id: 1 });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(state.persistent.catchpoints[0].id, 2);
+    }
+
+    #[test]
+    fn catchpoint_toggled_flips_enabled_leaves_others_untouched() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(3, CatchpointKind::Exec, &[]));
+
+        state.apply(StateEvent::CatchpointToggled {
+            id: 3,
+            enabled: false,
+        });
+        assert!(!state.persistent.catchpoints[0].enabled);
+
+        state.apply(StateEvent::CatchpointToggled {
+            id: 3,
+            enabled: true,
+        });
+        assert!(state.persistent.catchpoints[0].enabled);
+    }
+
+    #[test]
+    fn has_catchpoint_true_for_existing_kind_and_args_only() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(1, CatchpointKind::Signal, &["SIGINT"]));
+
+        assert!(has_catchpoint_helper(
+            &state,
+            CatchpointKind::Signal,
+            &["SIGINT"]
+        ));
+        assert!(!has_catchpoint_helper(
+            &state,
+            CatchpointKind::Signal,
+            &["SIGSEGV"]
+        ));
+        assert!(!has_catchpoint_helper(&state, CatchpointKind::Fork, &[]));
+    }
+
+    fn has_catchpoint_helper(state: &DebuggerState, kind: CatchpointKind, args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        state.has_catchpoint(kind, &owned)
+    }
+
+    #[test]
+    fn catchpoint_error_sets_and_reads_by_key() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::CatchpointError {
+            key: "signal:BOGUS".into(),
+            message: "Undefined signal name BOGUS.".into(),
+        });
+
+        assert_eq!(
+            state.catchpoint_error("signal:BOGUS"),
+            Some("Undefined signal name BOGUS.")
+        );
+        assert_eq!(state.catchpoint_error("fork:"), None);
+    }
+
+    #[test]
+    fn catchpoint_by_id_finds_only_matching_row() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(9, CatchpointKind::Load, &["libc"]));
+
+        assert!(state.catchpoint_by_id(9).is_some());
+        assert_eq!(
+            state.catchpoint_by_id(9).unwrap().kind,
+            CatchpointKind::Load
+        );
+        assert!(state.catchpoint_by_id(10).is_none());
+    }
+
+    #[test]
+    fn program_loaded_started_exited_wipe_catchpoint_errors() {
+        let mut state = DebuggerState::new();
+        state
+            .catchpoint_errors
+            .insert("fork:".into(), "stale error".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.catchpoint_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .catchpoint_errors
+            .insert("fork:".into(), "stale error".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.catchpoint_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .catchpoint_errors
+            .insert("fork:".into(), "stale error".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.catchpoint_errors.is_empty());
+    }
+
+    // Rollback guarantee (mirrors watchpoints): lifecycle events must leave
+    // persisted catchpoints untouched — only the *_errors map is wiped.
+    #[test]
+    fn program_loaded_does_not_clear_persisted_catchpoints() {
+        let mut state = DebuggerState::new();
+        state
+            .persistent
+            .catchpoints
+            .push(cp(1, CatchpointKind::Fork, &[]));
+
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
     }
 }

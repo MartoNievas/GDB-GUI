@@ -1,4 +1,4 @@
-use crate::state::{EditTarget, WatchpointKind};
+use crate::state::{CatchpointKind, EditTarget, WatchpointKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -53,6 +53,37 @@ pub enum Command {
     /// in `process.rs` (`pending_probe`) — it never becomes a `Breakpoint`
     /// row and never reaches the UI as a `Command`/state event of its own.
     ProbeMainSource,
+
+    // Catchpoints
+    /// Creates an event catchpoint. Dispatched to one of two MI transports
+    /// depending on `kind` (design addendum A1 — supersedes design #65's D7,
+    /// which assumed a uniform native `-catch-<kind>` verb that GDB 17.2
+    /// does not implement for Fork/Vfork/Exec/Signal): those four go through
+    /// `-interpreter-exec console "catch ..."`; Load/Unload keep the native
+    /// `-catch-load`/`-catch-unload` verbs. Fire-and-forget with NO
+    /// send-time optimistic event (addendum A2, overrides the brief): the
+    /// GDB id is unknown until the asynchronous, untokened
+    /// `=breakpoint-created` notify arrives and is parsed into
+    /// `CatchpointAdded` — only a rejected attempt (`^error`) is correlated
+    /// back to this request, via `pending_catch` (addendum A3).
+    AddCatchpoint {
+        kind: CatchpointKind,
+        args: Vec<String>,
+    },
+    /// Deletes a catchpoint via `-break-delete <id>` — dedicated variant,
+    /// NOT `RemoveBreakpoint`/`RemoveWatchpoint` reused (design decision D2):
+    /// `process.rs`'s optimistic dispatch keys off the `Command` variant, so
+    /// reusing another variant would emit the wrong `StateEvent` and never
+    /// clear this row. Reuses the shared breakpoint/watchpoint/catchpoint id
+    /// space and lifecycle verb.
+    RemoveCatchpoint(u32),
+    /// Toggles a catchpoint's active state via `-break-enable`/
+    /// `-break-disable <id>` — dedicated variant for the same D2 reason as
+    /// `RemoveCatchpoint`.
+    ToggleCatchpoint {
+        id: u32,
+        enable: bool,
+    },
 
     // Program
     LoadExecutable(String),
@@ -210,5 +241,73 @@ mod tests {
             }
         );
         assert_ne!(enable, disable);
+    }
+
+    // ── Catchpoints ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_catchpoint_carries_kind_and_args() {
+        let fork = Command::AddCatchpoint {
+            kind: CatchpointKind::Fork,
+            args: vec![],
+        };
+        let signal = Command::AddCatchpoint {
+            kind: CatchpointKind::Signal,
+            args: vec!["SIGINT".into()],
+        };
+        let other_args = Command::AddCatchpoint {
+            kind: CatchpointKind::Signal,
+            args: vec!["SIGSEGV".into()],
+        };
+        assert_eq!(
+            fork,
+            Command::AddCatchpoint {
+                kind: CatchpointKind::Fork,
+                args: vec![],
+            }
+        );
+        assert_ne!(fork, signal);
+        assert_ne!(signal, other_args);
+    }
+
+    #[test]
+    fn remove_and_toggle_catchpoint_construct_and_compare() {
+        assert_eq!(Command::RemoveCatchpoint(3), Command::RemoveCatchpoint(3));
+        assert_ne!(Command::RemoveCatchpoint(3), Command::RemoveCatchpoint(4));
+
+        let enable = Command::ToggleCatchpoint {
+            id: 3,
+            enable: true,
+        };
+        let disable = Command::ToggleCatchpoint {
+            id: 3,
+            enable: false,
+        };
+        assert_eq!(
+            enable,
+            Command::ToggleCatchpoint {
+                id: 3,
+                enable: true,
+            }
+        );
+        assert_ne!(enable, disable);
+    }
+
+    // D2 regression guard: AddCatchpoint/RemoveCatchpoint/ToggleCatchpoint
+    // must be distinct variants from their breakpoint/watchpoint
+    // counterparts (never reused), matching design decision D2.
+    #[test]
+    fn catchpoint_commands_are_distinct_from_watchpoint_commands() {
+        assert_ne!(Command::RemoveCatchpoint(3), Command::RemoveWatchpoint(3));
+        assert_ne!(
+            Command::ToggleCatchpoint {
+                id: 3,
+                enable: true
+            },
+            Command::ToggleWatchpoint {
+                id: 3,
+                enable: true
+            }
+        );
     }
 }
