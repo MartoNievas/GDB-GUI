@@ -97,6 +97,10 @@ pub enum CatchpointKind {
     Signal,
     Load,
     Unload,
+    /// Phase 2b: `catch syscall [name|number|group:foo ...]`. Unit variant
+    /// (D1) — `args` already lives in `Catchpoint::args`, so no payload is
+    /// needed here.
+    Syscall,
 }
 
 impl std::fmt::Display for CatchpointKind {
@@ -108,9 +112,19 @@ impl std::fmt::Display for CatchpointKind {
             CatchpointKind::Signal => "signal",
             CatchpointKind::Load => "load",
             CatchpointKind::Unload => "unload",
+            CatchpointKind::Syscall => "syscall",
         };
         write!(f, "{s}")
     }
+}
+
+/// Phase 2b (D3): `catch syscall` stops on both entry and return by
+/// default. Distinguishes which phase fired without needing two separate
+/// `StopReason` variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyscallPhase {
+    Entry,
+    Return,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +175,16 @@ pub enum StopReason {
     /// "unknown" instead of panicking.
     SolibEvent {
         library: Option<String>,
+    },
+    /// `*stopped,reason="syscall-entry"|"syscall-return"` (D3): a Syscall
+    /// catchpoint fired. `number` and `name` are each independently
+    /// optional (GDB may report either, both, or neither); `phase`
+    /// distinguishes entry from return so both stops get a labeled banner
+    /// instead of one of them falling through to `Unknown`.
+    SyscallTriggered {
+        phase: SyscallPhase,
+        number: Option<String>,
+        name: Option<String>,
     },
     Unknown,
 }
@@ -1546,6 +1570,78 @@ mod tests {
         assert_eq!(CatchpointKind::Unload.to_string(), "unload");
     }
 
+    // Phase 2b: Syscall is the 7th CatchpointKind.
+    #[test]
+    fn syscall_kind_displays_as_syscall() {
+        assert_eq!(CatchpointKind::Syscall.to_string(), "syscall");
+    }
+
+    // Phase 2b (D3): StopReason::SyscallTriggered carries an optional
+    // number, optional name, and a phase distinguishing entry from return.
+    // Exercises all 4 field-presence permutations plus both phases.
+    #[test]
+    fn syscall_triggered_entry_with_both_fields_present() {
+        let reason = StopReason::SyscallTriggered {
+            phase: SyscallPhase::Entry,
+            number: Some("2".to_string()),
+            name: Some("open".to_string()),
+        };
+        match reason {
+            StopReason::SyscallTriggered {
+                phase,
+                number,
+                name,
+            } => {
+                assert_eq!(phase, SyscallPhase::Entry);
+                assert_eq!(number, Some("2".to_string()));
+                assert_eq!(name, Some("open".to_string()));
+            }
+            _ => panic!("expected SyscallTriggered"),
+        }
+    }
+
+    #[test]
+    fn syscall_triggered_return_with_number_only() {
+        let reason = StopReason::SyscallTriggered {
+            phase: SyscallPhase::Return,
+            number: Some("2".to_string()),
+            name: None,
+        };
+        match reason {
+            StopReason::SyscallTriggered {
+                phase,
+                number,
+                name,
+            } => {
+                assert_eq!(phase, SyscallPhase::Return);
+                assert_eq!(number, Some("2".to_string()));
+                assert_eq!(name, None);
+            }
+            _ => panic!("expected SyscallTriggered"),
+        }
+    }
+
+    #[test]
+    fn syscall_triggered_entry_with_neither_field_present() {
+        let reason = StopReason::SyscallTriggered {
+            phase: SyscallPhase::Entry,
+            number: None,
+            name: None,
+        };
+        match reason {
+            StopReason::SyscallTriggered {
+                phase,
+                number,
+                name,
+            } => {
+                assert_eq!(phase, SyscallPhase::Entry);
+                assert_eq!(number, None);
+                assert_eq!(name, None);
+            }
+            _ => panic!("expected SyscallTriggered"),
+        }
+    }
+
     #[test]
     fn catchpoint_constructs_with_kind_args_and_enabled() {
         let c = cp(1, CatchpointKind::Signal, &["SIGINT"]);
@@ -1566,6 +1662,24 @@ mod tests {
         let row = &state.persistent.catchpoints[0];
         assert_eq!(row.id, 5);
         assert_eq!(row.kind, CatchpointKind::Fork);
+        assert!(row.enabled);
+    }
+
+    // Phase 2b task 4.1 (verify-only): CatchpointAdded{Syscall,..} appends
+    // via the existing generic replace-by-id logic — no per-kind branching
+    // needed in `apply`.
+    #[test]
+    fn catchpoint_added_syscall_pushes_new_row() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::CatchpointAdded {
+            catchpoint: cp(6, CatchpointKind::Syscall, &["open"]),
+        });
+
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        let row = &state.persistent.catchpoints[0];
+        assert_eq!(row.id, 6);
+        assert_eq!(row.kind, CatchpointKind::Syscall);
+        assert_eq!(row.args, vec!["open".to_string()]);
         assert!(row.enabled);
     }
 

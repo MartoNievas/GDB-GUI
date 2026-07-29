@@ -711,6 +711,14 @@ mod tests {
             crate::state::StopReason::Vforked { newpid: None },
             crate::state::StopReason::Execd { path: None },
             crate::state::StopReason::SolibEvent { library: None },
+            // Phase 2b task 4.2 (verify-only): routing is by StateEvent
+            // variant, not stop_reason content, so Syscall needs no new
+            // production code here either.
+            crate::state::StopReason::SyscallTriggered {
+                phase: crate::state::SyscallPhase::Entry,
+                number: Some("2".into()),
+                name: Some("open".into()),
+            },
         ] {
             let (mut app, cmd_rx) = test_app();
             app.apply_state_event(crate::state::StateEvent::ProgramPaused {

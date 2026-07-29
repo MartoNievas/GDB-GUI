@@ -8,7 +8,7 @@
 
 use eframe::egui::{self, Color32, ComboBox, FontId, Stroke, TextEdit};
 
-use crate::state::{Catchpoint, CatchpointKind, StopReason};
+use crate::state::{Catchpoint, CatchpointKind, StopReason, SyscallPhase};
 use crate::ui::app::App;
 use crate::ui::command::Command;
 use crate::ui::theme::*;
@@ -125,6 +125,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         CatchpointKind::Signal,
                         CatchpointKind::Load,
                         CatchpointKind::Unload,
+                        CatchpointKind::Syscall,
                     ] {
                         ui.selectable_value(&mut app.cp_kind_buffer, kind, kind_label(kind));
                     }
@@ -186,6 +187,7 @@ fn kind_label(kind: CatchpointKind) -> &'static str {
         CatchpointKind::Signal => "Signal",
         CatchpointKind::Load => "Load",
         CatchpointKind::Unload => "Unload",
+        CatchpointKind::Syscall => "Syscall",
     }
 }
 
@@ -203,6 +205,12 @@ fn args_hint(kind: CatchpointKind) -> &'static str {
     match kind {
         CatchpointKind::Signal => "signal name(s), space-separated",
         CatchpointKind::Load | CatchpointKind::Unload => "library regex (optional)",
+        // D1: no confirmation gate on a bare (all-syscalls) entry — the
+        // warning text is the sole guard, matching Phase 2a's no-gate
+        // precedent for other broad catchpoints.
+        CatchpointKind::Syscall => {
+            "name, number, or group:foo (space-separated) — ⚠ Bare = all syscalls"
+        }
         _ => "",
     }
 }
@@ -225,6 +233,8 @@ pub(crate) fn args_from_buffer(kind: CatchpointKind, buffer: &str) -> Vec<String
                 vec![trimmed.to_string()]
             }
         }
+        // D5: variadic, whitespace-separated — same shape as Signal.
+        CatchpointKind::Syscall => buffer.split_whitespace().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -260,6 +270,9 @@ fn arity_ok(kind: CatchpointKind, args: &[String]) -> bool {
         CatchpointKind::Fork | CatchpointKind::Vfork | CatchpointKind::Exec => args.is_empty(),
         CatchpointKind::Signal => true,
         CatchpointKind::Load | CatchpointKind::Unload => args.len() <= 1,
+        // D5: any arity is valid (bare, one, or many) — no client-side
+        // validation of syscall name/number/group:foo legality.
+        CatchpointKind::Syscall => true,
     }
 }
 
@@ -318,6 +331,27 @@ pub(crate) fn stop_event_banner_text(stop_reason: Option<&StopReason>) -> Option
         Some(StopReason::SolibEvent { library }) => {
             Some(format!("Library {}", library.as_deref().unwrap_or(UNKNOWN)))
         }
+        // Phase 2b (D3/D4): number-first (deterministic identity), name as
+        // parenthesized context; "unknown" fallback when both are absent;
+        // a trailing " [return]" marker distinguishes the return-phase stop
+        // from entry (entry gets no suffix).
+        Some(StopReason::SyscallTriggered {
+            phase,
+            number,
+            name,
+        }) => {
+            let identity = match (number.as_deref(), name.as_deref()) {
+                (Some(n), Some(name)) => format!("{n} ({name})"),
+                (Some(n), None) => n.to_string(),
+                (None, Some(name)) => name.to_string(),
+                (None, None) => UNKNOWN.to_string(),
+            };
+            let suffix = match phase {
+                SyscallPhase::Entry => "",
+                SyscallPhase::Return => " [return]",
+            };
+            Some(format!("Syscall: {identity}{suffix}"))
+        }
         _ => None,
     }
 }
@@ -359,6 +393,56 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             enabled: true,
         }
+    }
+
+    // ── Phase 2b task 3.1: kind_label / takes_args for Syscall ───────────────
+
+    #[test]
+    fn kind_label_syscall_is_syscall() {
+        assert_eq!(kind_label(CatchpointKind::Syscall), "Syscall");
+    }
+
+    #[test]
+    fn takes_args_syscall_is_true() {
+        assert!(takes_args(CatchpointKind::Syscall));
+    }
+
+    // ── Phase 2b task 3.4: ComboBox kind list includes Syscall ───────────────
+    // No compiler guard on the render()-local array (unlike the exhaustive
+    // matches above), so this test pins the count and renders every label
+    // without panicking — the same array `render()` iterates.
+    #[test]
+    fn combobox_kind_list_has_seven_entries_including_syscall() {
+        let kinds = [
+            CatchpointKind::Fork,
+            CatchpointKind::Vfork,
+            CatchpointKind::Exec,
+            CatchpointKind::Signal,
+            CatchpointKind::Load,
+            CatchpointKind::Unload,
+            CatchpointKind::Syscall,
+        ];
+        assert_eq!(kinds.len(), 7);
+        assert!(kinds.contains(&CatchpointKind::Syscall));
+        for kind in kinds {
+            // Must not panic for any kind — pins the "silently-passing" site.
+            let _ = kind_label(kind);
+        }
+    }
+
+    // ── Phase 2b task 3.2: args_hint for Syscall ─────────────────────────────
+
+    #[test]
+    fn args_hint_syscall_documents_shape_and_warns_bare_catches_all() {
+        let hint = args_hint(CatchpointKind::Syscall);
+        assert!(
+            hint.contains("name, number, or group:foo"),
+            "hint should document accepted input shapes: {hint:?}"
+        );
+        assert!(
+            hint.contains("⚠ Bare = all syscalls"),
+            "hint should warn that a bare entry catches every syscall: {hint:?}"
+        );
     }
 
     // ── should_add_catchpoint: arity per kind ────────────────────────────────
@@ -436,6 +520,40 @@ mod tests {
         assert!(!should_add_catchpoint(CatchpointKind::Fork, &[], &existing));
     }
 
+    // Phase 2b task 3.5 (D5): Syscall accepts any arity, mirroring Signal —
+    // GDB is the sole authority on syscall name/number/group legality.
+    #[test]
+    fn should_add_catchpoint_syscall_accepts_any_arity_including_zero() {
+        assert!(should_add_catchpoint(CatchpointKind::Syscall, &[], &[]));
+        assert!(should_add_catchpoint(
+            CatchpointKind::Syscall,
+            &["open".to_string()],
+            &[]
+        ));
+        assert!(should_add_catchpoint(
+            CatchpointKind::Syscall,
+            &["open".to_string(), "read".to_string()],
+            &[]
+        ));
+    }
+
+    // D4 regression: a duplicate Syscall add (same parsed-back args) must be
+    // rejected client-side, same as every other kind.
+    #[test]
+    fn should_add_catchpoint_rejects_syscall_duplicate_against_parsed_back_args() {
+        let existing = vec![cp(CatchpointKind::Syscall, &["open"])];
+        assert!(!should_add_catchpoint(
+            CatchpointKind::Syscall,
+            &["open".to_string()],
+            &existing
+        ));
+        assert!(should_add_catchpoint(
+            CatchpointKind::Syscall,
+            &["close".to_string()],
+            &existing
+        ));
+    }
+
     // ── args_from_buffer ──────────────────────────────────────────────────
 
     #[test]
@@ -453,6 +571,16 @@ mod tests {
         );
         assert!(args_from_buffer(CatchpointKind::Signal, "").is_empty());
         assert!(args_from_buffer(CatchpointKind::Signal, "   ").is_empty());
+    }
+
+    #[test]
+    fn args_from_buffer_syscall_splits_on_whitespace() {
+        assert_eq!(
+            args_from_buffer(CatchpointKind::Syscall, "open read"),
+            vec!["open".to_string(), "read".to_string()]
+        );
+        assert!(args_from_buffer(CatchpointKind::Syscall, "").is_empty());
+        assert!(args_from_buffer(CatchpointKind::Syscall, "   ").is_empty());
     }
 
     #[test]
@@ -548,6 +676,106 @@ mod tests {
         assert_eq!(
             stop_event_banner_text(Some(&StopReason::Signal("SIGINT".into()))),
             None
+        );
+    }
+
+    // Phase 2b task 3.3 (D3/D4): Syscall banner — number first (deterministic
+    // identity), name as parenthesized context, "unknown" fallback when both
+    // are absent, and a trailing " [return]" marker distinguishing the
+    // return-phase stop from entry (entry gets no suffix).
+    #[test]
+    fn stop_event_banner_text_syscall_entry_full() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Entry,
+                number: Some("2".into()),
+                name: Some("open".into()),
+            })),
+            Some("Syscall: 2 (open)".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_entry_number_only() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Entry,
+                number: Some("2".into()),
+                name: None,
+            })),
+            Some("Syscall: 2".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_entry_name_only() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Entry,
+                number: None,
+                name: Some("open".into()),
+            })),
+            Some("Syscall: open".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_entry_neither_field_falls_back_to_unknown() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Entry,
+                number: None,
+                name: None,
+            })),
+            Some("Syscall: unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_return_full() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Return,
+                number: Some("2".into()),
+                name: Some("open".into()),
+            })),
+            Some("Syscall: 2 (open) [return]".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_return_number_only() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Return,
+                number: Some("2".into()),
+                name: None,
+            })),
+            Some("Syscall: 2 [return]".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_return_name_only() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Return,
+                number: None,
+                name: Some("open".into()),
+            })),
+            Some("Syscall: open [return]".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_syscall_return_neither_field_falls_back_to_unknown() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SyscallTriggered {
+                phase: SyscallPhase::Return,
+                number: None,
+                name: None,
+            })),
+            Some("Syscall: unknown [return]".to_string())
         );
     }
 

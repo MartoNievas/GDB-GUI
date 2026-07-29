@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::state::{
     Breakpoint, Catchpoint, CatchpointKind, DebuggerEvent, Frame, PauseState, StateEvent,
-    StopReason, ThreadInfo, UiEvent, Variable, Watchpoint, WatchpointKind,
+    StopReason, SyscallPhase, ThreadInfo, UiEvent, Variable, Watchpoint, WatchpointKind,
 };
 
 pub fn parse_line(line: &str) -> Option<DebuggerEvent> {
@@ -81,10 +81,11 @@ fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
             // A synthetic frame preserves the pause transition instead of
             // bailing on `?` — which would silently drop the stop and leave
             // a stale watchpoint row (auto-removal never runs). Scoped to
-            // this one reason plus the four catchpoint stop reasons (D5,
-            // extended for Phase 2a — a caught fork/vfork/exec/solib-event
-            // may equally arrive with no active frame yet); every other stop
-            // still requires a real frame.
+            // this one reason plus the five catchpoint stop reasons (D5,
+            // extended for Phase 2a — a caught fork/vfork/exec/solib-event —
+            // and Phase 2b's syscall-entry/syscall-return, which share one
+            // `SyscallTriggered` variant) may equally arrive with no active
+            // frame yet); every other stop still requires a real frame.
             let frame = match (&reason, parse_frame_field(fields)) {
                 (_, Some(f)) => f,
                 (
@@ -92,7 +93,8 @@ fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
                     | StopReason::Forked { .. }
                     | StopReason::Vforked { .. }
                     | StopReason::Execd { .. }
-                    | StopReason::SolibEvent { .. },
+                    | StopReason::SolibEvent { .. }
+                    | StopReason::SyscallTriggered { .. },
                     None,
                 ) => Frame {
                     addr: 0,
@@ -186,6 +188,28 @@ fn parse_stop_reason(fields: &str) -> StopReason {
             // correct for both without needing two separate extractions.
             let library = extract_str(fields, "library");
             StopReason::SolibEvent { library }
+        }
+        // D3: `catch syscall` stops on both entry and return by default —
+        // mapping only entry would drop every second stop into `Unknown`
+        // with no banner. `syscall-number`/`syscall-name` are each
+        // independently optional; neither present must not panic.
+        Some("syscall-entry") => {
+            let number = extract_str(fields, "syscall-number");
+            let name = extract_str(fields, "syscall-name");
+            StopReason::SyscallTriggered {
+                phase: SyscallPhase::Entry,
+                number,
+                name,
+            }
+        }
+        Some("syscall-return") => {
+            let number = extract_str(fields, "syscall-number");
+            let name = extract_str(fields, "syscall-name");
+            StopReason::SyscallTriggered {
+                phase: SyscallPhase::Return,
+                number,
+                name,
+            }
         }
         _ => StopReason::Unknown,
     }
@@ -564,14 +588,14 @@ pub(crate) fn parse_watchpoint_field(
 /// Parses a `catch-type=...` block (the content of a `bkpt={...}` catchpoint
 /// record, already unwrapped by the caller) into a `Catchpoint`. Shared by
 /// BOTH ingress paths — `parse_notify_async`'s untokened
-/// `breakpoint-created`/`-modified` (all 6 kinds) and `parse_result`'s
+/// `breakpoint-created`/`-modified` (all 7 kinds) and `parse_result`'s
 /// tokened `done` arm (Load/Unload only) — so a duplicate record on either
 /// path produces a byte-identical `Catchpoint`, making `apply`'s
 /// replace-by-id idempotent regardless of which path wins the race (design
 /// addendum: "one shared `parse_catchpoint_field` serves both").
 ///
 /// Requires `number=` and a recognized `catch-type=`; returns `None` for an
-/// unknown `catch-type` (Phase 2b kinds: throw/catch/rethrow/syscall) so no
+/// unknown `catch-type` (Phase 2c kinds: throw/catch/rethrow) so no
 /// unsupported record is silently turned into a wrong-shaped row.
 pub(crate) fn parse_catchpoint_field(block: &str) -> Option<Catchpoint> {
     let catch_type = extract_str(block, "catch-type")?;
@@ -599,6 +623,7 @@ fn parse_catchpoint_kind(catch_type: &str) -> Option<CatchpointKind> {
         "signal" => Some(CatchpointKind::Signal),
         "load" => Some(CatchpointKind::Load),
         "unload" => Some(CatchpointKind::Unload),
+        "syscall" => Some(CatchpointKind::Syscall),
         _ => None,
     }
 }
@@ -627,6 +652,30 @@ fn catchpoint_args_from_what(kind: CatchpointKind, what: Option<&str>) -> Vec<St
                     vec![]
                 } else {
                     vec![w.to_string()]
+                }
+            }
+        },
+        // D4: `what=` normally carries the raw name/number/`group:foo`
+        // token verbatim (spec: direct passthrough, no GDB prose to strip).
+        // Defensive fallback for the unverified `print_one_catch_syscall`
+        // prose shape (`syscall "x"` / `syscalls "x y"`) — stripped the same
+        // way Load/Unload's `" matching "` prose is, so a live mismatch
+        // degrades to the raw text rather than ever panicking.
+        CatchpointKind::Syscall => match what {
+            None => vec![],
+            Some(w) if w.is_empty() => vec![],
+            Some("syscall") | Some("syscalls") => vec![],
+            Some(w) => {
+                let prose = w
+                    .strip_prefix("syscalls ")
+                    .or_else(|| w.strip_prefix("syscall "));
+                match prose {
+                    Some(quoted) => quoted
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    None => vec![w.to_string()],
                 }
             }
         },
@@ -1494,6 +1543,72 @@ mod tests {
         assert!(parse_catchpoint_field(block).is_none());
     }
 
+    // Phase 2b task 1.3: catch-type="syscall" maps to CatchpointKind::Syscall.
+    #[test]
+    fn parse_catchpoint_kind_syscall_maps_to_syscall_variant() {
+        assert_eq!(
+            parse_catchpoint_kind("syscall"),
+            Some(CatchpointKind::Syscall)
+        );
+    }
+
+    // Phase 2b task 1.4 (D4): Syscall's `what=` field carries the raw
+    // name/number/group token verbatim — no GDB prose to strip, unlike
+    // Load/Unload's `"... matching X"` shape.
+    #[test]
+    fn catchpoint_args_from_what_syscall_absent_is_empty() {
+        assert!(catchpoint_args_from_what(CatchpointKind::Syscall, None).is_empty());
+    }
+
+    #[test]
+    fn catchpoint_args_from_what_syscall_bare_empty_string_is_empty() {
+        assert!(catchpoint_args_from_what(CatchpointKind::Syscall, Some("")).is_empty());
+    }
+
+    #[test]
+    fn catchpoint_args_from_what_syscall_name_extracts_single_arg() {
+        assert_eq!(
+            catchpoint_args_from_what(CatchpointKind::Syscall, Some("open")),
+            vec!["open".to_string()]
+        );
+    }
+
+    #[test]
+    fn catchpoint_args_from_what_syscall_number_extracts_single_arg() {
+        assert_eq!(
+            catchpoint_args_from_what(CatchpointKind::Syscall, Some("2")),
+            vec!["2".to_string()]
+        );
+    }
+
+    #[test]
+    fn catchpoint_args_from_what_syscall_group_selector_extracts_single_arg() {
+        assert_eq!(
+            catchpoint_args_from_what(CatchpointKind::Syscall, Some("group:process_vm")),
+            vec!["group:process_vm".to_string()]
+        );
+    }
+
+    // Defensive fallback (design D4 open question): if GDB's `what=` ever
+    // carries the `print_one_catch_syscall`-style prose (`syscall "open"` /
+    // `syscalls "open close"`) instead of a bare token, extraction must
+    // still recover the clean name(s) rather than storing the quoted prose
+    // verbatim — otherwise `should_add_catchpoint`'s duplicate check would
+    // never match a user-entered `["open"]` (D4 regression, mirrors Load's
+    // `" matching "` stripping rationale).
+    #[test]
+    fn catchpoint_args_from_what_syscall_strips_verified_gdb_prose_if_present() {
+        assert_eq!(
+            catchpoint_args_from_what(CatchpointKind::Syscall, Some(r#"syscall "open""#)),
+            vec!["open".to_string()]
+        );
+        assert_eq!(
+            catchpoint_args_from_what(CatchpointKind::Syscall, Some(r#"syscalls "open close""#)),
+            vec!["open".to_string(), "close".to_string()]
+        );
+        assert!(catchpoint_args_from_what(CatchpointKind::Syscall, Some("syscall")).is_empty());
+    }
+
     #[test]
     fn parse_catchpoint_field_disabled_reads_enabled_false() {
         let block =
@@ -1725,8 +1840,210 @@ mod tests {
         }
     }
 
+    // ── Stop reasons: syscall-entry / syscall-return (D3, Phase 2b task 1.5) ──
+    // Exhaustive matrix: both phases × {both fields, number-only, name-only,
+    // neither field}.
+
+    #[test]
+    fn stop_reason_syscall_entry_full() {
+        let line = r#"*stopped,reason="syscall-entry",syscall-number="2",syscall-name="open",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Entry);
+                        assert_eq!(number, Some("2".to_string()));
+                        assert_eq!(name, Some("open".to_string()));
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_entry_number_only() {
+        let line = r#"*stopped,reason="syscall-entry",syscall-number="2",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Entry);
+                        assert_eq!(number, Some("2".to_string()));
+                        assert_eq!(name, None);
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_entry_name_only() {
+        let line = r#"*stopped,reason="syscall-entry",syscall-name="open",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Entry);
+                        assert_eq!(number, None);
+                        assert_eq!(name, Some("open".to_string()));
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_entry_neither_field() {
+        let line = r#"*stopped,reason="syscall-entry",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Entry);
+                        assert_eq!(number, None);
+                        assert_eq!(name, None);
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_return_full() {
+        let line = r#"*stopped,reason="syscall-return",syscall-number="2",syscall-name="open",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Return);
+                        assert_eq!(number, Some("2".to_string()));
+                        assert_eq!(name, Some("open".to_string()));
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_return_number_only() {
+        let line = r#"*stopped,reason="syscall-return",syscall-number="2",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered { phase, number, .. } => {
+                        assert_eq!(phase, SyscallPhase::Return);
+                        assert_eq!(number, Some("2".to_string()));
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_return_name_only() {
+        let line = r#"*stopped,reason="syscall-return",syscall-name="open",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered { phase, name, .. } => {
+                        assert_eq!(phase, SyscallPhase::Return);
+                        assert_eq!(name, Some("open".to_string()));
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_return_neither_field() {
+        let line = r#"*stopped,reason="syscall-return",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SyscallTriggered {
+                        phase,
+                        number,
+                        name,
+                    } => {
+                        assert_eq!(phase, SyscallPhase::Return);
+                        assert_eq!(number, None);
+                        assert_eq!(name, None);
+                    }
+                    other => panic!("expected SyscallTriggered, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    // ── D5 frame-fallback: Syscall extends the synthetic-frame set (task 1.6) ─
+
+    #[test]
+    fn stop_reason_syscall_entry_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="syscall-entry",syscall-number="2",syscall-name="open",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert!(matches!(
+                    pause.stop_reason,
+                    StopReason::SyscallTriggered { .. }
+                ));
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_syscall_return_without_frame_falls_back_to_synthetic_frame() {
+        let line = r#"*stopped,reason="syscall-return",syscall-number="2",thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert!(matches!(
+                    pause.stop_reason,
+                    StopReason::SyscallTriggered { .. }
+                ));
+                assert_eq!(pause.frame.function, "??");
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
     // Triangulation: an ordinary breakpoint-hit without a frame must still
-    // be dropped — the D5 fallback stays scoped to the five listed reasons.
+    // be dropped — the D5 fallback stays scoped to the six listed reasons.
     #[test]
     fn breakpoint_hit_without_frame_still_dropped_after_catchpoint_extension() {
         let line = r#"*stopped,reason="breakpoint-hit",bkptno="1",thread-id="1""#;
@@ -1838,5 +2155,56 @@ mod tests {
         }
 
         assert_eq!(state.persistent.catchpoints.len(), 1);
+    }
+
+    // Phase 2b task 4.3: Syscall full flow — create -> row, *stopped -> a
+    // correctly-shaped `SyscallTriggered`. Mirrors the Fork/Signal
+    // integration tests above. The remaining hop (`StopReason` ->
+    // `stop_event_banner_text`'s rendered string) is covered by
+    // `ui::panels::catchpoints`'s own test module (Phase 2b task 3.3) using
+    // the identical field shape asserted below — `stop_event_banner_text`
+    // is `pub(crate)` to `ui` only, so it cannot be called cross-module from
+    // here without loosening `mod panels`/`mod parser` visibility, which is
+    // out of this change's scope.
+    #[test]
+    fn syscall_catchpoint_full_flow_create_then_entry_stop() {
+        use crate::state::DebuggerState;
+        let mut state = DebuggerState::new();
+
+        match parse_line(
+            r#"=breakpoint-created,bkpt={number="2",type="catchpoint",disp="keep",enabled="y",what="open",catch-type="syscall",thread-groups=["i1"],times="0"}"#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the create notify, got {other:?}"),
+        }
+        assert_eq!(state.persistent.catchpoints.len(), 1);
+        assert_eq!(state.persistent.catchpoints[0].kind, CatchpointKind::Syscall);
+        assert_eq!(
+            state.persistent.catchpoints[0].args,
+            vec!["open".to_string()]
+        );
+
+        match parse_line(
+            r#"*stopped,reason="syscall-entry",syscall-number="2",syscall-name="open",frame={func="open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#,
+        ) {
+            Some(DebuggerEvent::State(s)) => state.apply(s),
+            other => panic!("expected a state event for the syscall stop, got {other:?}"),
+        }
+        assert!(state.is_paused());
+        match &state.pause.as_ref().unwrap().stop_reason {
+            StopReason::SyscallTriggered {
+                phase,
+                number,
+                name,
+            } => {
+                assert_eq!(*phase, SyscallPhase::Entry);
+                assert_eq!(number, &Some("2".to_string()));
+                assert_eq!(name, &Some("open".to_string()));
+                // `stop_event_banner_text_syscall_entry_full`
+                // (ui::panels::catchpoints) asserts this exact shape
+                // renders `Some("Syscall: 2 (open)")`.
+            }
+            other => panic!("expected SyscallTriggered, got {other:?}"),
+        }
     }
 }

@@ -184,12 +184,13 @@ pub fn build_break_watch(kind: WatchpointKind, expr: &str) -> String {
 ///
 /// Fork/Vfork/Exec: `-interpreter-exec console "catch <kind>"` — `args` is
 /// discarded entirely (never appended), so a stray argument on a no-arg kind
-/// cannot become part of the composed command. Signal: same console
-/// transport, joining 0..N args with spaces (`"catch signal"` alone when
-/// empty). Load/Unload: the native `-catch-load`/`-catch-unload` verb with
-/// its one mandatory argument through `quote_mi`; with zero args (A5) they
-/// degrade to the same console-passthrough form as Fork/Vfork/Exec, since
-/// the native verb errors on a missing library name.
+/// cannot become part of the composed command. Signal and Syscall (Phase
+/// 2b, D2): same console transport, joining 0..N args with spaces
+/// (`"catch signal"`/`"catch syscall"` alone when empty). Load/Unload: the
+/// native `-catch-load`/`-catch-unload` verb with its one mandatory argument
+/// through `quote_mi`; with zero args (A5) they degrade to the same
+/// console-passthrough form as Fork/Vfork/Exec, since the native verb errors
+/// on a missing library name.
 ///
 /// SECURITY: for the console-passthrough kinds, the WHOLE composed CLI text
 /// (`"catch fork"`, `"catch signal SIGINT SIGTERM"`, ...) is quoted as a
@@ -217,6 +218,17 @@ pub fn build_catch_command(kind: CatchpointKind, args: &[String]) -> String {
             Some(arg) => format!("-catch-unload {}", quote_mi(arg)),
             None => console_catch("catch unload"),
         },
+        // D2: same console-passthrough shape as Signal — GDB 17.2 has no
+        // native `-catch-syscall` MI verb. Args (name/number/`group:foo`)
+        // are joined with single spaces and never validated client-side.
+        CatchpointKind::Syscall => {
+            let joined = args.join(" ");
+            if joined.is_empty() {
+                console_catch("catch syscall")
+            } else {
+                console_catch(&format!("catch syscall {joined}"))
+            }
+        }
     }
 }
 
@@ -649,6 +661,109 @@ mod tests {
     fn build_catch_command_load_escapes_embedded_quote_and_backslash() {
         let mi = build_catch_command(CatchpointKind::Load, &[r#"lib"foo\bar"#.to_string()]);
         assert_eq!(mi, "-catch-load \"lib\\\"foo\\\\bar\"");
+    }
+
+    // Phase 2b task 2.1: Syscall uses the same console-passthrough shape as
+    // Signal (D2) — no native `-catch-syscall` MI verb exists in GDB 17.2.
+    #[test]
+    fn build_catch_command_syscall_no_args_is_bare_catch_syscall() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Syscall, &[]),
+            "-interpreter-exec console \"catch syscall\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_single_named_arg() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Syscall, &["open".to_string()]),
+            "-interpreter-exec console \"catch syscall open\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_joins_multiple_numeric_args_with_spaces() {
+        let args = vec!["2".to_string(), "4".to_string()];
+        assert_eq!(
+            build_catch_command(CatchpointKind::Syscall, &args),
+            "-interpreter-exec console \"catch syscall 2 4\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_group_selector_passes_through_verbatim() {
+        assert_eq!(
+            build_catch_command(CatchpointKind::Syscall, &["group:process_vm".to_string()]),
+            "-interpreter-exec console \"catch syscall group:process_vm\""
+        );
+    }
+
+    // Phase 2b task 2.2 (threat matrix: CLI-in-MI nesting via newline).
+    #[test]
+    fn build_catch_command_syscall_strips_embedded_newline_no_command_injection() {
+        let args = vec!["2\n-exec-continue".to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch syscall 2-exec-continue\""
+        );
+    }
+
+    // Phase 2b task 5.1: combined injection matrix for Syscall — every
+    // adversarial character class plus the `"; rm -rf"` shell-flavored
+    // payload (harmless here: `;` is passed through verbatim as part of the
+    // `catch syscall` CLI grammar, not a shell separator).
+    #[test]
+    fn build_catch_command_syscall_passes_semicolon_through_verbatim() {
+        let args = vec!["2; rm -rf".to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch syscall 2; rm -rf\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_escapes_embedded_quote() {
+        let args = vec![r#"open"evil"#.to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch syscall open\\\"evil\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_escapes_embedded_backslash() {
+        let args = vec![r"open\evil".to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch syscall open\\\\evil\""
+        );
+    }
+
+    #[test]
+    fn build_catch_command_syscall_strips_embedded_carriage_return() {
+        let args = vec!["2\r-exec-run".to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert!(!mi.contains('\r'));
+    }
+
+    // Combined payload: semicolon + newline + smuggled MI command all in one
+    // arg must still collapse to a single inert quoted line.
+    #[test]
+    fn build_catch_command_syscall_combined_payload_stays_a_single_line() {
+        let args = vec!["2; rm -rf\nstuff".to_string()];
+        let mi = build_catch_command(CatchpointKind::Syscall, &args);
+        assert_eq!(mi.lines().count(), 1);
+        assert!(!mi.contains('\n'));
+        assert_eq!(
+            mi,
+            "-interpreter-exec console \"catch syscall 2; rm -rfstuff\""
+        );
     }
 
     #[test]

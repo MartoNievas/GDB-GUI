@@ -1113,6 +1113,29 @@ mod tests {
         );
     }
 
+    // Phase 2b task 4.3 (verify-only): the key is built from `Display for
+    // CatchpointKind` (`"syscall"`), so Syscall's rejected creation routes
+    // to the same Pending Errors path with no new code.
+    #[test]
+    fn correlate_pending_catch_emits_error_for_syscall_key() {
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(11, "syscall:bogus_name".into());
+
+        let event = correlate_pending_catch(
+            "11^error,msg=\"Unknown syscall name bogus_name.\"",
+            &mut pending_catch,
+        );
+
+        match event {
+            Some(StateEvent::CatchpointError { key, message }) => {
+                assert_eq!(key, "syscall:bogus_name");
+                assert_eq!(message, "Unknown syscall name bogus_name.");
+            }
+            other => panic!("expected CatchpointError, got {other:?}"),
+        }
+        assert!(!pending_catch.contains_key(&11));
+    }
+
     #[test]
     fn correlate_pending_catch_done_is_cleanup_only_no_event() {
         let mut pending_catch: HashMap<u32, String> = HashMap::new();

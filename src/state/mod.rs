@@ -18,6 +18,7 @@ pub use debugger_state::{
     Register,
     StateEvent,
     StopReason,
+    SyscallPhase,
     ThreadInfo,
 
     UiEvent,
