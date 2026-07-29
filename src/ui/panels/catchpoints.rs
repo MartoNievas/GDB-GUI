@@ -32,6 +32,28 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             }
         }
 
+        // Stop-event labeling for the other 5 kinds (Fork/Vfork/Exec always;
+        // Load/Unload via the shared SolibEvent reason) — every one of these
+        // stop reasons carries no `bkptno` to disambiguate by id (unlike a
+        // plain breakpoint hit), so a single banner is shown regardless of
+        // which specific armed catchpoint caused it, mirroring the
+        // watchpoint trigger banner's presentation.
+        if let Some(banner) = stop_event_banner_text(stop_reason) {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(m(&format!("⚡ {banner}"), 11.0, TXT_YELLOW));
+            });
+            ui.add_space(2.0);
+        }
+
+        // D6: the one case that DOES carry an id is `BreakpointHit(id)` —
+        // `catchpoint_by_id()` confirms that id belongs to an armed
+        // catchpoint (not an ordinary breakpoint sharing the same id space)
+        // before the row is highlighted.
+        let highlighted_id = highlighted_catchpoint_id(stop_reason)
+            .and_then(|id| app.state.catchpoint_by_id(id))
+            .map(|c| c.id);
+
         let mut pending_toggles: Vec<(u32, bool)> = Vec::new();
         let mut pending_removes: Vec<u32> = Vec::new();
 
@@ -45,7 +67,9 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 ui.end_row();
 
                 for cp in &app.state.persistent.catchpoints {
-                    ui.label(m(kind_label(cp.kind), 12.0, TXT_YELLOW));
+                    let is_hit = Some(cp.id) == highlighted_id;
+                    let kind_color = if is_hit { ACCENT } else { TXT_YELLOW };
+                    ui.label(m(kind_label(cp.kind), 12.0, kind_color));
                     ui.label(m(&cp.args.join(" "), 12.0, TXT_CYAN));
 
                     let mut enabled = cp.enabled;
@@ -261,6 +285,57 @@ fn signal_stop_name(stop_reason: Option<&StopReason>) -> Option<&str> {
     }
 }
 
+/// Stop-event labeling (verify blocker fix) for the 5 catchpoint stop
+/// reasons that are NOT `StopReason::Signal` (which already has its own
+/// `signal_catch_hint` banner, D6): Fork/Vfork show the child's new PID,
+/// Exec shows the new executable's path, and the shared `SolibEvent`
+/// (Load/Unload — GDB reports one literal reason for both, D4) shows the
+/// affected library. `None` for every other stop reason, mirroring
+/// `trigger_banner_text`'s (watchpoints) shape exactly.
+///
+/// Every field here is `Option` because GDB may omit it (verified live for
+/// fork's `newpid` and solib-event's `library` — apply-blocker #68); a
+/// missing field renders as "unknown" instead of silently showing nothing,
+/// so the user always gets SOME labeling even on an under-specified reply.
+pub(crate) fn stop_event_banner_text(stop_reason: Option<&StopReason>) -> Option<String> {
+    const UNKNOWN: &str = "unknown";
+    match stop_reason {
+        Some(StopReason::Forked { newpid }) => Some(format!(
+            "Fork: new PID {}",
+            newpid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| UNKNOWN.into())
+        )),
+        Some(StopReason::Vforked { newpid }) => Some(format!(
+            "Vfork: new PID {}",
+            newpid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| UNKNOWN.into())
+        )),
+        Some(StopReason::Execd { path }) => {
+            Some(format!("Exec: {}", path.as_deref().unwrap_or(UNKNOWN)))
+        }
+        Some(StopReason::SolibEvent { library }) => {
+            Some(format!("Library {}", library.as_deref().unwrap_or(UNKNOWN)))
+        }
+        _ => None,
+    }
+}
+
+/// D6: which catchpoint id (if any) the current stop should highlight in
+/// the table. Only `StopReason::BreakpointHit(id)` carries an id at all —
+/// every other catchpoint stop reason (Fork/Vfork/Exec/Signal/SolibEvent)
+/// has no `bkptno` to correlate from, so nothing is highlighted for those
+/// (their banner above the table is the sole feedback). The caller still
+/// confirms the id via `DebuggerState::catchpoint_by_id()` before treating
+/// it as a catchpoint hit — this function only extracts the candidate id.
+pub(crate) fn highlighted_catchpoint_id(stop_reason: Option<&StopReason>) -> Option<u32> {
+    match stop_reason {
+        Some(StopReason::BreakpointHit(id)) => Some(*id),
+        _ => None,
+    }
+}
+
 /// Formats `catchpoint_errors` into a deterministically ordered list for the
 /// panel's "Pending Errors" section — mirrors
 /// `watchpoints::pending_watchpoint_errors` exactly.
@@ -456,5 +531,96 @@ mod tests {
             "signal:SIGINT"
         );
         assert_eq!(catchpoint_error_key(CatchpointKind::Fork, &[]), "fork:");
+    }
+
+    // ── stop_event_banner_text (verify blocker fix) ──────────────────────────
+
+    #[test]
+    fn stop_event_banner_text_none_for_no_pause_or_unrelated_reasons() {
+        assert_eq!(stop_event_banner_text(None), None);
+        assert_eq!(stop_event_banner_text(Some(&StopReason::Unknown)), None);
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::BreakpointHit(1))),
+            None
+        );
+        // Signal has its own dedicated D6 banner (signal_catch_hint) —
+        // must not also produce a generic stop-event banner.
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Signal("SIGINT".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_fork_with_and_without_newpid() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Forked { newpid: Some(4242) })),
+            Some("Fork: new PID 4242".to_string())
+        );
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Forked { newpid: None })),
+            Some("Fork: new PID unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_vfork_with_and_without_newpid() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Vforked { newpid: Some(999) })),
+            Some("Vfork: new PID 999".to_string())
+        );
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Vforked { newpid: None })),
+            Some("Vfork: new PID unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_exec_with_and_without_path() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Execd {
+                path: Some("/usr/bin/foo".into())
+            })),
+            Some("Exec: /usr/bin/foo".to_string())
+        );
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::Execd { path: None })),
+            Some("Exec: unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn stop_event_banner_text_solib_event_with_and_without_library() {
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SolibEvent {
+                library: Some("/lib/libfoo.so".into())
+            })),
+            Some("Library /lib/libfoo.so".to_string())
+        );
+        assert_eq!(
+            stop_event_banner_text(Some(&StopReason::SolibEvent { library: None })),
+            Some("Library unknown".to_string())
+        );
+    }
+
+    // ── highlighted_catchpoint_id (D6, verify blocker fix) ───────────────────
+
+    #[test]
+    fn highlighted_catchpoint_id_extracts_id_from_breakpoint_hit_only() {
+        assert_eq!(
+            highlighted_catchpoint_id(Some(&StopReason::BreakpointHit(7))),
+            Some(7)
+        );
+        assert_eq!(highlighted_catchpoint_id(None), None);
+        assert_eq!(
+            highlighted_catchpoint_id(Some(&StopReason::Forked { newpid: Some(1) })),
+            None,
+            "Fork carries no bkptno to correlate a row by id"
+        );
+        assert_eq!(
+            highlighted_catchpoint_id(Some(&StopReason::SolibEvent { library: None })),
+            None,
+            "SolibEvent carries no bkptno to correlate a row by id"
+        );
     }
 }

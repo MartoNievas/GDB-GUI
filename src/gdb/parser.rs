@@ -92,7 +92,7 @@ fn parse_exec_async(line: &str) -> Option<DebuggerEvent> {
                     | StopReason::Forked { .. }
                     | StopReason::Vforked { .. }
                     | StopReason::Execd { .. }
-                    | StopReason::SolibEvent,
+                    | StopReason::SolibEvent { .. },
                     None,
                 ) => Frame {
                     addr: 0,
@@ -177,7 +177,16 @@ fn parse_stop_reason(fields: &str) -> StopReason {
             let path = extract_str(fields, "new-exec-path");
             StopReason::Execd { path }
         }
-        Some("solib-event") => StopReason::SolibEvent,
+        Some("solib-event") => {
+            // Verified live shape (apply-blocker #68):
+            // `added=[library="..."]`. `extract_str` scans the whole
+            // fields string for the first `library="..."` occurrence
+            // regardless of which list it is nested in (`added=[...]` for
+            // load, presumably `removed=[...]` for unload), so this stays
+            // correct for both without needing two separate extractions.
+            let library = extract_str(fields, "library");
+            StopReason::SolibEvent { library }
+        }
         _ => StopReason::Unknown,
     }
 }
@@ -1668,7 +1677,37 @@ mod tests {
         let line = r#"*stopped,reason="solib-event",frame={func="_dl_open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
         match parse_line(line) {
             Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
-                assert!(matches!(pause.stop_reason, StopReason::SolibEvent));
+                assert!(matches!(pause.stop_reason, StopReason::SolibEvent { .. }));
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_solib_event_extracts_library_name() {
+        let line = r#"*stopped,reason="solib-event",added=[library="/lib/libfoo.so"],frame={func="_dl_open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SolibEvent { library } => {
+                        assert_eq!(library, Some("/lib/libfoo.so".to_string()))
+                    }
+                    other => panic!("expected SolibEvent, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProgramPaused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_solib_event_without_library_field_is_none() {
+        let line = r#"*stopped,reason="solib-event",frame={func="_dl_open",args=[],file="a.c",fullname="/a.c",line="10"},thread-id="1""#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                match pause.stop_reason {
+                    StopReason::SolibEvent { library } => assert_eq!(library, None),
+                    other => panic!("expected SolibEvent, got {other:?}"),
+                }
             }
             other => panic!("expected ProgramPaused, got {other:?}"),
         }
@@ -1679,7 +1718,7 @@ mod tests {
         let line = r#"*stopped,reason="solib-event",thread-id="1""#;
         match parse_line(line) {
             Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
-                assert!(matches!(pause.stop_reason, StopReason::SolibEvent));
+                assert!(matches!(pause.stop_reason, StopReason::SolibEvent { .. }));
                 assert_eq!(pause.frame.function, "??");
             }
             other => panic!("expected ProgramPaused, got {other:?}"),

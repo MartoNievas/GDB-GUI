@@ -710,7 +710,7 @@ mod tests {
             crate::state::StopReason::Forked { newpid: Some(123) },
             crate::state::StopReason::Vforked { newpid: None },
             crate::state::StopReason::Execd { path: None },
-            crate::state::StopReason::SolibEvent,
+            crate::state::StopReason::SolibEvent { library: None },
         ] {
             let (mut app, cmd_rx) = test_app();
             app.apply_state_event(crate::state::StateEvent::ProgramPaused {

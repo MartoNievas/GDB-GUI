@@ -155,7 +155,13 @@ pub enum StopReason {
         path: Option<String>,
     },
     /// `*stopped,reason="solib-event"`: a Load/Unload catchpoint fired.
-    SolibEvent,
+    /// `library` is the affected library's name/path if GDB reported one
+    /// (verified live shape: `added=[library="..."]`, apply-blocker #68) —
+    /// `None` if the field is absent, so the stop-event banner degrades to
+    /// "unknown" instead of panicking.
+    SolibEvent {
+        library: Option<String>,
+    },
     Unknown,
 }
 
