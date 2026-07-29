@@ -33,6 +33,15 @@ structured, panel-based UI instead of the raw command line.
 - **Disassembly** — instructions around the program counter, with the current
   instruction marked.
 - **Integrated GDB console** — type raw GDB/MI commands and see GDB's output.
+- **Watchpoints** — click in the Watchpoints panel to add read/write/access watchpoints
+  for any expression; watchpoints trigger and display old→new values in a banner when
+  the memory location changes.
+- **Catchpoints** — set catch points for program events (fork, vfork, exec, signal, 
+  library load/unload, syscall entry/return, and C++ exceptions). Each catchpoint 
+  type displays contextual information at stop time: new process ID for fork/vfork, 
+  executable path for exec, library name for load/unload, syscall number/name for 
+  syscall, and "Exception thrown/rethrown/caught" for C++ exception events. Syscall 
+  and C++ exception catchpoints support optional regex filtering.
 - **Resizable panels** — drag the dividers between the side sections, the console
   and the source view.
 
