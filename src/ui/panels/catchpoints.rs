@@ -46,6 +46,19 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(2.0);
         }
 
+        // Phase 2c (D3): Throw/Rethrow/Catch stop labeling — these arrive
+        // as a plain `BreakpointHit(id)`, so the banner is derived by
+        // looking up the id in the catchpoint table (same shape as
+        // `signal_catch_hint`, not `stop_event_banner_text`).
+        if let Some(banner) = exception_banner_text(stop_reason, &app.state.persistent.catchpoints)
+        {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(m(&format!("⚡ {banner}"), 11.0, TXT_YELLOW));
+            });
+            ui.add_space(2.0);
+        }
+
         // D6: the one case that DOES carry an id is `BreakpointHit(id)` —
         // `catchpoint_by_id()` confirms that id belongs to an armed
         // catchpoint (not an ordinary breakpoint sharing the same id space)
@@ -126,6 +139,9 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         CatchpointKind::Load,
                         CatchpointKind::Unload,
                         CatchpointKind::Syscall,
+                        CatchpointKind::Throw,
+                        CatchpointKind::Rethrow,
+                        CatchpointKind::Catch,
                     ] {
                         ui.selectable_value(&mut app.cp_kind_buffer, kind, kind_label(kind));
                     }
@@ -188,12 +204,15 @@ fn kind_label(kind: CatchpointKind) -> &'static str {
         CatchpointKind::Load => "Load",
         CatchpointKind::Unload => "Unload",
         CatchpointKind::Syscall => "Syscall",
+        CatchpointKind::Throw => "Throw",
+        CatchpointKind::Rethrow => "Rethrow",
+        CatchpointKind::Catch => "Catch",
     }
 }
 
 /// Whether `kind` accepts a user-entered args string (spec: "Argument Arity
-/// Validation Only" — Fork/Vfork/Exec: none; Signal: variadic; Load/Unload:
-/// zero-or-one).
+/// Validation Only" — Fork/Vfork/Exec: none; Signal: variadic; Load/Unload/
+/// Throw/Rethrow/Catch: zero-or-one).
 fn takes_args(kind: CatchpointKind) -> bool {
     !matches!(
         kind,
@@ -210,6 +229,13 @@ fn args_hint(kind: CatchpointKind) -> &'static str {
         // precedent for other broad catchpoints.
         CatchpointKind::Syscall => {
             "name, number, or group:foo (space-separated) — ⚠ Bare = all syscalls"
+        }
+        // Phase 2c: optional regexp filter — a bare entry catches every
+        // exception of this kind (A4: needs libstdc++ SDT probes; silently
+        // ignored on a stripped runtime, documented here rather than gated
+        // client-side, per design).
+        CatchpointKind::Throw | CatchpointKind::Rethrow | CatchpointKind::Catch => {
+            "optional regexp, e.g. std::runtime_error — bare = all exceptions"
         }
         _ => "",
     }
@@ -235,6 +261,17 @@ pub(crate) fn args_from_buffer(kind: CatchpointKind, buffer: &str) -> Vec<String
         }
         // D5: variadic, whitespace-separated — same shape as Signal.
         CatchpointKind::Syscall => buffer.split_whitespace().map(|s| s.to_string()).collect(),
+        // Phase 2c: zero-or-one regexp, whole trimmed buffer as one token —
+        // same shape as Load/Unload (a regexp may contain spaces, e.g.
+        // template arguments).
+        CatchpointKind::Throw | CatchpointKind::Rethrow | CatchpointKind::Catch => {
+            let trimmed = buffer.trim();
+            if trimmed.is_empty() {
+                vec![]
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
     }
 }
 
@@ -273,6 +310,10 @@ fn arity_ok(kind: CatchpointKind, args: &[String]) -> bool {
         // D5: any arity is valid (bare, one, or many) — no client-side
         // validation of syscall name/number/group:foo legality.
         CatchpointKind::Syscall => true,
+        // Phase 2c: zero-or-one regexp, same arity rule as Load/Unload.
+        CatchpointKind::Throw | CatchpointKind::Rethrow | CatchpointKind::Catch => {
+            args.len() <= 1
+        }
     }
 }
 
@@ -294,6 +335,33 @@ pub(crate) fn signal_catch_hint(name: &str, catchpoints: &[Catchpoint]) -> Optio
 fn signal_stop_name(stop_reason: Option<&StopReason>) -> Option<&str> {
     match stop_reason {
         Some(StopReason::Signal(name)) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Phase 2c (D3): the visible banner for a stop correlated to a Throw/
+/// Rethrow/Catch catchpoint via `StopReason::BreakpointHit { bkptno }` (A2 —
+/// verified live, Phase 0 spike: no dedicated `StopReason` variant exists).
+/// A separate function rather than widening `stop_event_banner_text`
+/// (which is a pure function of the stop reason alone, with a pinned test
+/// asserting `BreakpointHit(1) -> None`): exception labeling requires the
+/// catchpoint table to tell a catchpoint hit from a plain breakpoint hit —
+/// exactly `signal_catch_hint`'s shape, not `stop_event_banner_text`'s.
+/// `None` for an unmatched id, a plain breakpoint, or any other catchpoint
+/// kind hit by id — never panics.
+pub(crate) fn exception_banner_text(
+    stop_reason: Option<&StopReason>,
+    catchpoints: &[Catchpoint],
+) -> Option<String> {
+    let id = match stop_reason {
+        Some(StopReason::BreakpointHit(id)) => *id,
+        _ => return None,
+    };
+    let cp = catchpoints.iter().find(|c| c.id == id)?;
+    match cp.kind {
+        CatchpointKind::Throw => Some("Exception thrown".to_string()),
+        CatchpointKind::Rethrow => Some("Exception rethrown".to_string()),
+        CatchpointKind::Catch => Some("Exception caught".to_string()),
         _ => None,
     }
 }
@@ -828,6 +896,199 @@ mod tests {
         assert_eq!(
             stop_event_banner_text(Some(&StopReason::SolibEvent { library: None })),
             Some("Library unknown".to_string())
+        );
+    }
+
+    // ── Phase 2c: Throw/Rethrow/Catch (C++ exceptions) ───────────────────────
+
+    #[test]
+    fn kind_label_throw_rethrow_catch() {
+        assert_eq!(kind_label(CatchpointKind::Throw), "Throw");
+        assert_eq!(kind_label(CatchpointKind::Rethrow), "Rethrow");
+        assert_eq!(kind_label(CatchpointKind::Catch), "Catch");
+    }
+
+    #[test]
+    fn takes_args_throw_rethrow_catch_is_true() {
+        assert!(takes_args(CatchpointKind::Throw));
+        assert!(takes_args(CatchpointKind::Rethrow));
+        assert!(takes_args(CatchpointKind::Catch));
+    }
+
+    #[test]
+    fn args_hint_throw_rethrow_catch_documents_optional_regexp() {
+        for kind in [
+            CatchpointKind::Throw,
+            CatchpointKind::Rethrow,
+            CatchpointKind::Catch,
+        ] {
+            let hint = args_hint(kind);
+            assert!(
+                hint.contains("regexp"),
+                "hint should mention regexp for {kind:?}: {hint:?}"
+            );
+            assert!(
+                hint.to_lowercase().contains("bare")
+                    || hint.to_lowercase().contains("all exceptions"),
+                "hint should document bare = all exceptions for {kind:?}: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn args_from_buffer_throw_rethrow_catch_keeps_whole_trimmed_buffer_as_one_token() {
+        // Regexps contain spaces (e.g. template args) — unlike Signal's
+        // whitespace split, the whole trimmed buffer is one token.
+        assert_eq!(
+            args_from_buffer(CatchpointKind::Throw, "  std::runtime_error  "),
+            vec!["std::runtime_error".to_string()]
+        );
+        assert!(args_from_buffer(CatchpointKind::Throw, "   ").is_empty());
+        assert_eq!(
+            args_from_buffer(CatchpointKind::Rethrow, "My Exception"),
+            vec!["My Exception".to_string()]
+        );
+        assert!(args_from_buffer(CatchpointKind::Catch, "").is_empty());
+    }
+
+    #[test]
+    fn arity_ok_throw_rethrow_catch_accept_zero_or_one_reject_two() {
+        assert!(arity_ok(CatchpointKind::Throw, &[]));
+        assert!(arity_ok(
+            CatchpointKind::Throw,
+            &["std::runtime_error".to_string()]
+        ));
+        assert!(!arity_ok(
+            CatchpointKind::Throw,
+            &["a".to_string(), "b".to_string()]
+        ));
+        assert!(arity_ok(CatchpointKind::Rethrow, &[]));
+        assert!(arity_ok(CatchpointKind::Catch, &[]));
+    }
+
+    #[test]
+    fn should_add_catchpoint_throw_rethrow_catch_accept_zero_or_one_reject_two() {
+        assert!(should_add_catchpoint(CatchpointKind::Throw, &[], &[]));
+        assert!(should_add_catchpoint(
+            CatchpointKind::Throw,
+            &["std::runtime_error".to_string()],
+            &[]
+        ));
+        assert!(!should_add_catchpoint(
+            CatchpointKind::Throw,
+            &["a".to_string(), "b".to_string()],
+            &[]
+        ));
+    }
+
+    // Multiple Throw catchpoints with different regexps coexist — no
+    // client-side de-dup beyond the exact (kind, args) match (D4/spec).
+    #[test]
+    fn should_add_catchpoint_multiple_throw_with_different_regexps_are_not_duplicates() {
+        let existing = vec![cp(CatchpointKind::Throw, &["std::runtime_error"])];
+        assert!(should_add_catchpoint(
+            CatchpointKind::Throw,
+            &["std::logic_error".to_string()],
+            &existing
+        ));
+        assert!(!should_add_catchpoint(
+            CatchpointKind::Throw,
+            &["std::runtime_error".to_string()],
+            &existing
+        ));
+    }
+
+    #[test]
+    fn combobox_kind_list_has_ten_entries_including_exceptions() {
+        let kinds = [
+            CatchpointKind::Fork,
+            CatchpointKind::Vfork,
+            CatchpointKind::Exec,
+            CatchpointKind::Signal,
+            CatchpointKind::Load,
+            CatchpointKind::Unload,
+            CatchpointKind::Syscall,
+            CatchpointKind::Throw,
+            CatchpointKind::Rethrow,
+            CatchpointKind::Catch,
+        ];
+        assert_eq!(kinds.len(), 10);
+        for kind in kinds {
+            let _ = kind_label(kind);
+        }
+    }
+
+    // ── exception_banner_text (D3) ───────────────────────────────────────────
+
+    fn armed(id: u32, kind: CatchpointKind) -> Catchpoint {
+        Catchpoint {
+            id,
+            kind,
+            args: vec![],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn exception_banner_text_throw_hit_shows_exception_thrown() {
+        let catchpoints = vec![armed(3, CatchpointKind::Throw)];
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(3)), &catchpoints),
+            Some("Exception thrown".to_string())
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_rethrow_hit_shows_exception_rethrown() {
+        let catchpoints = vec![armed(4, CatchpointKind::Rethrow)];
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(4)), &catchpoints),
+            Some("Exception rethrown".to_string())
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_catch_hit_shows_exception_caught() {
+        let catchpoints = vec![armed(5, CatchpointKind::Catch)];
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(5)), &catchpoints),
+            Some("Exception caught".to_string())
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_none_for_unmatched_id() {
+        let catchpoints = vec![armed(3, CatchpointKind::Throw)];
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(99)), &catchpoints),
+            None
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_none_for_plain_breakpoint_no_catchpoints() {
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(1)), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_none_for_other_kind_catchpoint_hit_by_id() {
+        let catchpoints = vec![armed(3, CatchpointKind::Fork)];
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::BreakpointHit(3)), &catchpoints),
+            None
+        );
+    }
+
+    #[test]
+    fn exception_banner_text_none_for_non_breakpoint_hit_stop_reason() {
+        let catchpoints = vec![armed(3, CatchpointKind::Throw)];
+        assert_eq!(exception_banner_text(None, &catchpoints), None);
+        assert_eq!(
+            exception_banner_text(Some(&StopReason::Unknown), &catchpoints),
+            None
         );
     }
 

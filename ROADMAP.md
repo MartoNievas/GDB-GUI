@@ -55,23 +55,23 @@ being a seriously usable debugger, ordered roughly by priority.
   message, and trigger old→new values in a yellow banner. Automatic scope
   cleanup on `watchpoint-scope` events (no UI toast). Strict TDD: 185/185 tests
   passing (47 new).
-- **Catchpoints (implemented, Phase 2a+2b)** — New `Catchpoint` type in
-  `src/state/debugger_state.rs` (Fork/Vfork/Exec/Signal/Load/Unload/Syscall
-  kinds) with dual MI ingress: console-passthrough for fork/vfork/exec/signal/
-  syscall (via `-interpreter-exec console "catch <kind> [args]"`), native
-  verbs for load/unload (`-catch-load/-catch-unload`). Separate UI panel
-  (`src/ui/panels/catchpoints.rs`) with stop-event labeling (fork/vfork show
-  new PID, exec shows path, load/unload show library name, syscall shows
-  number/name for both entry and return stops). Strict TDD: 326/326 tests
-  passing (73 new catchpoints tests in Phase 2a, 49 new syscall tests in
-  Phase 2b). Phase 2c (C++ exceptions) deferred to a separate SDD change.
+- **Catchpoints (implemented, Phase 2a+2b+2c)** — New `Catchpoint` type in
+  `src/state/debugger_state.rs` (Fork/Vfork/Exec/Signal/Load/Unload/Syscall/
+  Throw/Rethrow/Catch kinds) with three MI ingress shapes:
+  console-passthrough for fork/vfork/exec/signal/syscall (via
+  `-interpreter-exec console "catch <kind> [args]"`), native verbs for
+  load/unload (`-catch-load/-catch-unload`), and native verbs for the C++
+  exception kinds (`-catch-throw/-catch-rethrow/-catch-catch`, optional
+  `-r <regexp>`). Separate UI panel (`src/ui/panels/catchpoints.rs`) with
+  stop-event labeling (fork/vfork show new PID, exec shows path, load/unload
+  show library name, syscall shows number/name for both entry and return
+  stops, exceptions show "Exception thrown/rethrown/caught"). Strict TDD:
+  367/367 tests passing (73 new catchpoints tests in Phase 2a, 49 new
+  syscall tests in Phase 2b, 41 new exception tests in Phase 2c). Catchpoints
+  feature is now complete.
 
 ## Missing debugging functionality
 
-- **No C++ exception catchpoints (Phase 2c)** — Phase 2a
-  (fork/vfork/exec/signal/load/unload) and Phase 2b (syscall) are done.
-  Remaining catchpoint types to be implemented: `-catch-throw`,
-  `-catch-rethrow`, `-catch-catch`. Planned as a separate SDD change.
 - **No memory view (hex dump)** — no command wraps
   `-data-read-memory-bytes`; raw memory cannot be inspected outside of
   named variables.
