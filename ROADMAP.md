@@ -69,6 +69,24 @@ being a seriously usable debugger, ordered roughly by priority.
   367/367 tests passing (73 new catchpoints tests in Phase 2a, 49 new
   syscall tests in Phase 2b, 41 new exception tests in Phase 2c). Catchpoints
   feature is now complete.
+- **Architecture cleanup (Phase 1)** — Broke the sole bidirectional import
+  cycle (`app.rs <-> panels/watch.rs`) by relocating `WatchTab` enum from
+  `watch.rs` to `app.rs`, restoring uniform one-way dependency direction
+  across all 11 panels. Verified by graphify: "Import Cycles: None detected".
+  Extracted error state maps (`edit_errors`, `watchpoint_errors`,
+  `catchpoint_errors`) from `DebuggerState` into new `ErrorState` substruct,
+  improving cohesion structurally as a first step toward larger decomposition.
+  All 367/367 tests passing. See `openspec/changes/archive/2026-07-30-{break-app-watch-cycle,extract-error-state}/`.
+- **Architecture cleanup (Phase 2)** — Decomposed `run_loop()` (310 lines,
+  cohesion 0.11) by extracting 3 functions (`spawn_reader_thread`,
+  `handle_commands`, `handle_gdb_output`) that encapsulate distinct concerns
+  (reader setup, command dispatch, output processing). Grouped 7 independent
+  `pending_*` maps into `struct PendingRegistry` with distinctly-typed fields
+  (preserving type-level mutual isolation), eliminating the 7-parameter fan-out
+  smell and improving cohesion to 0.33. Preserved exact check order and
+  continue/fall-through semantics verified by manual smoke test against live GDB.
+  Strict TDD: 369/369 tests passing (2 new characterization tests added).
+  See `openspec/changes/archive/2026-07-30-{extract-run-loop-functions,pending-registry}/`.
 
 ## Missing debugging functionality
 
@@ -91,12 +109,6 @@ being a seriously usable debugger, ordered roughly by priority.
   and `breakpoints` in process memory — nothing is serialized to disk.
   Closing the app loses breakpoints and session state; there is no
   "project" or config file concept.
-
-## Architecture (from `graphify-out/GRAPH_REPORT.md`)
-
-- Import cycle: `app.rs <-> panels/watch.rs`.
-- `DebuggerState` and `run_loop` have low cohesion (0.10-0.11) — candidates
-  for splitting into smaller modules.
 
 ## Already solid
 
