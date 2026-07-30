@@ -4,21 +4,11 @@ use eframe::egui::{self, Color32, FontId, ScrollArea, Stroke, TextEdit, Vec2};
 
 use super::util::visible_register_rows;
 use crate::state::EditTarget;
-use crate::ui::app::App;
+use crate::ui::app::{App, WatchTab};
 use crate::ui::command::Command;
 use crate::ui::registers::RegClass;
 use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m};
-
-// ─── UI-only tab state ────────────────────────────────────────────────────────
-
-#[derive(Default, PartialEq, Clone, Copy)]
-pub(crate) enum WatchTab {
-    #[default]
-    Watch,
-    Registers,
-    Data,
-}
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(2.0);

@@ -245,6 +245,29 @@ pub struct PersistentState {
     pub catchpoints: Vec<Catchpoint>,
 }
 
+// ─── Error state ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Default)]
+pub struct ErrorState {
+    /// GDB `^error` message from a failed `Command::SetValue`, keyed by the
+    /// target that failed. Cleared for a key on that key's next
+    /// `ValueEditSucceeded`. Wiped in full on Loaded/Started/Exited, like the
+    /// other per-session panels.
+    pub edit_errors: std::collections::HashMap<EditTarget, String>,
+    /// GDB `^error` message from a failed watchpoint creation/toggle/delete,
+    /// keyed by the requested expression (design decision D1 — a rejected
+    /// `-break-watch` returns no GDB id, so there is no row to attach an
+    /// error to). Cleared on that expression's next successful add. Wiped in
+    /// full on Loaded/Started/Exited, like `edit_errors`.
+    pub watchpoint_errors: std::collections::HashMap<String, String>,
+    /// GDB `^error` message from a failed catchpoint creation/toggle/delete,
+    /// keyed by `"{kind}:{args joined}"` (design decision D1 — a rejected
+    /// catchpoint attempt returns no GDB id, so there is no row to attach an
+    /// error to). Wiped in full on Loaded/Started/Exited, like
+    /// `watchpoint_errors`.
+    pub catchpoint_errors: std::collections::HashMap<String, String>,
+}
+
 // ─── Top-level state ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -271,23 +294,7 @@ pub struct DebuggerState {
     /// `source_view_file()` — `current_file()` stays pause-only so the
     /// topbar location label keeps meaning "where execution is".
     pub preview_file: Option<String>,
-    /// GDB `^error` message from a failed `Command::SetValue`, keyed by the
-    /// target that failed. Cleared for a key on that key's next
-    /// `ValueEditSucceeded`. Wiped in full on Loaded/Started/Exited, like the
-    /// other per-session panels.
-    pub edit_errors: std::collections::HashMap<EditTarget, String>,
-    /// GDB `^error` message from a failed watchpoint creation/toggle/delete,
-    /// keyed by the requested expression (design decision D1 — a rejected
-    /// `-break-watch` returns no GDB id, so there is no row to attach an
-    /// error to). Cleared on that expression's next successful add. Wiped in
-    /// full on Loaded/Started/Exited, like `edit_errors`.
-    pub watchpoint_errors: std::collections::HashMap<String, String>,
-    /// GDB `^error` message from a failed catchpoint creation/toggle/delete,
-    /// keyed by `"{kind}:{args joined}"` (design decision D1 — a rejected
-    /// catchpoint attempt returns no GDB id, so there is no row to attach an
-    /// error to). Wiped in full on Loaded/Started/Exited, like
-    /// `watchpoint_errors`.
-    pub catchpoint_errors: std::collections::HashMap<String, String>,
+    pub errors: ErrorState,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -458,9 +465,7 @@ impl DebuggerState {
                 catchpoints: vec![],
             },
             preview_file: None,
-            edit_errors: std::collections::HashMap::new(),
-            watchpoint_errors: std::collections::HashMap::new(),
-            catchpoint_errors: std::collections::HashMap::new(),
+            errors: ErrorState::default(),
         }
     }
 
@@ -485,9 +490,9 @@ impl DebuggerState {
                 // New executable: a previously resolved preview path may no
                 // longer apply.
                 self.preview_file = None;
-                self.edit_errors.clear();
-                self.watchpoint_errors.clear();
-                self.catchpoint_errors.clear();
+                self.errors.edit_errors.clear();
+                self.errors.watchpoint_errors.clear();
+                self.errors.catchpoint_errors.clear();
             }
 
             StateEvent::ProgramStarted => {
@@ -504,9 +509,9 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
-                self.edit_errors.clear();
-                self.watchpoint_errors.clear();
-                self.catchpoint_errors.clear();
+                self.errors.edit_errors.clear();
+                self.errors.watchpoint_errors.clear();
+                self.errors.catchpoint_errors.clear();
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -542,9 +547,9 @@ impl DebuggerState {
                 self.struct_value = None;
                 self.threads = vec![];
                 self.current_thread = None;
-                self.edit_errors.clear();
-                self.watchpoint_errors.clear();
-                self.catchpoint_errors.clear();
+                self.errors.edit_errors.clear();
+                self.errors.watchpoint_errors.clear();
+                self.errors.catchpoint_errors.clear();
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -610,10 +615,10 @@ impl DebuggerState {
             }
 
             StateEvent::ValueEditFailed { target, message } => {
-                self.edit_errors.insert(target, message);
+                self.errors.edit_errors.insert(target, message);
             }
             StateEvent::ValueEditSucceeded { target } => {
-                self.edit_errors.remove(&target);
+                self.errors.edit_errors.remove(&target);
             }
             StateEvent::SourcePreviewResolved { file } => {
                 self.preview_file = Some(file);
@@ -640,7 +645,7 @@ impl DebuggerState {
                 }
             }
             StateEvent::WatchpointError { expr, message } => {
-                self.watchpoint_errors.insert(expr, message);
+                self.errors.watchpoint_errors.insert(expr, message);
             }
 
             StateEvent::CatchpointAdded { catchpoint } => {
@@ -664,7 +669,7 @@ impl DebuggerState {
                 }
             }
             StateEvent::CatchpointError { key, message } => {
-                self.catchpoint_errors.insert(key, message);
+                self.errors.catchpoint_errors.insert(key, message);
             }
         }
     }
@@ -727,7 +732,7 @@ impl DebuggerState {
     /// GDB's `^error` message from the last failed write to `target`, if
     /// any. `None` means no failed edit is pending display for this target.
     pub fn edit_error(&self, target: &EditTarget) -> Option<&str> {
-        self.edit_errors.get(target).map(|s| s.as_str())
+        self.errors.edit_errors.get(target).map(|s| s.as_str())
     }
 
     /// Whether a watchpoint already exists for `expr` (exact string match).
@@ -741,7 +746,7 @@ impl DebuggerState {
     /// for `expr`, if any. `None` means no error is pending display for this
     /// expression.
     pub fn watchpoint_error(&self, expr: &str) -> Option<&str> {
-        self.watchpoint_errors.get(expr).map(|s| s.as_str())
+        self.errors.watchpoint_errors.get(expr).map(|s| s.as_str())
     }
 
     /// Whether a catchpoint already exists for this exact `(kind, args)`
@@ -757,7 +762,7 @@ impl DebuggerState {
     /// GDB's `^error` message (or a locally rejected duplicate's message)
     /// for `key` (`"{kind}:{args joined}"`), if any.
     pub fn catchpoint_error(&self, key: &str) -> Option<&str> {
-        self.catchpoint_errors.get(key).map(|s| s.as_str())
+        self.errors.catchpoint_errors.get(key).map(|s| s.as_str())
     }
 
     /// Catchpoint with the given GDB id, if any — used to correlate a
@@ -860,9 +865,11 @@ mod tests {
         let target_a = EditTarget::Local("x".into());
         let target_b = EditTarget::Global("g_counter".into());
         state
+            .errors
             .edit_errors
             .insert(target_a.clone(), "stale error a".into());
         state
+            .errors
             .edit_errors
             .insert(target_b.clone(), "stale error b".into());
 
@@ -879,21 +886,21 @@ mod tests {
         let target = EditTarget::Register("pc".into());
 
         let mut state = DebuggerState::new();
-        state.edit_errors.insert(target.clone(), "e".into());
+        state.errors.edit_errors.insert(target.clone(), "e".into());
         state.apply(StateEvent::ProgramLoaded {
             executable: "a.out".into(),
         });
-        assert!(state.edit_errors.is_empty());
+        assert!(state.errors.edit_errors.is_empty());
 
         let mut state = DebuggerState::new();
-        state.edit_errors.insert(target.clone(), "e".into());
+        state.errors.edit_errors.insert(target.clone(), "e".into());
         state.apply(StateEvent::ProgramStarted);
-        assert!(state.edit_errors.is_empty());
+        assert!(state.errors.edit_errors.is_empty());
 
         let mut state = DebuggerState::new();
-        state.edit_errors.insert(target, "e".into());
+        state.errors.edit_errors.insert(target, "e".into());
         state.apply(StateEvent::ProgramExited { code: Some(0) });
-        assert!(state.edit_errors.is_empty());
+        assert!(state.errors.edit_errors.is_empty());
     }
 
     fn bp(id: u32, file: &str, line: u32) -> Breakpoint {
@@ -1464,26 +1471,29 @@ mod tests {
     fn program_loaded_started_exited_wipe_watchpoint_errors() {
         let mut state = DebuggerState::new();
         state
+            .errors
             .watchpoint_errors
             .insert("x".into(), "stale error".into());
         state.apply(StateEvent::ProgramLoaded {
             executable: "a.out".into(),
         });
-        assert!(state.watchpoint_errors.is_empty());
+        assert!(state.errors.watchpoint_errors.is_empty());
 
         let mut state = DebuggerState::new();
         state
+            .errors
             .watchpoint_errors
             .insert("x".into(), "stale error".into());
         state.apply(StateEvent::ProgramStarted);
-        assert!(state.watchpoint_errors.is_empty());
+        assert!(state.errors.watchpoint_errors.is_empty());
 
         let mut state = DebuggerState::new();
         state
+            .errors
             .watchpoint_errors
             .insert("x".into(), "stale error".into());
         state.apply(StateEvent::ProgramExited { code: Some(0) });
-        assert!(state.watchpoint_errors.is_empty());
+        assert!(state.errors.watchpoint_errors.is_empty());
     }
 
     // Rollback guarantee (design.md): the same lifecycle events must still
@@ -1871,26 +1881,29 @@ mod tests {
     fn program_loaded_started_exited_wipe_catchpoint_errors() {
         let mut state = DebuggerState::new();
         state
+            .errors
             .catchpoint_errors
             .insert("fork:".into(), "stale error".into());
         state.apply(StateEvent::ProgramLoaded {
             executable: "a.out".into(),
         });
-        assert!(state.catchpoint_errors.is_empty());
+        assert!(state.errors.catchpoint_errors.is_empty());
 
         let mut state = DebuggerState::new();
         state
+            .errors
             .catchpoint_errors
             .insert("fork:".into(), "stale error".into());
         state.apply(StateEvent::ProgramStarted);
-        assert!(state.catchpoint_errors.is_empty());
+        assert!(state.errors.catchpoint_errors.is_empty());
 
         let mut state = DebuggerState::new();
         state
+            .errors
             .catchpoint_errors
             .insert("fork:".into(), "stale error".into());
         state.apply(StateEvent::ProgramExited { code: Some(0) });
-        assert!(state.catchpoint_errors.is_empty());
+        assert!(state.errors.catchpoint_errors.is_empty());
     }
 
     // Rollback guarantee (mirrors watchpoints): lifecycle events must leave

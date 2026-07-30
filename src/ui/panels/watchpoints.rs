@@ -1,6 +1,6 @@
 //! Watchpoints panel content.
 //!
-//! Distinct from `panels::watch` (the unrelated `WatchTab::Watch`
+//! Distinct from `ui::app` (the unrelated `WatchTab::Watch`
 //! variable-inspection tab, design decision D7): this panel is a new
 //! collapsible section, rendered immediately after `panels::breakpoints`.
 
@@ -131,7 +131,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         // Listed here, separately from the table, so they stay visible and
         // are never a transient toast (spec: "Persistent Per-Row Error
         // Surfacing").
-        let pending_errors = pending_watchpoint_errors(&app.state.watchpoint_errors);
+        let pending_errors = pending_watchpoint_errors(&app.state.errors.watchpoint_errors);
         if !pending_errors.is_empty() {
             ui.add_space(4.0);
             ui.label(m("Pending Errors", 10.0, TXT_DIM).italics());

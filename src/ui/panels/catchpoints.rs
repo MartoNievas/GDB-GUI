@@ -176,7 +176,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         // (design decision D1). Listed separately so it stays visible and
         // is never a transient toast (spec: "Persistent Per-Row Error
         // Surfacing").
-        let pending_errors = pending_catchpoint_errors(&app.state.catchpoint_errors);
+        let pending_errors = pending_catchpoint_errors(&app.state.errors.catchpoint_errors);
         if !pending_errors.is_empty() {
             ui.add_space(4.0);
             ui.label(m("Pending Errors", 10.0, TXT_DIM).italics());

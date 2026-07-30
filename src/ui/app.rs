@@ -3,7 +3,6 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use super::command::Command;
 use super::panels;
-use super::panels::watch::WatchTab;
 use super::theme::*;
 use super::widgets::*;
 use crate::state::{DebuggerEvent, DebuggerState, UiEvent};
@@ -16,6 +15,14 @@ struct SourceLine {
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
+
+#[derive(Default, PartialEq, Clone, Copy)]
+pub(crate) enum WatchTab {
+    #[default]
+    Watch,
+    Registers,
+    Data,
+}
 
 pub struct App {
     pub state: DebuggerState,
