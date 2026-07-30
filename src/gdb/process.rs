@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
+    ops::ControlFlow,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{Receiver, Sender},
     thread,
@@ -308,6 +309,319 @@ fn spawn_gdb(
 
 // ─── run_loop ─────────────────────────────────────────────────────────────────
 
+/// Spawns the background thread that blocks on `reader.read_line` and
+/// forwards each trimmed line through the returned channel. Errors and EOF
+/// both terminate the thread silently on the reader side; a read error is
+/// also reported to the UI via `event_tx` before the thread exits. The
+/// `JoinHandle` is returned for the caller to hold (never joined — the
+/// thread is expected to outlive `run_loop`'s use of it and terminate on its
+/// own when the child's stdout closes).
+fn spawn_reader_thread(
+    reader: BufReader<ChildStdout>,
+    event_tx: Sender<DebuggerEvent>,
+) -> (thread::JoinHandle<()>, Receiver<String>) {
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    let event_tx_reader = event_tx.clone();
+
+    let handle = thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let line = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+                    if !line.is_empty() && line_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = event_tx_reader.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
+                        "Error leyendo GDB: {e}"
+                    ))));
+                    break;
+                }
+            }
+        }
+    });
+
+    (handle, line_rx)
+}
+
+/// Groups the 7 in-flight MI-token correlation maps used by `handle_commands`
+/// and `handle_gdb_output` into one cohesive concept. Fields are deliberately
+/// **distinctly typed** — never a single `HashMap<u32, PendingKind>` — because
+/// type-level mutual isolation between correlation domains is a documented
+/// correctness guarantee (Engram #95, finding 1): a reply for one domain can
+/// never be mistakenly consumed by another domain's correlator.
+#[derive(Clone, Debug, Default)]
+struct PendingRegistry {
+    /// Token (assigned by `GdbWriter::send`) -> id of the breakpoint whose
+    /// `-break-condition` is pending a response. GDB echoes the token in its
+    /// result record (`{token}^done`/`{token}^error`), which lets us
+    /// correlate an `^error` with the exact row that originated it.
+    cond: HashMap<u32, u32>,
+
+    /// Token (assigned by `GdbWriter::send`) -> struct-panel expression
+    /// pending a response. Correlated by token, not FIFO: kept separate from
+    /// `globals` so a struct response is never consumed by the globals path
+    /// (and vice versa), even when both are in flight at the same time after
+    /// the same pause.
+    struct_: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) -> global-variable name pending
+    /// a response. Correlated by token, not FIFO: kept separate from
+    /// `struct_` (and vice versa) so a globals response is never consumed by
+    /// the struct path, even when both are in flight at the same time after
+    /// the same pause.
+    globals: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) -> `EditTarget` of the
+    /// `Command::SetValue` write pending a response. Correlated by token, not
+    /// FIFO, like the other pending maps: kept separate so a value-edit reply
+    /// is never consumed by the struct/globals/cond paths, even when several
+    /// are in flight after the same pause.
+    edit: HashMap<u32, EditTarget>,
+
+    /// Token (assigned by `GdbWriter::send`) of the in-flight
+    /// `Command::ProbeMainSource` probe, if any. Correlated by token like the
+    /// other pending sets: its reply is intercepted and `continue`d on before
+    /// `parse_line`, so it never reaches `parse_result` and never becomes a
+    /// `BreakpointAdded` row (see `correlate_pending_probe`).
+    probe: HashSet<u32>,
+
+    /// Token (assigned by `GdbWriter::send`) -> expression of the
+    /// `Command::AddWatchpoint` pending a response. Correlated by token, not
+    /// FIFO, like the other pending maps: only `^error` needs correlation
+    /// here (success is self-describing and flows through the normal
+    /// `parse_line` path into `WatchpointAdded`).
+    watch: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) -> D1 key (`"{kind}:{args}"`) of
+    /// the `Command::AddCatchpoint` pending a response. Correlated by token,
+    /// not FIFO, like the other pending maps: only `^error` needs correlation
+    /// here (a successful creation is never send-time optimistic — see
+    /// `correlate_pending_catch` doc comment / design addendum A2/A3).
+    catch: HashMap<u32, String>,
+}
+
+/// Drains `cmd_rx` fully, dispatching each `DebuggerCommand` to GDB and
+/// tagging the 7 `PendingRegistry` fields as needed. Returns `Err(())` the
+/// moment `writer.send` fails (after reporting the error) so the caller can
+/// centralize `child.kill()`; every other error path here is non-fatal
+/// (`event_tx.send` failures are ignored like the rest of the loop, matching
+/// the previous behavior — only the writer failure aborts the drain).
+fn handle_commands<W: Write>(
+    cmd_rx: &Receiver<DebuggerCommand>,
+    writer: &mut GdbWriter<W>,
+    event_tx: &Sender<DebuggerEvent>,
+    gdb_pid: u32,
+    pending: &mut PendingRegistry,
+) -> Result<(), ()> {
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        let mi = match dispatch(&cmd) {
+            GdbAction::Interrupt => {
+                // The inferior is running: in synchronous mode GDB does not
+                // read its stdin, so `-exec-interrupt` sent through the pipe
+                // would do nothing. We send SIGINT to the GDB process instead,
+                // which stops the inferior and emits
+                // `*stopped,reason="signal-received"` (parsed by parse_line
+                // below).
+                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(
+                    "> [SIGINT] interrupt".into(),
+                )));
+                send_interrupt(gdb_pid);
+                continue;
+            }
+            GdbAction::Mi(mi) => mi,
+        };
+
+        let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!("> {mi}"))));
+
+        let token = match writer.send(&mi) {
+            Ok(token) => token,
+            Err(e) => {
+                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
+                    "Error escribiendo a GDB: {e}"
+                ))));
+                return Err(());
+            }
+        };
+
+        if let DebuggerCommand::SetBreakpointCondition { id, .. } = &cmd {
+            pending.cond.insert(token, *id);
+        }
+
+        if let DebuggerCommand::Evaluate(expr) = &cmd {
+            pending.struct_.insert(token, expr.clone());
+        }
+
+        if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
+            pending.globals.insert(token, name.clone());
+        }
+
+        if let DebuggerCommand::SetValue { target, .. } = &cmd {
+            pending.edit.insert(token, target.clone());
+        }
+
+        if matches!(cmd, DebuggerCommand::ProbeMainSource) {
+            pending.probe.insert(token);
+        }
+
+        if let DebuggerCommand::AddWatchpoint { expr, .. } = &cmd {
+            pending.watch.insert(token, expr.clone());
+        }
+
+        // D1 key: "{kind}:{args joined by ','}" — matches
+        // `catchpoint_errors`' key shape so a later `^error` attributes
+        // straight to the row the panel is tracking by (kind, args).
+        if let DebuggerCommand::AddCatchpoint { kind, args } = &cmd {
+            pending.catch.insert(token, format!("{kind}:{}", args.join(",")));
+        }
+
+        // GDB responds to `-break-delete` with a plain `^done` without
+        // `=breakpoint-deleted` or the deleted id, so the response cannot be
+        // correlated. We emit the removal event ourselves so the UI reflects it.
+        if let DebuggerCommand::RemoveBreakpoint(id) = &cmd {
+            let _ = event_tx.send(DebuggerEvent::State(StateEvent::BreakpointRemoved {
+                id: *id,
+            }));
+        }
+
+        // Watchpoint remove/toggle (D2, D4): neither `-break-delete` nor
+        // `-break-enable`/`-break-disable` gives a reply this can
+        // correlate a row update from (see `optimistic_watchpoint_event`
+        // doc comment), so both are emitted optimistically at send time.
+        if let Some(event) = optimistic_watchpoint_event(&cmd) {
+            let _ = event_tx.send(DebuggerEvent::State(event));
+        }
+
+        // Catchpoint remove/toggle (D2, D4, unaffected by the transport
+        // addendum): same fire-and-forget reasoning as watchpoints.
+        if let Some(event) = optimistic_catchpoint_event(&cmd) {
+            let _ = event_tx.send(DebuggerEvent::State(event));
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs the 7 ordered correlation checks against a single raw MI `line`,
+/// then falls through to `parse_line`. CRITICAL: exact check order is
+/// struct → globals → probe → cond → edit → watch → catch → parse_line.
+/// struct/globals/probe early-return `ControlFlow::Continue(())` on a match
+/// (short-circuit: the rest of the checks, including `parse_line`, are
+/// skipped for this line). cond/edit/watch/catch do NOT early-return on a
+/// match: they fall through to the next check and eventually to
+/// `parse_line`, so a single line can emit two events. Any `event_tx.send`
+/// or `writer.send` error anywhere returns `ControlFlow::Break(())`, which
+/// tells the caller to kill the child and stop the loop.
+fn handle_gdb_output<W: Write>(
+    line: &str,
+    writer: &mut GdbWriter<W>,
+    event_tx: &Sender<DebuggerEvent>,
+    pending: &mut PendingRegistry,
+) -> ControlFlow<()> {
+    // Struct-panel correlation: checked FIRST, before globals. Both sides are
+    // token-keyed maps, so isolation is mutual — neither path can consume the
+    // other's reply, regardless of check order.
+    if let Some(event) = correlate_pending_struct(line, &mut pending.struct_) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+        return ControlFlow::Continue(());
+    }
+
+    if let Some(event) = correlate_pending_global(line, &mut pending.globals) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+        return ControlFlow::Continue(());
+    }
+
+    // Preload-source probe correlation: intercepted and `continue`d
+    // on for BOTH outcomes, before `parse_line`, so the probe's
+    // `^done,bkpt={...}` never reaches `parse_result` and never
+    // becomes a `BreakpointAdded` row (design decision #2). On
+    // `Resolved`, the probe's own `-break-delete <number>` is
+    // written directly through `writer` here — not via
+    // `Command::RemoveBreakpoint` — so no `BreakpointRemoved` event
+    // is emitted for a row the UI never had (design decision #3).
+    // On `Failed` (no `main` symbol), nothing is emitted: a silent
+    // no-op matching today's empty-source-view behavior.
+    if let Some(outcome) = correlate_pending_probe(line, &mut pending.probe) {
+        if let ProbeOutcome::Resolved { number, file } = outcome {
+            if let Err(e) = writer.send(&format!("-break-delete {number}")) {
+                let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
+                    "Error escribiendo a GDB: {e}"
+                ))));
+                return ControlFlow::Break(());
+            }
+            if event_tx
+                .send(DebuggerEvent::State(StateEvent::SourcePreviewResolved {
+                    file,
+                }))
+                .is_err()
+            {
+                return ControlFlow::Break(());
+            }
+        }
+        return ControlFlow::Continue(());
+    }
+
+    // -break-condition correlation: an `^error` whose token is in
+    // pending_cond is translated into a BreakpointConditionError for the
+    // exact row. The console GdbError from parse_line below is still
+    // emitted regardless (not replaced), so the log loses nothing.
+    if let Some(event) = correlate_pending_cond(line, &mut pending.cond) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Value-edit correlation: like cond, does not `continue` — an `^error`
+    // still falls through to parse_line below so the console log also shows
+    // it (not replaced, just supplemented).
+    if let Some(event) = correlate_pending_edit(line, &mut pending.edit) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Watchpoint-creation correlation: like cond/edit, does not `continue`
+    // on `^error` — the console log still shows it via parse_line below. On
+    // `^done`, the token is cleaned up and the line falls through to
+    // parse_line, which turns the self-describing `wpt=`/`hw-rwpt=`/
+    // `hw-awpt=` reply into `WatchpointAdded`.
+    if let Some(event) = correlate_pending_watch(line, &mut pending.watch) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Catchpoint-creation correlation: like watch, does not `continue` on
+    // `^error` — the console log still shows it via parse_line below. On
+    // `^done` (Load/Unload's native, tokened reply), the token is cleaned up
+    // and the line falls through to parse_line, which turns its
+    // self-describing `bkpt={catch-type=...}` payload into `CatchpointAdded`
+    // (same fn the untokened notify-async path uses — A6).
+    if let Some(event) = correlate_pending_catch(line, &mut pending.catch) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    if let Some(event) = parse_line(line) {
+        // None = ignorable line, not an error
+        if event_tx.send(event).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    ControlFlow::Continue(())
+}
+
 pub fn run_loop(
     executable: Option<String>,
     cmd_rx: Receiver<DebuggerCommand>,
@@ -332,277 +646,26 @@ pub fn run_loop(
         }));
     }
 
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    let event_tx_reader = event_tx.clone();
+    let (_reader_handle, line_rx) = spawn_reader_thread(reader, event_tx.clone());
 
-    thread::spawn(move || {
-        let mut reader = reader;
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    let line = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
-                    if !line.is_empty() && line_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = event_tx_reader.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
-                        "Error leyendo GDB: {e}"
-                    ))));
-                    break;
-                }
-            }
-        }
-    });
-
-    // Token (assigned by GdbWriter::send) -> global-variable name pending a
-    // response. Correlated by token, not FIFO: kept separate from
-    // `pending_struct` (and vice versa) so a globals response is never
-    // consumed by the struct path, even when both are in flight at the same
-    // time after the same pause.
-    let mut pending_globals: HashMap<u32, String> = HashMap::new();
-
-    // Token (assigned by GdbWriter::send) -> id of the breakpoint whose
-    // `-break-condition` is pending a response. GDB echoes the token in its
-    // result record (`{token}^done`/`{token}^error`), which lets us
-    // correlate an `^error` with the exact row that originated it.
-    let mut pending_cond: HashMap<u32, u32> = HashMap::new();
-
-    // Token (assigned by GdbWriter::send) -> struct-panel expression pending
-    // a response. Correlated by token, not FIFO: kept separate from
-    // `pending_globals` so a struct response is never consumed by the
-    // globals path (and vice versa), even when both are in flight at the
-    // same time after the same pause.
-    let mut pending_struct: HashMap<u32, String> = HashMap::new();
-
-    // Token (assigned by GdbWriter::send) -> EditTarget of the
-    // `Command::SetValue` write pending a response. Correlated by token, not
-    // FIFO, like the other pending maps: kept separate so a value-edit reply
-    // is never consumed by the struct/globals/cond paths, even when several
-    // are in flight after the same pause.
-    let mut pending_edit: HashMap<u32, EditTarget> = HashMap::new();
-
-    // Token (assigned by GdbWriter::send) of the in-flight
-    // `Command::ProbeMainSource` probe, if any. Correlated by token like the
-    // other pending sets: its reply is intercepted and `continue`d on before
-    // `parse_line`, so it never reaches `parse_result` and never becomes a
-    // `BreakpointAdded` row (see `correlate_pending_probe`).
-    let mut pending_probe: HashSet<u32> = HashSet::new();
-
-    // Token (assigned by GdbWriter::send) -> expression of the
-    // `Command::AddWatchpoint` pending a response. Correlated by token, not
-    // FIFO, like the other pending maps: only `^error` needs correlation
-    // here (success is self-describing and flows through the normal
-    // `parse_line` path into `WatchpointAdded`).
-    let mut pending_watch: HashMap<u32, String> = HashMap::new();
-
-    // Token (assigned by GdbWriter::send) -> D1 key (`"{kind}:{args}"`) of
-    // the `Command::AddCatchpoint` pending a response. Correlated by token,
-    // not FIFO, like the other pending maps: only `^error` needs correlation
-    // here (a successful creation is never send-time optimistic — see
-    // `correlate_pending_catch` doc comment / design addendum A2/A3).
-    let mut pending_catch: HashMap<u32, String> = HashMap::new();
+    // In-flight MI-token correlation state for all 7 correlation domains —
+    // see `PendingRegistry`'s field doc comments for what each one tracks.
+    let mut pending = PendingRegistry::default();
 
     loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            let mi = match dispatch(&cmd) {
-                GdbAction::Interrupt => {
-                    // The inferior is running: in synchronous mode GDB does not
-                    // read its stdin, so `-exec-interrupt` sent through the pipe
-                    // would do nothing. We send SIGINT to the GDB process instead,
-                    // which stops the inferior and emits
-                    // `*stopped,reason="signal-received"` (parsed by parse_line
-                    // below).
-                    let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(
-                        "> [SIGINT] interrupt".into(),
-                    )));
-                    send_interrupt(gdb_pid);
-                    continue;
-                }
-                GdbAction::Mi(mi) => mi,
-            };
-
-            let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::ConsoleOutput(format!("> {mi}"))));
-
-            let token = match writer.send(&mi) {
-                Ok(token) => token,
-                Err(e) => {
-                    let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
-                        "Error escribiendo a GDB: {e}"
-                    ))));
-                    let _ = child.kill();
-                    return;
-                }
-            };
-
-            if let DebuggerCommand::SetBreakpointCondition { id, .. } = &cmd {
-                pending_cond.insert(token, *id);
-            }
-
-            if let DebuggerCommand::Evaluate(expr) = &cmd {
-                pending_struct.insert(token, expr.clone());
-            }
-
-            if let DebuggerCommand::EvaluateGlobal(name) = &cmd {
-                pending_globals.insert(token, name.clone());
-            }
-
-            if let DebuggerCommand::SetValue { target, .. } = &cmd {
-                pending_edit.insert(token, target.clone());
-            }
-
-            if matches!(cmd, DebuggerCommand::ProbeMainSource) {
-                pending_probe.insert(token);
-            }
-
-            if let DebuggerCommand::AddWatchpoint { expr, .. } = &cmd {
-                pending_watch.insert(token, expr.clone());
-            }
-
-            // D1 key: "{kind}:{args joined by ','}" — matches
-            // `catchpoint_errors`' key shape so a later `^error` attributes
-            // straight to the row the panel is tracking by (kind, args).
-            if let DebuggerCommand::AddCatchpoint { kind, args } = &cmd {
-                pending_catch.insert(token, format!("{kind}:{}", args.join(",")));
-            }
-
-            // GDB responds to `-break-delete` with a plain `^done` without
-            // `=breakpoint-deleted` or the deleted id, so the response cannot be
-            // correlated. We emit the removal event ourselves so the UI reflects it.
-            if let DebuggerCommand::RemoveBreakpoint(id) = &cmd {
-                let _ = event_tx.send(DebuggerEvent::State(StateEvent::BreakpointRemoved {
-                    id: *id,
-                }));
-            }
-
-            // Watchpoint remove/toggle (D2, D4): neither `-break-delete` nor
-            // `-break-enable`/`-break-disable` gives a reply this can
-            // correlate a row update from (see `optimistic_watchpoint_event`
-            // doc comment), so both are emitted optimistically at send time.
-            if let Some(event) = optimistic_watchpoint_event(&cmd) {
-                let _ = event_tx.send(DebuggerEvent::State(event));
-            }
-
-            // Catchpoint remove/toggle (D2, D4, unaffected by the transport
-            // addendum): same fire-and-forget reasoning as watchpoints.
-            if let Some(event) = optimistic_catchpoint_event(&cmd) {
-                let _ = event_tx.send(DebuggerEvent::State(event));
-            }
+        if handle_commands(&cmd_rx, &mut writer, &event_tx, gdb_pid, &mut pending).is_err() {
+            let _ = child.kill();
+            return;
         }
 
+        // Raw MI protocol records (^done, *stopped, =notify-async, …) are not
+        // echoed to the console: parse_line already translates them into state
+        // events, and real errors arrive separately as GdbError. Only stream
+        // records (~ @) produce readable text for the user.
         while let Ok(line) = line_rx.try_recv() {
-            // Raw MI protocol records (^done, *stopped, =notify-async, …) are not
-            // echoed to the console: parse_line already translates them into state
-            // events, and real errors arrive separately as GdbError. Only stream
-            // records (~ @) produce readable text for the user.
-            // Struct-panel correlation: checked FIRST, before pending_globals. Both
-            // sides are token-keyed maps, so isolation is mutual — neither path can
-            // consume the other's reply, regardless of check order.
-            if let Some(event) = correlate_pending_struct(&line, &mut pending_struct) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-                continue;
-            }
-
-            if let Some(event) = correlate_pending_global(&line, &mut pending_globals) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-                continue;
-            }
-
-            // Preload-source probe correlation: intercepted and `continue`d
-            // on for BOTH outcomes, before `parse_line`, so the probe's
-            // `^done,bkpt={...}` never reaches `parse_result` and never
-            // becomes a `BreakpointAdded` row (design decision #2). On
-            // `Resolved`, the probe's own `-break-delete <number>` is
-            // written directly through `writer` here — not via
-            // `Command::RemoveBreakpoint` — so no `BreakpointRemoved` event
-            // is emitted for a row the UI never had (design decision #3).
-            // On `Failed` (no `main` symbol), nothing is emitted: a silent
-            // no-op matching today's empty-source-view behavior.
-            if let Some(outcome) = correlate_pending_probe(&line, &mut pending_probe) {
-                if let ProbeOutcome::Resolved { number, file } = outcome {
-                    if let Err(e) = writer.send(&format!("-break-delete {number}")) {
-                        let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
-                            "Error escribiendo a GDB: {e}"
-                        ))));
-                        let _ = child.kill();
-                        return;
-                    }
-                    if event_tx
-                        .send(DebuggerEvent::State(StateEvent::SourcePreviewResolved {
-                            file,
-                        }))
-                        .is_err()
-                    {
-                        let _ = child.kill();
-                        return;
-                    }
-                }
-                continue;
-            }
-
-            // -break-condition correlation: an `^error` whose token is in
-            // pending_cond is translated into a BreakpointConditionError for the
-            // exact row. The console GdbError from parse_line below is still
-            // emitted regardless (not replaced), so the log loses nothing.
-            if let Some(event) = correlate_pending_cond(&line, &mut pending_cond) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-            }
-
-            // Value-edit correlation: like pending_cond, does not `continue` —
-            // an `^error` still falls through to parse_line below so the
-            // console log also shows it (not replaced, just supplemented).
-            if let Some(event) = correlate_pending_edit(&line, &mut pending_edit) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-            }
-
-            // Watchpoint-creation correlation: like pending_cond/pending_edit,
-            // does not `continue` on `^error` — the console log still shows
-            // it via parse_line below. On `^done`, the token is cleaned up
-            // and the line falls through to parse_line, which turns the
-            // self-describing `wpt=`/`hw-rwpt=`/`hw-awpt=` reply into
-            // `WatchpointAdded`.
-            if let Some(event) = correlate_pending_watch(&line, &mut pending_watch) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-            }
-
-            // Catchpoint-creation correlation: like pending_watch, does not
-            // `continue` on `^error` — the console log still shows it via
-            // parse_line below. On `^done` (Load/Unload's native, tokened
-            // reply), the token is cleaned up and the line falls through to
-            // parse_line, which turns its self-describing `bkpt={catch-type=
-            // ...}` payload into `CatchpointAdded` (same fn the untokened
-            // notify-async path uses — A6).
-            if let Some(event) = correlate_pending_catch(&line, &mut pending_catch) {
-                if event_tx.send(DebuggerEvent::State(event)).is_err() {
-                    let _ = child.kill();
-                    return;
-                }
-            }
-
-            if let Some(event) = parse_line(&line) {
-                // None = ignorable line, not an error
-                if event_tx.send(event).is_err() {
-                    let _ = child.kill();
-                    return; // UI closed
-                }
+            if handle_gdb_output(&line, &mut writer, &event_tx, &mut pending).is_break() {
+                let _ = child.kill();
+                return;
             }
         }
 
@@ -1308,5 +1371,92 @@ mod tests {
             other => panic!("expected StructValueUpdated, got {other:?}"),
         }
         assert!(!pending_struct.contains_key(&30));
+    }
+
+    #[test]
+    fn handle_gdb_output_probe_resolved_short_circuits_skips_parse_line() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.probe.insert(9);
+
+        let flow = handle_gdb_output(
+            "9^done,bkpt={number=\"3\",fullname=\"/tmp/main.c\",line=\"5\"}",
+            &mut writer,
+            &event_tx,
+            &mut pending,
+        );
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(
+            !pending.probe.contains(&9),
+            "token must be removed after a matching ^done"
+        );
+
+        // The probe reply must write its own -break-delete directly through
+        // the writer, bypassing Command::RemoveBreakpoint. `GdbWriter::send`
+        // prefixes the MI token it assigned (seq=1 here) to the raw command.
+        assert_eq!(String::from_utf8(writer.stdin).unwrap(), "1-break-delete 3\n");
+
+        // Exactly one event: SourcePreviewResolved. The short-circuit means
+        // the same line never reaches parse_line, so it must NOT also
+        // become a BreakpointAdded row.
+        let event = event_rx.try_recv().expect("SourcePreviewResolved event");
+        match event {
+            DebuggerEvent::State(StateEvent::SourcePreviewResolved { file }) => {
+                assert_eq!(file, "/tmp/main.c");
+            }
+            other => panic!("expected SourcePreviewResolved, got {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "probe short-circuit must skip parse_line — no second event allowed"
+        );
+    }
+
+    #[test]
+    fn handle_gdb_output_cond_error_falls_through_to_parse_line() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.cond.insert(7, 42);
+
+        let flow = handle_gdb_output(
+            "7^error,msg=\"No symbol \\\"unknown_symbol_xyz\\\" in current context.\"",
+            &mut writer,
+            &event_tx,
+            &mut pending,
+        );
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.cond.contains_key(&7));
+
+        // Fall-through: the same line emits BOTH BreakpointConditionError
+        // AND the GdbError from parse_line — the console log must not lose
+        // the raw error just because it was correlated to a row.
+        let first = event_rx.try_recv().expect("BreakpointConditionError event");
+        match first {
+            DebuggerEvent::State(StateEvent::BreakpointConditionError { id, message }) => {
+                assert_eq!(id, 42);
+                assert_eq!(message, "No symbol \"unknown_symbol_xyz\" in current context.");
+            }
+            other => panic!("expected BreakpointConditionError, got {other:?}"),
+        }
+
+        let second = event_rx
+            .try_recv()
+            .expect("GdbError event from parse_line fall-through");
+        match second {
+            DebuggerEvent::Ui(UiEvent::GdbError(msg)) => {
+                assert_eq!(msg, "No symbol \"unknown_symbol_xyz\" in current context.");
+            }
+            other => panic!("expected GdbError, got {other:?}"),
+        }
     }
 }
