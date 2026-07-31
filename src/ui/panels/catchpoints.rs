@@ -15,8 +15,10 @@ use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Catchpoints", &mut app.open_cp);
-    if app.open_cp {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::CATCHPOINTS);
+    sec_hdr(ui, "Catchpoints", &mut open);
+    app.panels.set(crate::ui::app::PanelState::CATCHPOINTS, open);
+    if open {
         // D6: a signal-received stop is correlated to an armed Signal
         // catchpoint by name (or "all") only — no id-based disambiguation
         // (that is the breakpoint-hit/C++-exception path, deferred to Phase

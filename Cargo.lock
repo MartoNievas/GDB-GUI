@@ -1160,6 +1160,7 @@ dependencies = [
 name = "gdb-gui"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.0",
  "eframe",
  "egui",
  "libc",

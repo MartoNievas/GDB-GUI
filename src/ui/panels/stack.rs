@@ -8,8 +8,10 @@ use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Stack", &mut app.open_stack);
-    if app.open_stack {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::STACK);
+    sec_hdr(ui, "Stack", &mut open);
+    app.panels.set(crate::ui::app::PanelState::STACK, open);
+    if open {
         if let Some(pause) = &app.state.pause {
             egui::Grid::new("stack_grid")
                 .num_columns(3)

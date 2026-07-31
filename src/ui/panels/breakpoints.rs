@@ -9,8 +9,10 @@ use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Breakpoints", &mut app.open_bp);
-    if app.open_bp {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::BREAKPOINTS);
+    sec_hdr(ui, "Breakpoints", &mut open);
+    app.panels.set(crate::ui::app::PanelState::BREAKPOINTS, open);
+    if open {
         let mut pending_commits: Vec<(u32, String)> = Vec::new();
 
         egui::Grid::new("bp_grid")

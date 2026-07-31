@@ -13,8 +13,10 @@ use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Watchpoints", &mut app.open_wp);
-    if app.open_wp {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::WATCHPOINTS);
+    sec_hdr(ui, "Watchpoints", &mut open);
+    app.panels.set(crate::ui::app::PanelState::WATCHPOINTS, open);
+    if open {
         // CRITICAL-3: watchpoint-trigger old/new values (spec: "Trigger:
         // show old/new values") — a stop reason is transient (overwritten by
         // the next pause), so it is rendered as a banner rather than

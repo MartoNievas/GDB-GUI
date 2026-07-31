@@ -8,8 +8,10 @@ use crate::ui::theme::{TXT, TXT_DIM};
 use crate::ui::widgets::{hl, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Struct", &mut app.open_struct);
-    if app.open_struct {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::STRUCT);
+    sec_hdr(ui, "Struct", &mut open);
+    app.panels.set(crate::ui::app::PanelState::STRUCT, open);
+    if open {
         let resp = ui
             .horizontal(|ui| {
                 ui.add_space(8.0);

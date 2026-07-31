@@ -8,8 +8,10 @@ use crate::ui::theme::*;
 use crate::ui::widgets::{hl, m, sec_hdr};
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Commands", &mut app.open_cmd);
-    if app.open_cmd {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::COMMANDS);
+    sec_hdr(ui, "Commands", &mut open);
+    app.panels.set(crate::ui::app::PanelState::COMMANDS, open);
+    if open {
         for cmd_str in &["info locals", "bt full", "info registers", "info threads", "flush"] {
             if ui
                 .add(

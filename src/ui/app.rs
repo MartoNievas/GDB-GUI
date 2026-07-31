@@ -6,12 +6,29 @@ use super::panels;
 use super::theme::*;
 use super::widgets::*;
 use crate::state::{DebuggerEvent, DebuggerState, UiEvent};
+use bitflags::bitflags;
 
 // ─── Source line for rendering ─────────────────────────────────────────────────
 
 struct SourceLine {
     number: u32,
     text: String,
+}
+
+// ─── Panel Flags for rendering ─────────────────────────────────────────────────
+
+bitflags! {
+    #[derive(Default)]
+    pub struct PanelState: u32 {
+        const BREAKPOINTS = 1 << 0;
+        const WATCHPOINTS = 1 << 1;
+        const CATCHPOINTS = 1 << 2;
+        const COMMANDS    = 1 << 3;
+        const STACK       = 1 << 4;
+        const FILES       = 1 << 5;
+        const THREAD      = 1 << 6;
+        const STRUCT      = 1 << 7;
+    }
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -35,14 +52,7 @@ pub struct App {
     pub(crate) watch_tab: WatchTab,
 
     // Collapsible sections
-    pub(crate) open_bp: bool,
-    pub(crate) open_wp: bool,
-    pub(crate) open_cmd: bool,
-    pub(crate) open_struct: bool,
-    pub(crate) open_stack: bool,
-    pub(crate) open_files: bool,
-    pub(crate) open_thread: bool,
-    pub(crate) open_cp: bool,
+    pub(crate) panels: PanelState,
 
     source_lines: Vec<SourceLine>,
     source_file: Option<String>,
@@ -74,6 +84,10 @@ impl App {
         event_rx: Receiver<DebuggerEvent>,
         cmd_tx: Sender<Command>,
     ) -> Self {
+        let mut panels = PanelState::empty();
+        panels.insert(PanelState::BREAKPOINTS);
+        panels.insert(PanelState::STACK);
+
         Self {
             state,
             event_rx,
@@ -81,14 +95,7 @@ impl App {
             console_input: String::new(),
             console_log: Vec::new(),
             watch_tab: WatchTab::Watch,
-            open_bp: true,
-            open_wp: true,
-            open_cmd: false,
-            open_struct: false,
-            open_stack: true,
-            open_files: false,
-            open_thread: false,
-            open_cp: true,
+            panels,
             source_lines: Vec::new(),
             source_file: None,
             bp_cond_buffer: std::collections::HashMap::new(),

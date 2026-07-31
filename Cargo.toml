@@ -17,6 +17,7 @@ strip = true
 [dependencies]
 egui = "0.33.3"
 eframe = "0.33.3"
+bitflags = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

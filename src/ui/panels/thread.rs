@@ -21,8 +21,10 @@ pub(crate) fn rows_interactive(state: &DebuggerState) -> bool {
 }
 
 pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
-    sec_hdr(ui, "Thread", &mut app.open_thread);
-    if app.open_thread {
+    let mut open = app.panels.contains(crate::ui::app::PanelState::THREAD);
+    sec_hdr(ui, "Thread", &mut open);
+    app.panels.set(crate::ui::app::PanelState::THREAD, open);
+    if open {
         if let Some(pause) = &app.state.pause {
             if app.state.threads.is_empty() {
                 // Fallback: no roster fetched yet (or -thread-info hasn't
