@@ -33,12 +33,13 @@ bitflags! {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
-#[derive(Default, PartialEq, Clone, Copy)]
+#[derive(Default, Debug, PartialEq, Clone, Copy)]
 pub(crate) enum WatchTab {
     #[default]
     Watch,
     Registers,
     Data,
+    Memory,
 }
 
 pub struct App {
@@ -63,6 +64,11 @@ pub struct App {
 
     // Struct panel expression edit buffer.
     pub(crate) struct_input: String,
+
+    // Memory tab address edit buffer (D4) — the commit-on-blur draft;
+    // `state.memory_addr` is the committed truth `refresh_thread_scoped_views`
+    // reads.
+    pub(crate) memory_input: String,
 
     // Value-cell edit buffer (Watch locals/globals + Registers), keyed by
     // EditTarget so the same key survives Command -> pending_edit ->
@@ -100,6 +106,7 @@ impl App {
             source_file: None,
             bp_cond_buffer: std::collections::HashMap::new(),
             struct_input: String::new(),
+            memory_input: String::new(),
             value_edit_buffer: std::collections::HashMap::new(),
             wp_expr_buffer: String::new(),
             wp_kind_buffer: crate::state::WatchpointKind::Write,
@@ -129,6 +136,14 @@ impl App {
         }
         if !self.state.struct_expr.is_empty() {
             self.send(Command::Evaluate(self.state.struct_expr.clone()));
+        }
+        // R8: a previously committed memory address is auto-re-fetched on
+        // every pause/thread-switch, mirroring the struct_expr guard above.
+        if !self.state.memory_addr.is_empty() {
+            self.send(Command::RequestMemory {
+                address: self.state.memory_addr.clone(),
+                count: 256,
+            });
         }
     }
 
@@ -565,6 +580,64 @@ mod tests {
         let sent: Vec<Command> = cmd_rx.try_iter().collect();
 
         assert!(!sent.iter().any(|c| matches!(c, Command::Evaluate(_))));
+    }
+
+    // ── Memory tab (D3/D4/R8) ────────────────────────────────────────────────
+
+    #[test]
+    fn app_new_starts_with_empty_memory_input_and_watch_tab_default() {
+        let (app, _cmd_rx) = test_app();
+        assert_eq!(app.memory_input, "");
+        assert_eq!(app.watch_tab, WatchTab::Watch);
+    }
+
+    #[test]
+    fn watch_tab_memory_variant_exists_and_compares() {
+        assert_eq!(WatchTab::Memory, WatchTab::Memory);
+        assert_ne!(WatchTab::Memory, WatchTab::Data);
+    }
+
+    // R8: a committed address is re-sent on every pause/thread-switch
+    // refresh, mirroring the struct_expr guard.
+    #[test]
+    fn refresh_thread_scoped_views_resends_request_memory_when_addr_committed() {
+        let (mut app, cmd_rx) = test_app();
+        app.state.memory_addr = "$sp".into();
+
+        app.refresh_thread_scoped_views();
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+
+        assert!(
+            sent.contains(&Command::RequestMemory {
+                address: "$sp".into(),
+                count: 256,
+            }),
+            "expected a RequestMemory(\"$sp\", 256) follow-up, got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_thread_scoped_views_sends_no_request_memory_when_addr_empty() {
+        let (app, cmd_rx) = test_app();
+        app.refresh_thread_scoped_views();
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+
+        assert!(!sent.iter().any(|c| matches!(c, Command::RequestMemory { .. })));
+    }
+
+    #[test]
+    fn refresh_thread_scoped_views_sends_exactly_one_request_memory_on_address_change() {
+        let (mut app, cmd_rx) = test_app();
+        app.state.memory_addr = "0x1000".into();
+
+        app.refresh_thread_scoped_views();
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+
+        let count = sent
+            .iter()
+            .filter(|c| matches!(c, Command::RequestMemory { .. }))
+            .count();
+        assert_eq!(count, 1, "expected exactly one RequestMemory, got {sent:?}");
     }
 
     // Preload-source: ProgramLoaded must trigger the one-shot probe

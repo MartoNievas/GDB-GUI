@@ -16,7 +16,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         for (label, tab) in [
             ("Watch", WatchTab::Watch),
             ("Registers", WatchTab::Registers),
-            ("Data", WatchTab::Data),
+            ("Disasm", WatchTab::Data),
+            ("Memory", WatchTab::Memory),
         ] {
             let active = app.watch_tab == tab;
             let col = if active {
@@ -199,8 +200,103 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                WatchTab::Memory => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        let resp = ui.add(
+                            TextEdit::singleline(&mut app.memory_input)
+                                .font(FontId::monospace(11.0))
+                                .desired_width(160.0)
+                                .hint_text("address"),
+                        );
+                        if crate::ui::panels::struct_panel::should_commit_struct_expr(
+                            resp.lost_focus(),
+                            &app.memory_input,
+                            &app.state.memory_addr,
+                        ) {
+                            let addr = app.memory_input.clone();
+                            app.state.memory_addr = addr.clone();
+                            if !addr.is_empty() {
+                                app.send(Command::RequestMemory {
+                                    address: addr,
+                                    count: 256,
+                                });
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    // R5/R3/R6/otherwise state machine, evaluated top-down.
+                    if !paused {
+                        ui.label(m("Not paused", 11.0, TXT_DIM).italics());
+                    } else if let Some(msg) = &app.state.errors.memory_error {
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(m(msg, 11.0, RED));
+                        });
+                    } else if app.state.memory.is_empty() {
+                        ui.label(m("No address", 11.0, TXT_DIM).italics());
+                    } else {
+                        for (block_idx, block) in app.state.memory.iter().enumerate() {
+                            if block_idx > 0 {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(m("…unreadable…", 11.0, TXT_DIM).italics());
+                                });
+                            }
+                            let base = u64::from_str_radix(
+                                block.begin.trim_start_matches("0x"),
+                                16,
+                            )
+                            .unwrap_or(0);
+                            for (row_idx, chunk) in block.bytes.chunks(16).enumerate() {
+                                let (offset, hex, ascii) = format_hex_row(base, row_idx, chunk);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(m(&offset, 11.0, TXT_DIM));
+                                    ui.add_space(6.0);
+                                    ui.label(m(&hex, 11.0, TXT));
+                                    ui.add_space(6.0);
+                                    ui.label(m(&ascii, 11.0, TXT_CYAN));
+                                });
+                            }
+                        }
+                    }
+                }
             }
         });
+}
+
+// ─── Memory hex row formatting (D5 — pure, no egui) ────────────────────────────
+
+/// Formats one 16-byte row of a memory hex dump into its three display
+/// columns: `(offset, hex, ascii)`. `base` is the block's starting address;
+/// `row_index` is this row's position within the block (row N covers bytes
+/// `[N*16, N*16+16)`). Short rows (the block's final, possibly-partial row)
+/// pad `hex` with `"   "` and `ascii` with `" "` per missing byte, so every
+/// row's columns stay the same width regardless of length. Non-printable
+/// bytes (`< 0x20` or `> 0x7e`) render as `.` in the ASCII column.
+pub(crate) fn format_hex_row(base: u64, row_index: usize, bytes: &[u8]) -> (String, String, String) {
+    let offset = base + (row_index as u64) * 16;
+    let offset_col = format!("0x{offset:x}");
+
+    let mut hex_col = String::new();
+    let mut ascii_col = String::new();
+    for i in 0..16 {
+        match bytes.get(i) {
+            Some(b) => {
+                hex_col.push_str(&format!("{b:02x} "));
+                let c = if (0x20..=0x7e).contains(b) { *b as char } else { '.' };
+                ascii_col.push(c);
+            }
+            None => {
+                hex_col.push_str("   ");
+                ascii_col.push(' ');
+            }
+        }
+    }
+
+    (offset_col, hex_col, ascii_col)
 }
 
 // ─── Editable value cell ────────────────────────────────────────────────────────
@@ -348,5 +444,65 @@ mod tests {
         // text, authoritative is the last known-good value).
         assert!(should_reseed_value_buffer(false, "stale", "42"));
         assert!(should_reseed_value_buffer(false, "rejected-text", "7"));
+    }
+
+    // ─── format_hex_row (D5 — pure formatter, no egui) ────────────────────────
+
+    #[test]
+    fn format_hex_row_full_16_byte_row() {
+        let bytes: Vec<u8> = b"ABCDEFGHIJKLMNOP".to_vec();
+        let (offset, hex, ascii) = format_hex_row(0x1000, 0, &bytes);
+
+        assert_eq!(offset, "0x1000");
+        assert_eq!(hex, "41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 ");
+        assert_eq!(ascii, "ABCDEFGHIJKLMNOP");
+    }
+
+    #[test]
+    fn format_hex_row_short_tail_row_pads_hex_and_ascii() {
+        let bytes: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let (offset, hex, ascii) = format_hex_row(0x1000, 1, &bytes);
+
+        assert_eq!(offset, "0x1010");
+        assert_eq!(
+            hex,
+            "00 01 02 03 04 05 06 07 " .to_string() + &"   ".repeat(8)
+        );
+        assert_eq!(ascii, "........".to_string() + &" ".repeat(8));
+    }
+
+    #[test]
+    fn format_hex_row_non_printable_bytes_become_dots() {
+        let bytes: Vec<u8> = vec![0x00, 0x1f, 0xff, 0x7f, 0x20, 0x7e];
+        let (_, _, ascii) = format_hex_row(0x1000, 0, &bytes);
+
+        // 0x20 (space) and 0x7e ('~') are the printable boundary — both
+        // render verbatim; everything outside [0x20, 0x7e] becomes '.'.
+        assert_eq!(ascii.as_bytes()[0], b'.'); // 0x00
+        assert_eq!(ascii.as_bytes()[1], b'.'); // 0x1f
+        assert_eq!(ascii.as_bytes()[2], b'.'); // 0xff
+        assert_eq!(ascii.as_bytes()[3], b'.'); // 0x7f
+        assert_eq!(ascii.as_bytes()[4], b' '); // 0x20
+        assert_eq!(ascii.as_bytes()[5], b'~'); // 0x7e
+    }
+
+    #[test]
+    fn format_hex_row_offset_arithmetic_advances_by_16_per_row() {
+        let bytes: Vec<u8> = vec![0xaa];
+        assert_eq!(format_hex_row(0x2000, 0, &bytes).0, "0x2000");
+        assert_eq!(format_hex_row(0x2000, 1, &bytes).0, "0x2010");
+        assert_eq!(format_hex_row(0x2000, 2, &bytes).0, "0x2020");
+    }
+
+    // Task 7.1 (D6): reuse should_commit_struct_expr verbatim for the memory
+    // address buffer — signature and semantics are identical (single
+    // always-present committed string, "" = none).
+    #[test]
+    fn memory_address_commit_reuses_should_commit_struct_expr() {
+        use crate::ui::panels::struct_panel::should_commit_struct_expr;
+
+        assert!(should_commit_struct_expr(true, "$sp", ""));
+        assert!(!should_commit_struct_expr(false, "$sp", ""));
+        assert!(!should_commit_struct_expr(true, "$sp", "$sp"));
     }
 }
