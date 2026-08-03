@@ -12,6 +12,7 @@ pub use debugger_state::{
     // Types
     EditTarget,
     Frame,
+    MemoryBlock,
     PauseState,
 
     ProgramState,

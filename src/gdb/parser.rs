@@ -339,6 +339,12 @@ fn parse_result(line: &str) -> Option<DebuggerEvent> {
                 return Some(DebuggerEvent::State(StateEvent::DisasmUpdated { lines }));
             }
 
+            // -data-read-memory-bytes → ^done,memory=[{begin="0x...",offset="0x...",end="0x...",contents="..."}...]
+            if fields.contains("memory=[") {
+                let blocks = parse_memory(fields);
+                return Some(DebuggerEvent::State(StateEvent::MemoryUpdated { blocks }));
+            }
+
             // -symbol-info-variables → ^done,symbols={debug=[{filename="...",symbols=[...]}]}
             if fields.contains("symbols=") && fields.contains("debug=") {
                 let names = parse_global_names(fields);
@@ -999,6 +1005,65 @@ fn parse_disasm(fields: &str) -> Vec<crate::state::AsmLine> {
     }
 
     lines
+}
+
+// ─── Memory (hex dump) ────────────────────────────────────────────────────────
+
+/// Decodes `s` as best-effort pairwise hex (D8). Never panics: a trailing
+/// odd nibble (no partner) is dropped, and any 2-char chunk that is not
+/// valid hex is dropped too — parsing continues past it rather than
+/// aborting the whole block. Matches `parse_disasm`'s defensive posture
+/// (`extract_str(...).and_then(...).unwrap_or(0)`).
+fn decode_hex(s: &str) -> Vec<u8> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        let hi = chars[i].to_digit(16);
+        let lo = chars[i + 1].to_digit(16);
+        if let (Some(h), Some(l)) = (hi, lo) {
+            bytes.push((h * 16 + l) as u8);
+        }
+        i += 2;
+    }
+    bytes
+}
+
+/// Parses `-data-read-memory-bytes` reply tuples: `memory=[{begin="0x...",
+/// offset="0x...",end="0x...",contents="..."},...]`. A reply may hold
+/// multiple tuples when the requested range spans an unreadable gap (R2) —
+/// always returns a `Vec`, never a single struct. Copies the `find('{')` +
+/// `find_closing_brace` loop shape from `parse_disasm`/`parse_registers`.
+fn parse_memory(fields: &str) -> Vec<crate::state::MemoryBlock> {
+    let list = match extract_list(fields, "memory") {
+        Some(l) => l,
+        None => return vec![],
+    };
+
+    let mut blocks = vec![];
+    let mut rest = list;
+
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        if let Some(end) = find_closing_brace(rest) {
+            let block = &rest[..end];
+            let begin = extract_str(block, "begin").unwrap_or_default();
+            let offset = extract_str(block, "offset").unwrap_or_default();
+            let end_addr = extract_str(block, "end").unwrap_or_default();
+            let contents = extract_str(block, "contents").unwrap_or_default();
+            blocks.push(crate::state::MemoryBlock {
+                begin,
+                offset,
+                end: end_addr,
+                bytes: decode_hex(&contents),
+            });
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    blocks
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -2391,5 +2456,93 @@ mod tests {
             state.persistent.catchpoints[0].args,
             vec!["std::runtime_error".to_string()]
         );
+    }
+
+    // ─── Memory (hex dump, D8 — best-effort, never panics) ───────────────────
+
+    #[test]
+    fn decode_hex_even_length_decodes_all_bytes() {
+        assert_eq!(
+            decode_hex("48656c6c6f"),
+            vec![0x48, 0x65, 0x6c, 0x6c, 0x6f]
+        );
+    }
+
+    #[test]
+    fn decode_hex_odd_length_drops_trailing_nibble() {
+        assert_eq!(decode_hex("480"), vec![0x48]);
+    }
+
+    #[test]
+    fn decode_hex_non_hex_pair_is_dropped_but_parsing_continues() {
+        assert_eq!(decode_hex("zz1234"), vec![0x12, 0x34]);
+    }
+
+    #[test]
+    fn decode_hex_empty_string_yields_empty_vec() {
+        assert_eq!(decode_hex(""), Vec::<u8>::new());
+        assert!(decode_hex("").is_empty());
+    }
+
+    // R2: -data-read-memory-bytes reply, keyed on "memory=[" — self-describing,
+    // no token needed for success (D1).
+
+    #[test]
+    fn parse_line_memory_single_tuple_yields_memory_updated() {
+        let line = r#"5^done,memory=[{begin="0x7ffe1000",offset="0x00000000",end="0x7ffe1010",contents="48656c6c6f20776f726c642121212121"}]"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::MemoryUpdated { blocks })) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].begin, "0x7ffe1000");
+                assert_eq!(blocks[0].offset, "0x00000000");
+                assert_eq!(blocks[0].end, "0x7ffe1010");
+                assert_eq!(
+                    blocks[0].bytes,
+                    vec![
+                        0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x21,
+                        0x21, 0x21, 0x21, 0x21
+                    ]
+                );
+            }
+            other => panic!("expected MemoryUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_line_memory_two_tuples_gap_yields_both_blocks() {
+        let line = r#"6^done,memory=[{begin="0x1000",offset="0x0",end="0x1008",contents="0011223344556677"},{begin="0x2000",offset="0x0",end="0x2008",contents="8899aabbccddeeff"}]"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::MemoryUpdated { blocks })) => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].begin, "0x1000");
+                assert_eq!(blocks[1].begin, "0x2000");
+                assert_eq!(blocks[0].bytes, vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+                assert_eq!(blocks[1].bytes, vec![0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            }
+            other => panic!("expected MemoryUpdated with 2 blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_line_memory_missing_contents_yields_empty_bytes_no_panic() {
+        let line = r#"7^done,memory=[{begin="0x1000",offset="0x0",end="0x1008"}]"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::MemoryUpdated { blocks })) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].bytes.is_empty());
+            }
+            other => panic!("expected MemoryUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_line_memory_empty_list_yields_empty_vec_no_panic() {
+        let line = r#"8^done,memory=[]"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::MemoryUpdated { blocks })) => {
+                assert!(blocks.is_empty());
+            }
+            other => panic!("expected MemoryUpdated with empty Vec, got {other:?}"),
+        }
     }
 }
