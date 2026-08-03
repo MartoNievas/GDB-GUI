@@ -216,11 +216,17 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         ) {
                             let addr = app.memory_input.clone();
                             app.state.memory_addr = addr.clone();
-                            if !addr.is_empty() {
-                                app.send(Command::RequestMemory {
-                                    address: addr,
-                                    count: 256,
-                                });
+                            if paused {
+                                if !addr.is_empty() {
+                                    app.send(Command::RequestMemory {
+                                        address: addr,
+                                        count: 256,
+                                    });
+                                } else {
+                                    app.state.memory.clear();
+                                }
+                            } else {
+                                app.state.memory.clear();
                             }
                         }
                     });
