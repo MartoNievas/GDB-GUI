@@ -82,6 +82,221 @@ pub struct App {
     // Catchpoints panel input row buffers.
     pub(crate) cp_kind_buffer: crate::state::CatchpointKind,
     pub(crate) cp_args_buffer: String,
+
+    // ── Session persistence (design decision D4/D6) ─────────────────────
+    /// Resolved once at construction via `Store::from_env()`; `None` when
+    /// the platform has no resolvable config directory (persistence
+    /// disabled for the session rather than crashing). `pub(crate)` so
+    /// tests can inject a temp-dir `Store` directly, mirroring
+    /// `persistence.rs`'s own `Store { root: dir }` test pattern.
+    pub(crate) store: Option<crate::state::Store>,
+    /// Suppresses the save hook while a restore replay (Phase 3) is
+    /// in-flight (design decision D6): state mid-replay holds only the
+    /// entries restored so far, so saving then would truncate the file.
+    /// Set `true` by `start_restore` and cleared by `finalize_restore`.
+    pub(crate) restore_pending: bool,
+    /// The in-flight restore replay (Phase 3, design D2/D6/D9), if any.
+    /// `pub(crate)` for direct test injection/inspection.
+    pub(crate) restore_session: Option<RestoreSession>,
+    /// Failures from the most recently finalized restore, shown by
+    /// `panels::restore_report`'s modal until the user picks `Keep` or
+    /// `Remove N failed` (design decision D8 — never auto-dropped).
+    /// `None`/empty means no report is pending.
+    pub(crate) restore_report: Option<Vec<RestoreFailure>>,
+    /// `true` for the rest of this session once `Store::load` reports the
+    /// project file's `schema_version` is newer than this build understands
+    /// (design decision D7: read-only quarantine) — the save hook checks
+    /// this so a newer version's file is never clobbered.
+    pub(crate) persistence_quarantined: bool,
+    /// App-wide settings (currently only the persistence enable/disable
+    /// switch), loaded once at construction and mutated by the topbar's
+    /// "Persist" checkbox (spec: "Persistence Enable/Disable Setting").
+    pub(crate) settings: crate::state::Settings,
+    /// Resolved once at construction via `SettingsStore::from_env()`;
+    /// `None` when the platform has no resolvable config directory —
+    /// `settings` then stays in-memory only for the session (never
+    /// persisted, mirroring `store`'s degrade-gracefully contract).
+    pub(crate) settings_store: Option<crate::state::SettingsStore>,
+}
+
+// ─── Restore replay (Phase 3: design decisions D2, D6, D8, D9) ────────────────
+
+/// One entry from a persisted `ProjectFile` still awaiting its replay
+/// outcome. Carries just enough identity to match the `*Added` (success) or
+/// `*Failed`/`*Error` (failure) `StateEvent` it produced back to the request
+/// that produced it, and whether it should be toggled off once a fresh id
+/// exists (design decision D9 — never toggled before the row is added).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RestoreEntry {
+    /// Keyed by `same_file` + the requested line (design: "key by
+    /// `same_file` + (`line`|`requested_line`)") — matches whichever of the
+    /// two fields the reply carries a match on.
+    Breakpoint { file: String, line: u32, enabled: bool },
+    /// Keyed by exact `expr` (design: "key by exact `expr`").
+    Watchpoint { expr: String, enabled: bool },
+    /// Keyed by exact `(kind, args)` (design: "key by `(kind, args)`").
+    Catchpoint {
+        kind: crate::state::CatchpointKind,
+        args: Vec<String>,
+        enabled: bool,
+    },
+}
+
+/// One failure to show in the restore report modal (design decision D8:
+/// failures are reported, never silently dropped from the project file).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RestoreFailure {
+    pub(crate) label: String,
+    pub(crate) message: String,
+}
+
+/// Fallback deadline (design.md "Open Questions": "3 s restore-report
+/// deadline is a guess; tune after first real run") — a hung/crashed GDB
+/// reply must not suppress the save hook forever.
+const RESTORE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// One in-flight restore replay, started by `start_restore` on
+/// `StateEvent::ProgramLoaded` (design decision D2). `App.restore_pending`
+/// is suppressing the save hook for as long as this exists.
+#[derive(Debug)]
+pub(crate) struct RestoreSession {
+    /// Entries still awaiting a success/failure `StateEvent`.
+    pub(crate) outstanding: Vec<RestoreEntry>,
+    /// Failures observed so far.
+    pub(crate) failures: Vec<RestoreFailure>,
+    /// Wall-clock fallback: finalize even if some entries never reply.
+    pub(crate) deadline: std::time::Instant,
+}
+
+/// The restore-relevant fact carried by one `StateEvent`, extracted BEFORE
+/// `DebuggerState::apply` consumes it (mirrors every other flag captured in
+/// `apply_state_event`, e.g. `was_paused`). `None` for every event a restore
+/// never needs to correlate.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RestoreSignal {
+    BreakpointSuccess { file: String, line: u32, requested_line: Option<u32>, id: u32 },
+    BreakpointFailure { file: String, line: u32, message: String },
+    WatchpointSuccess { expr: String, id: u32 },
+    WatchpointFailure { expr: String, message: String },
+    CatchpointSuccess { kind: crate::state::CatchpointKind, args: Vec<String>, id: u32 },
+    CatchpointFailure { key: String, message: String },
+}
+
+fn restore_signal_from_event(event: &crate::state::StateEvent) -> Option<RestoreSignal> {
+    use crate::state::StateEvent;
+    match event {
+        StateEvent::BreakpointAdded { breakpoint } => Some(RestoreSignal::BreakpointSuccess {
+            file: breakpoint.file.clone(),
+            line: breakpoint.line,
+            requested_line: breakpoint.requested_line,
+            id: breakpoint.id,
+        }),
+        StateEvent::BreakpointInsertFailed { file, line, message } => {
+            Some(RestoreSignal::BreakpointFailure {
+                file: file.clone(),
+                line: *line,
+                message: message.clone(),
+            })
+        }
+        StateEvent::WatchpointAdded { watchpoint } => Some(RestoreSignal::WatchpointSuccess {
+            expr: watchpoint.expr.clone(),
+            id: watchpoint.id,
+        }),
+        StateEvent::WatchpointError { expr, message } => Some(RestoreSignal::WatchpointFailure {
+            expr: expr.clone(),
+            message: message.clone(),
+        }),
+        StateEvent::CatchpointAdded { catchpoint } => Some(RestoreSignal::CatchpointSuccess {
+            kind: catchpoint.kind,
+            args: catchpoint.args.clone(),
+            id: catchpoint.id,
+        }),
+        StateEvent::CatchpointError { key, message } => Some(RestoreSignal::CatchpointFailure {
+            key: key.clone(),
+            message: message.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `entry` is the outstanding request that produced `signal`
+/// (design: breakpoint keys by `same_file` + (`line`|`requested_line`),
+/// watchpoint by exact `expr`, catchpoint by exact `(kind, args)`).
+fn restore_entry_matches(entry: &RestoreEntry, signal: &RestoreSignal) -> bool {
+    match (entry, signal) {
+        (
+            RestoreEntry::Breakpoint { file, line, .. },
+            RestoreSignal::BreakpointSuccess {
+                file: got_file,
+                line: got_line,
+                requested_line,
+                ..
+            },
+        ) => {
+            crate::state::same_file(file, got_file)
+                && (*line == *got_line || Some(*line) == *requested_line)
+        }
+        (
+            RestoreEntry::Breakpoint { file, line, .. },
+            RestoreSignal::BreakpointFailure {
+                file: got_file,
+                line: got_line,
+                ..
+            },
+        ) => crate::state::same_file(file, got_file) && *line == *got_line,
+        (RestoreEntry::Watchpoint { expr, .. }, RestoreSignal::WatchpointSuccess { expr: got, .. }) => {
+            expr == got
+        }
+        (RestoreEntry::Watchpoint { expr, .. }, RestoreSignal::WatchpointFailure { expr: got, .. }) => {
+            expr == got
+        }
+        (
+            RestoreEntry::Catchpoint { kind, args, .. },
+            RestoreSignal::CatchpointSuccess {
+                kind: got_kind,
+                args: got_args,
+                ..
+            },
+        ) => kind == got_kind && args == got_args,
+        (RestoreEntry::Catchpoint { kind, args, .. }, RestoreSignal::CatchpointFailure { key, .. }) => {
+            format!("{kind}:{}", args.join(",")) == *key
+        }
+        _ => false,
+    }
+}
+
+/// Maps a persisted `BreakpointDTO` to the `Command` that replays it
+/// (design decisions D2/D3): GDB assigns a fresh id on `-break-insert`, so
+/// no id ever round-trips through the project file, and the DTO's `line`
+/// is already the *requested* one (design D3 — set at save time from
+/// `requested_line.unwrap_or(line)`).
+pub(crate) fn breakpoint_dto_to_command(dto: &crate::state::BreakpointDTO) -> Command {
+    Command::AddBreakpoint {
+        file: dto.file.clone(),
+        line: dto.line,
+        condition: dto.condition.clone(),
+    }
+}
+
+/// Maps a persisted `WatchpointDTO` to its replay `Command`. `None` for an
+/// unrecognized `kind` wire literal (a project file from a future schema
+/// version) — the entry is skipped rather than guessed at.
+pub(crate) fn watchpoint_dto_to_command(dto: &crate::state::WatchpointDTO) -> Option<Command> {
+    let kind = crate::state::WatchpointKind::from_wire(&dto.kind)?;
+    Some(Command::AddWatchpoint {
+        expr: dto.expr.clone(),
+        kind,
+    })
+}
+
+/// Maps a persisted `CatchpointDTO` to its replay `Command`. `None` for an
+/// unrecognized `kind` wire literal, mirroring `watchpoint_dto_to_command`.
+pub(crate) fn catchpoint_dto_to_command(dto: &crate::state::CatchpointDTO) -> Option<Command> {
+    let kind = crate::state::CatchpointKind::from_wire(&dto.kind)?;
+    Some(Command::AddCatchpoint {
+        kind,
+        args: dto.args.clone(),
+    })
 }
 
 impl App {
@@ -112,6 +327,15 @@ impl App {
             wp_kind_buffer: crate::state::WatchpointKind::Write,
             cp_kind_buffer: crate::state::CatchpointKind::Fork,
             cp_args_buffer: String::new(),
+            store: crate::state::Store::from_env(),
+            restore_pending: false,
+            restore_session: None,
+            restore_report: None,
+            persistence_quarantined: false,
+            settings: crate::state::SettingsStore::from_env()
+                .map(|s| s.load())
+                .unwrap_or_default(),
+            settings_store: crate::state::SettingsStore::from_env(),
         }
     }
 
@@ -166,6 +390,20 @@ impl App {
 
         let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
         let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
+        // Captured for the restore hook (Phase 3, design D2): the executable
+        // this `ProgramLoaded` names, so `try_start_restore` can load its
+        // project file once `s` has been consumed into `self.state`.
+        let loaded_executable = if let crate::state::StateEvent::ProgramLoaded { executable } = &s {
+            Some(executable.clone())
+        } else {
+            None
+        };
+        // Captured for restore correlation (Phase 3, design D2/D6/D9):
+        // whether this event is the success/failure reply to an outstanding
+        // replayed entry. `None` when no restore is relevant to this event
+        // shape at all (cheap to compute regardless of whether a restore is
+        // actually in flight — `handle_restore_signal` is the no-op guard).
+        let restore_signal = restore_signal_from_event(&s);
         let thread_selected = matches!(s, crate::state::StateEvent::ThreadSelected { .. });
         let new_global_names = if let crate::state::StateEvent::GlobalNamesReceived { names } = &s {
             Some(names.clone())
@@ -181,9 +419,26 @@ impl App {
         } else {
             None
         };
+        // Captured BEFORE apply() consumes `s`, mirroring every other flag
+        // above (was_paused, was_loaded, ...) — the decision to save is
+        // about the mutation this event represents, not about the state
+        // apply() leaves behind. Gated on three independent reasons to skip
+        // (Phase 3): an in-flight restore (D6), a quarantined newer-schema
+        // session (D7), and the user's persistence toggle (spec "Persistence
+        // Enable/Disable Setting").
+        let should_save = !self.restore_pending
+            && !self.persistence_quarantined
+            && self.persistence_effectively_enabled()
+            && crate::state::mutates_tracepoints(&s);
 
         self.state.apply(s);
         self.load_source_if_needed();
+        if should_save {
+            self.save_persistent_state();
+        }
+        if let Some(signal) = restore_signal {
+            self.handle_restore_signal(signal);
+        }
         if was_loaded {
             self.send(Command::RequestRegisterNames);
             self.send(Command::RequestGlobalNames);
@@ -193,6 +448,15 @@ impl App {
             // `Breakpoint`, or panel row (process.rs intercepts it by MI
             // token before parse_line).
             self.send(Command::ProbeMainSource);
+            // Phase 3 (design D2): a new executable resets last session's
+            // schema-version quarantine (D7) — a fresh load deserves its own
+            // determination, not the previous executable's stale one.
+            self.persistence_quarantined = false;
+            if let Some(exe) = loaded_executable {
+                if self.persistence_effectively_enabled() {
+                    self.try_start_restore(&exe);
+                }
+            }
         }
         if was_paused {
             self.refresh_thread_scoped_views();
@@ -212,6 +476,260 @@ impl App {
                 crate::state::EditTarget::Register(_) => self.send(Command::RequestRegisters),
             }
         }
+    }
+
+    /// Writes the current persisted breakpoints/watchpoints/catchpoints to
+    /// disk via `self.store`, if one is available. A no-op when no
+    /// executable is loaded yet — `ProjectFile::from_persistent` would
+    /// otherwise serialize an empty `executable` string, which
+    /// `Store::save`/`project_path` would hash into a bogus, unnamed
+    /// project file. IO failures are logged to the console (mirroring
+    /// `load_source_if_needed`'s degrade-gracefully pattern): a failed save
+    /// must never panic or block the UI.
+    fn save_persistent_state(&mut self) {
+        let Some(store) = &self.store else { return };
+        if self.state.persistent.executable.is_none() {
+            return;
+        }
+        let project_file = crate::state::ProjectFile::from_persistent(&self.state.persistent);
+        if let Err(e) = store.save(&project_file) {
+            self.console_log
+                .push(format!("[UI] ✗ Failed to save project file: {e}"));
+        }
+    }
+
+    /// Whether persistence is effectively enabled right now (spec
+    /// "Persistence Enable/Disable Setting"): the `GDB_GUI_NO_PERSIST`
+    /// environment variable's mere presence always wins, regardless of the
+    /// persisted setting.
+    fn persistence_effectively_enabled(&self) -> bool {
+        let env = std::env::var("GDB_GUI_NO_PERSIST").ok();
+        crate::state::persistence_enabled(&self.settings, env.as_deref())
+    }
+
+    /// Flips the persistence toggle (topbar "Persist" checkbox) and
+    /// persists the new setting immediately, mirroring
+    /// `save_persistent_state`'s degrade-gracefully IO-error handling.
+    pub(crate) fn set_persistence_enabled(&mut self, enabled: bool) {
+        self.settings.persistence_enabled = enabled;
+        if let Some(store) = &self.settings_store {
+            if let Err(e) = store.save(&self.settings) {
+                self.console_log
+                    .push(format!("[UI] ✗ Failed to save settings: {e}"));
+            }
+        }
+    }
+
+    /// Loads the project file for `exe` (design decision D2) and starts a
+    /// replay on a well-formed match. Every other `LoadOutcome` degrades
+    /// silently (spec "Missing or Corrupt File Handling" / design D7):
+    /// `Absent` = nothing to restore; `Corrupt` = warn and start clean
+    /// (still allows a future save to overwrite it); `TooNew` = warn and
+    /// quarantine this session's saves so a newer version's file is never
+    /// clobbered.
+    fn try_start_restore(&mut self, exe: &str) {
+        let Some(store) = &self.store else { return };
+        match store.load(exe) {
+            crate::state::LoadOutcome::Loaded(project_file) => {
+                self.start_restore(&project_file);
+            }
+            crate::state::LoadOutcome::Absent => {}
+            crate::state::LoadOutcome::Corrupt(msg) => {
+                self.console_log
+                    .push(format!("[UI] ⚠ Project file corrupt, starting clean: {msg}"));
+            }
+            crate::state::LoadOutcome::TooNew(version) => {
+                self.console_log.push(format!(
+                    "[UI] ⚠ Project file schema v{version} is newer than this build supports — persistence disabled for this session"
+                ));
+                self.persistence_quarantined = true;
+            }
+        }
+    }
+
+    /// Starts a restore replay for `project_file` (design decision D2):
+    /// dispatches an Add command for every entry regardless of its
+    /// persisted `enabled` flag — GDB assigns a fresh id on insert, so a
+    /// disabled entry must exist before it can be toggled off (design
+    /// decision D9) — and arms `restore_pending`/`restore_session` so the
+    /// save hook stays suppressed until every entry's outcome is known.
+    fn start_restore(&mut self, project_file: &crate::state::ProjectFile) {
+        let mut outstanding = Vec::new();
+
+        for bp in &project_file.breakpoints {
+            self.send(breakpoint_dto_to_command(bp));
+            outstanding.push(RestoreEntry::Breakpoint {
+                file: bp.file.clone(),
+                line: bp.line,
+                enabled: bp.enabled,
+            });
+        }
+        for wp in &project_file.watchpoints {
+            match watchpoint_dto_to_command(wp) {
+                Some(cmd) => {
+                    self.send(cmd);
+                    outstanding.push(RestoreEntry::Watchpoint {
+                        expr: wp.expr.clone(),
+                        enabled: wp.enabled,
+                    });
+                }
+                None => self.console_log.push(format!(
+                    "[UI] ⚠ Skipped restoring watchpoint '{}': unrecognized kind '{}'",
+                    wp.expr, wp.kind
+                )),
+            }
+        }
+        for cp in &project_file.catchpoints {
+            match catchpoint_dto_to_command(cp) {
+                Some(cmd) => {
+                    self.send(cmd);
+                    outstanding.push(RestoreEntry::Catchpoint {
+                        // `catchpoint_dto_to_command` returning `Some` already
+                        // proves `cp.kind` parsed — reusing it here (instead
+                        // of destructuring `cmd`) keeps this a plain data
+                        // build, not a pattern match on the Command shape.
+                        kind: crate::state::CatchpointKind::from_wire(&cp.kind)
+                            .expect("catchpoint_dto_to_command returned Some"),
+                        args: cp.args.clone(),
+                        enabled: cp.enabled,
+                    });
+                }
+                None => self.console_log.push(format!(
+                    "[UI] ⚠ Skipped restoring catchpoint: unrecognized kind '{}'",
+                    cp.kind
+                )),
+            }
+        }
+
+        if outstanding.is_empty() {
+            // Nothing to replay (an empty project file) — no in-flight
+            // entries, so there is nothing for the save hook to wait on.
+            return;
+        }
+
+        self.restore_pending = true;
+        self.restore_session = Some(RestoreSession {
+            outstanding,
+            failures: Vec::new(),
+            deadline: std::time::Instant::now() + RESTORE_DEADLINE,
+        });
+    }
+
+    /// Correlates one restore-relevant `StateEvent` (already turned into a
+    /// `RestoreSignal` before `apply()` consumed it) against the in-flight
+    /// session's outstanding entries. A no-op when no restore is in flight,
+    /// or when `signal` doesn't match anything still outstanding (e.g. a
+    /// normal, non-restore add/error that merely shares the same event
+    /// shape).
+    fn handle_restore_signal(&mut self, signal: RestoreSignal) {
+        let Some(session) = self.restore_session.as_mut() else {
+            return;
+        };
+        let Some(idx) = session
+            .outstanding
+            .iter()
+            .position(|entry| restore_entry_matches(entry, &signal))
+        else {
+            return;
+        };
+        let entry = session.outstanding.remove(idx);
+
+        let mut toggle_off: Option<Command> = None;
+        match &signal {
+            RestoreSignal::BreakpointSuccess { id, .. } => {
+                if matches!(entry, RestoreEntry::Breakpoint { enabled: false, .. }) {
+                    toggle_off = Some(Command::ToggleBreakpoint {
+                        id: *id,
+                        enable: false,
+                    });
+                }
+            }
+            RestoreSignal::WatchpointSuccess { id, .. } => {
+                if matches!(entry, RestoreEntry::Watchpoint { enabled: false, .. }) {
+                    toggle_off = Some(Command::ToggleWatchpoint {
+                        id: *id,
+                        enable: false,
+                    });
+                }
+            }
+            RestoreSignal::CatchpointSuccess { id, .. } => {
+                if matches!(entry, RestoreEntry::Catchpoint { enabled: false, .. }) {
+                    toggle_off = Some(Command::ToggleCatchpoint {
+                        id: *id,
+                        enable: false,
+                    });
+                }
+            }
+            RestoreSignal::BreakpointFailure { file, line, message } => {
+                session.failures.push(RestoreFailure {
+                    label: format!("Breakpoint {file}:{line}"),
+                    message: message.clone(),
+                });
+            }
+            RestoreSignal::WatchpointFailure { expr, message } => {
+                session.failures.push(RestoreFailure {
+                    label: format!("Watchpoint {expr}"),
+                    message: message.clone(),
+                });
+            }
+            RestoreSignal::CatchpointFailure { key, message } => {
+                session.failures.push(RestoreFailure {
+                    label: format!("Catchpoint {key}"),
+                    message: message.clone(),
+                });
+            }
+        }
+
+        if let Some(cmd) = toggle_off {
+            self.send(cmd);
+        }
+        self.finalize_restore_if_done();
+    }
+
+    /// Finalizes the in-flight restore if every entry has replied, or if the
+    /// fallback deadline has elapsed (design.md: "3 s restore-report
+    /// deadline ... checked in `update()`" — also checked reactively here so
+    /// a fully-resolved session doesn't wait for the next frame). A no-op
+    /// when no restore is in flight or it isn't done yet.
+    fn finalize_restore_if_done(&mut self) {
+        let Some(session) = &self.restore_session else {
+            return;
+        };
+        let done = session.outstanding.is_empty() || std::time::Instant::now() >= session.deadline;
+        if done {
+            self.finalize_restore();
+        }
+    }
+
+    /// Clears the in-flight restore session, resumes the save hook, and — if
+    /// any entries failed — arms the restore report modal (design decision
+    /// D8: failures are surfaced, never silently dropped from the project
+    /// file).
+    fn finalize_restore(&mut self) {
+        let Some(session) = self.restore_session.take() else {
+            return;
+        };
+        self.restore_pending = false;
+        if !session.failures.is_empty() {
+            self.restore_report = Some(session.failures);
+        }
+    }
+
+    /// "Keep" button (design decision D8): dismiss the report without
+    /// touching the project file — the failed entries stay on disk for a
+    /// retry on the next launch.
+    pub(crate) fn dismiss_restore_report(&mut self) {
+        self.restore_report = None;
+    }
+
+    /// "Remove N failed" button (design decision D8): explicitly rewrite the
+    /// project file from the current in-memory state. Failed entries were
+    /// never added to `self.state.persistent` in the first place, so this
+    /// naturally drops them from the file without any separate filtering
+    /// step.
+    pub(crate) fn remove_failed_restore_entries(&mut self) {
+        self.save_persistent_state();
+        self.restore_report = None;
     }
 
     fn load_source_if_needed(&mut self) {
@@ -307,6 +825,12 @@ impl eframe::App for App {
             }
         }
 
+        // Phase 3 (design.md: "3 s restore-report deadline ... checked in
+        // `update()`"): a restore with no more incoming GDB replies (e.g. a
+        // crashed/hung child) must still finalize eventually instead of
+        // suppressing the save hook forever.
+        self.finalize_restore_if_done();
+
         ctx.request_repaint();
 
         // ── TOP BAR ───────────────────────────────────────────────────────────
@@ -320,6 +844,9 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 panels::topbar::render(self, ui);
             });
+
+        // ── RESTORE REPORT (modal, Phase 3 task 3.10) ───────────────────────────
+        panels::restore_report::render(self, ctx);
 
         // ── CONSOLE (bottom) ──────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("console")
@@ -497,6 +1024,147 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel();
         let app = App::new(DebuggerState::new(), event_rx, cmd_tx);
         (app, cmd_rx)
+    }
+
+    // ── Persistence save hook (Phase 2: Wiring & Sanitization) ──────────────
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "gdb-gui-app-persistence-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        dir
+    }
+
+    #[test]
+    fn app_new_defaults_restore_pending_to_false() {
+        let (app, _cmd_rx) = test_app();
+        assert!(!app.restore_pending);
+    }
+
+    // Spec "Save Timing and Atomicity": the project file must be rewritten
+    // after a mutating tracepoint event. `store` is injected directly
+    // (bypassing `Store::from_env()`, mirroring `persistence.rs`'s own
+    // `Store { root: dir }` test pattern) so this stays a fast, hermetic
+    // unit test over a temp dir.
+    #[test]
+    fn apply_state_event_saves_project_file_on_breakpoint_added() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("save-on-add");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "/tmp/persist-test.out".into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: crate::state::Breakpoint {
+                id: 1,
+                file: "/tmp/main.c".into(),
+                line: 5,
+                requested_line: None,
+                enabled: true,
+                condition: None,
+                condition_error: None,
+            },
+        });
+
+        let store = app.store.as_ref().unwrap();
+        match store.load("/tmp/persist-test.out") {
+            crate::state::LoadOutcome::Loaded(project_file) => {
+                assert_eq!(project_file.breakpoints.len(), 1);
+                assert_eq!(project_file.breakpoints[0].file, "/tmp/main.c");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // D6: while `restore_pending` is true, state mid-replay holds only the
+    // entries restored so far — saving then would truncate the file.
+    #[test]
+    fn apply_state_event_does_not_save_while_restore_pending() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("no-save-during-restore");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "/tmp/restore-pending-test.out".into(),
+        });
+        app.restore_pending = true;
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: crate::state::Breakpoint {
+                id: 1,
+                file: "/tmp/main.c".into(),
+                line: 5,
+                requested_line: None,
+                enabled: true,
+                condition: None,
+                condition_error: None,
+            },
+        });
+
+        let store = app.store.as_ref().unwrap();
+        assert!(
+            matches!(
+                store.load("/tmp/restore-pending-test.out"),
+                crate::state::LoadOutcome::Absent
+            ),
+            "no file must be written while restore_pending is true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Triangulation: a read-only refresh event must not trigger a save
+    // either, mirroring `mutates_tracepoints_false_for_non_mutating_events`.
+    #[test]
+    fn apply_state_event_does_not_save_for_non_mutating_event() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("no-save-read-only");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "/tmp/read-only-test.out".into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::LocalsUpdated { vars: vec![] });
+
+        let store = app.store.as_ref().unwrap();
+        assert!(matches!(
+            store.load("/tmp/read-only-test.out"),
+            crate::state::LoadOutcome::Absent
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Guard: without a loaded executable, `ProjectFile::from_persistent`
+    // would serialize an empty `executable` string — saving here would
+    // silently create a bogus, unnamed project file instead of skipping.
+    #[test]
+    fn apply_state_event_does_not_save_when_no_executable_loaded() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("no-save-no-exe");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: crate::state::Breakpoint {
+                id: 1,
+                file: "/tmp/main.c".into(),
+                line: 5,
+                requested_line: None,
+                enabled: true,
+                condition: None,
+                condition_error: None,
+            },
+        });
+
+        let store = app.store.as_ref().unwrap();
+        assert!(matches!(store.load(""), crate::state::LoadOutcome::Absent));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Design "Re-fetch site": ValueEditSucceeded triggers an explicit
@@ -787,6 +1455,100 @@ mod tests {
         assert!(app.state.persistent.catchpoints.is_empty());
     }
 
+    // ── Phase 3 (persistence-serialization): restore replay ─────────────────
+    //
+    // RED: DTO -> Command mapping is the first replay building block (spec
+    // "Load and Restore via Command Replay"; design D2/D3 — GDB assigns a
+    // fresh id, so the DTO never round-trips one).
+
+    #[test]
+    fn breakpoint_dto_to_command_maps_file_line_and_condition() {
+        let dto = crate::state::BreakpointDTO {
+            file: "/tmp/main.c".into(),
+            line: 12,
+            enabled: true,
+            condition: Some("i > 3".into()),
+        };
+        assert_eq!(
+            breakpoint_dto_to_command(&dto),
+            Command::AddBreakpoint {
+                file: "/tmp/main.c".into(),
+                line: 12,
+                condition: Some("i > 3".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn breakpoint_dto_to_command_carries_no_condition_when_none() {
+        let dto = crate::state::BreakpointDTO {
+            file: "/tmp/a.c".into(),
+            line: 3,
+            enabled: false,
+            condition: None,
+        };
+        assert_eq!(
+            breakpoint_dto_to_command(&dto),
+            Command::AddBreakpoint {
+                file: "/tmp/a.c".into(),
+                line: 3,
+                condition: None,
+            }
+        );
+    }
+
+    #[test]
+    fn watchpoint_dto_to_command_maps_expr_and_parses_kind() {
+        let dto = crate::state::WatchpointDTO {
+            expr: "counter".into(),
+            kind: "write".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            watchpoint_dto_to_command(&dto),
+            Some(Command::AddWatchpoint {
+                expr: "counter".into(),
+                kind: crate::state::WatchpointKind::Write,
+            })
+        );
+    }
+
+    #[test]
+    fn watchpoint_dto_to_command_none_for_unknown_kind_literal() {
+        let dto = crate::state::WatchpointDTO {
+            expr: "x".into(),
+            kind: "bogus".into(),
+            enabled: true,
+        };
+        assert_eq!(watchpoint_dto_to_command(&dto), None);
+    }
+
+    #[test]
+    fn catchpoint_dto_to_command_maps_kind_and_args() {
+        let dto = crate::state::CatchpointDTO {
+            kind: "syscall".into(),
+            args: vec!["open".into()],
+            enabled: true,
+        };
+        assert_eq!(
+            catchpoint_dto_to_command(&dto),
+            Some(Command::AddCatchpoint {
+                kind: crate::state::CatchpointKind::Syscall,
+                args: vec!["open".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn catchpoint_dto_to_command_none_for_unknown_kind_literal() {
+        let dto = crate::state::CatchpointDTO {
+            kind: "bogus".into(),
+            args: vec![],
+            enabled: true,
+        };
+        assert_eq!(catchpoint_dto_to_command(&dto), None);
+    }
+
     // Stop-reason dispatch (Task 5): a ProgramPaused carrying any of the 4
     // new catchpoint stop reasons must trigger the same thread-scoped
     // refresh as every other pause (no special-casing needed — the routing
@@ -827,5 +1589,473 @@ mod tests {
                 "expected RequestThreads for stop reason {reason:?}, got {sent:?}"
             );
         }
+    }
+
+    // ── Phase 3 (persistence-serialization): restore replay integration ─────
+
+    fn seeded_project_file(exe: &str) -> crate::state::ProjectFile {
+        crate::state::ProjectFile {
+            schema_version: crate::state::SCHEMA_VERSION,
+            executable: exe.into(),
+            breakpoints: vec![crate::state::BreakpointDTO {
+                file: "/tmp/main.c".into(),
+                line: 5,
+                enabled: true,
+                condition: None,
+            }],
+            watchpoints: vec![crate::state::WatchpointDTO {
+                expr: "counter".into(),
+                kind: "write".into(),
+                enabled: true,
+            }],
+            catchpoints: vec![crate::state::CatchpointDTO {
+                kind: "fork".into(),
+                args: vec![],
+                enabled: true,
+            }],
+        }
+    }
+
+    fn bp_row(id: u32, file: &str, line: u32) -> crate::state::Breakpoint {
+        crate::state::Breakpoint {
+            id,
+            file: file.into(),
+            line,
+            requested_line: Some(line),
+            enabled: true,
+            condition: None,
+            condition_error: None,
+        }
+    }
+
+    // Task 3.1/3.2: `ProgramLoaded` for an executable with a saved project
+    // file loads it and replays every entry via `Command::Add*` — zero
+    // direct `persistent.*` writes (spec "Load and Restore via Command
+    // Replay").
+    #[test]
+    fn program_loaded_starts_restore_and_dispatches_add_commands_for_each_entry() {
+        let (mut app, cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-start");
+        let exe = "/tmp/restore-start-exe.out";
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store
+            .as_ref()
+            .unwrap()
+            .save(&seeded_project_file(exe))
+            .expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(sent.contains(&Command::AddBreakpoint {
+            file: "/tmp/main.c".into(),
+            line: 5,
+            condition: None,
+        }));
+        assert!(sent.contains(&Command::AddWatchpoint {
+            expr: "counter".into(),
+            kind: crate::state::WatchpointKind::Write,
+        }));
+        assert!(sent.contains(&Command::AddCatchpoint {
+            kind: crate::state::CatchpointKind::Fork,
+            args: vec![],
+        }));
+        assert!(app.restore_pending, "restore must suppress the save hook");
+        assert!(app.restore_session.is_some());
+        assert_eq!(
+            app.restore_session.as_ref().unwrap().outstanding.len(),
+            3,
+            "all 3 entries must be outstanding until their outcomes arrive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 3.9/D6: once every replayed entry's success reply has arrived,
+    // the session finalizes, `restore_pending` clears, and no failures were
+    // reported.
+    #[test]
+    fn restore_finalizes_and_resumes_save_hook_once_all_entries_succeed() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-all-success");
+        let exe = "/tmp/restore-success-exe.out";
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store
+            .as_ref()
+            .unwrap()
+            .save(&seeded_project_file(exe))
+            .expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+        assert!(app.restore_pending);
+
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(101, "/tmp/main.c", 5),
+        });
+        app.apply_state_event(crate::state::StateEvent::WatchpointAdded {
+            watchpoint: crate::state::Watchpoint {
+                id: 102,
+                expr: "counter".into(),
+                kind: crate::state::WatchpointKind::Write,
+                enabled: true,
+            },
+        });
+        app.apply_state_event(crate::state::StateEvent::CatchpointAdded {
+            catchpoint: crate::state::Catchpoint {
+                id: 103,
+                kind: crate::state::CatchpointKind::Fork,
+                args: vec![],
+                enabled: true,
+            },
+        });
+
+        assert!(
+            !app.restore_pending,
+            "restore must finalize once every entry has replied"
+        );
+        assert!(app.restore_session.is_none());
+        assert!(
+            app.restore_report.is_none(),
+            "an all-success restore must not arm the report modal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 3.6/3.7 (design D9): a disabled persisted breakpoint is added
+    // like every other, but only toggled off AFTER its own `BreakpointAdded`
+    // confirms a fresh id — never before.
+    #[test]
+    fn disabled_breakpoint_restore_toggles_off_only_after_added_event() {
+        let (mut app, cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-disabled");
+        let exe = "/tmp/restore-disabled-exe.out";
+        let mut project_file = seeded_project_file(exe);
+        project_file.breakpoints[0].enabled = false;
+        project_file.watchpoints.clear();
+        project_file.catchpoints.clear();
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store.as_ref().unwrap().save(&project_file).expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+
+        let before: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(before.contains(&Command::AddBreakpoint {
+            file: "/tmp/main.c".into(),
+            line: 5,
+            condition: None,
+        }));
+        assert!(
+            !before.iter().any(|c| matches!(c, Command::ToggleBreakpoint { .. })),
+            "must never toggle before the row exists: {before:?}"
+        );
+
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(55, "/tmp/main.c", 5),
+        });
+
+        let after: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            after.contains(&Command::ToggleBreakpoint {
+                id: 55,
+                enable: false,
+            }),
+            "expected a toggle-off for the fresh id, got {after:?}"
+        );
+        assert!(
+            !app.restore_pending,
+            "the single outstanding entry resolved, so the session must finalize"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 3.8/3.9: a partial failure (1 of 2 breakpoints) restores the
+    // success, reports the failure, and does NOT auto-drop it from the file
+    // (design decision D8 — the user must explicitly prune).
+    #[test]
+    fn partial_restore_failure_restores_successes_and_reports_the_rest() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-partial");
+        let exe = "/tmp/restore-partial-exe.out";
+        let project_file = crate::state::ProjectFile {
+            schema_version: crate::state::SCHEMA_VERSION,
+            executable: exe.into(),
+            breakpoints: vec![
+                crate::state::BreakpointDTO {
+                    file: "/tmp/ok.c".into(),
+                    line: 10,
+                    enabled: true,
+                    condition: None,
+                },
+                crate::state::BreakpointDTO {
+                    file: "/tmp/deleted.c".into(),
+                    line: 42,
+                    enabled: true,
+                    condition: None,
+                },
+            ],
+            watchpoints: vec![],
+            catchpoints: vec![],
+        };
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store.as_ref().unwrap().save(&project_file).expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(200, "/tmp/ok.c", 10),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointInsertFailed {
+            file: "/tmp/deleted.c".into(),
+            line: 42,
+            message: "No such file or directory.".into(),
+        });
+
+        assert!(!app.restore_pending, "both entries replied — must finalize");
+        assert_eq!(app.state.persistent.breakpoints.len(), 1);
+        assert_eq!(app.state.persistent.breakpoints[0].file, "/tmp/ok.c");
+
+        let report = app.restore_report.as_ref().expect("expected a restore report");
+        assert_eq!(report.len(), 1);
+        assert!(report[0].label.contains("/tmp/deleted.c"));
+        assert_eq!(report[0].message, "No such file or directory.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Design D8: "Keep" must leave the project file untouched — the failed
+    // entry stays available for a retry on the next launch.
+    #[test]
+    fn dismiss_restore_report_leaves_project_file_untouched() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-keep");
+        let exe = "/tmp/restore-keep-exe.out";
+        let project_file = crate::state::ProjectFile {
+            schema_version: crate::state::SCHEMA_VERSION,
+            executable: exe.into(),
+            breakpoints: vec![crate::state::BreakpointDTO {
+                file: "/tmp/deleted.c".into(),
+                line: 42,
+                enabled: true,
+                condition: None,
+            }],
+            watchpoints: vec![],
+            catchpoints: vec![],
+        };
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store.as_ref().unwrap().save(&project_file).expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointInsertFailed {
+            file: "/tmp/deleted.c".into(),
+            line: 42,
+            message: "No such file or directory.".into(),
+        });
+        assert!(app.restore_report.is_some());
+
+        app.dismiss_restore_report();
+
+        assert!(app.restore_report.is_none());
+        match app.store.as_ref().unwrap().load(exe) {
+            crate::state::LoadOutcome::Loaded(loaded) => {
+                assert_eq!(
+                    loaded.breakpoints.len(),
+                    1,
+                    "Keep must not touch the on-disk file"
+                );
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Design D8: "Remove N failed" explicitly rewrites the file from
+    // current in-memory state, which naturally drops the never-added
+    // failure while keeping the successfully restored entry.
+    #[test]
+    fn remove_failed_restore_entries_rewrites_file_dropping_only_failures() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-remove");
+        let exe = "/tmp/restore-remove-exe.out";
+        let project_file = crate::state::ProjectFile {
+            schema_version: crate::state::SCHEMA_VERSION,
+            executable: exe.into(),
+            breakpoints: vec![
+                crate::state::BreakpointDTO {
+                    file: "/tmp/ok.c".into(),
+                    line: 10,
+                    enabled: true,
+                    condition: None,
+                },
+                crate::state::BreakpointDTO {
+                    file: "/tmp/deleted.c".into(),
+                    line: 42,
+                    enabled: true,
+                    condition: None,
+                },
+            ],
+            watchpoints: vec![],
+            catchpoints: vec![],
+        };
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store.as_ref().unwrap().save(&project_file).expect("seed project file");
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(7, "/tmp/ok.c", 10),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointInsertFailed {
+            file: "/tmp/deleted.c".into(),
+            line: 42,
+            message: "No such file or directory.".into(),
+        });
+
+        app.remove_failed_restore_entries();
+
+        assert!(app.restore_report.is_none());
+        match app.store.as_ref().unwrap().load(exe) {
+            crate::state::LoadOutcome::Loaded(loaded) => {
+                assert_eq!(loaded.breakpoints.len(), 1);
+                assert_eq!(loaded.breakpoints[0].file, "/tmp/ok.c");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // design.md "3 s restore-report deadline ... checked in update()": a
+    // hung/crashed reply must not suppress the save hook forever.
+    #[test]
+    fn finalize_restore_if_done_finalizes_past_deadline_even_with_outstanding_entries() {
+        let (mut app, _cmd_rx) = test_app();
+        app.restore_pending = true;
+        app.restore_session = Some(RestoreSession {
+            outstanding: vec![RestoreEntry::Breakpoint {
+                file: "/tmp/never-replies.c".into(),
+                line: 1,
+                enabled: true,
+            }],
+            failures: vec![],
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+
+        app.finalize_restore_if_done();
+
+        assert!(!app.restore_pending);
+        assert!(app.restore_session.is_none());
+    }
+
+    // Task 3.11/3.12 (spec "Persistence Enable/Disable Setting"): the
+    // topbar toggle is a full opt-out — disabled means no load/restore at
+    // all, even when a project file exists.
+    #[test]
+    fn program_loaded_skips_restore_when_persistence_disabled() {
+        let (mut app, cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-disabled-setting");
+        let exe = "/tmp/restore-setting-off-exe.out";
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.store
+            .as_ref()
+            .unwrap()
+            .save(&seeded_project_file(exe))
+            .expect("seed project file");
+        app.settings.persistence_enabled = false;
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            !sent.iter().any(|c| matches!(c, Command::AddBreakpoint { .. })),
+            "disabled persistence must not replay any entry: {sent:?}"
+        );
+        assert!(!app.restore_pending);
+        assert!(app.restore_session.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 3.12: disabled persistence must also skip the save hook, mirroring
+    // the load-side gate above.
+    #[test]
+    fn apply_state_event_does_not_save_when_persistence_disabled() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("save-disabled-setting");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        app.settings.persistence_enabled = false;
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "/tmp/save-setting-off.out".into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(1, "/tmp/main.c", 5),
+        });
+
+        let store = app.store.as_ref().unwrap();
+        assert!(matches!(
+            store.load("/tmp/save-setting-off.out"),
+            crate::state::LoadOutcome::Absent
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Design D7: a project file whose `schema_version` is newer than this
+    // build understands must be quarantined read-only for the session — the
+    // save hook must not clobber it, and no restore is attempted from it.
+    #[test]
+    fn too_new_schema_quarantines_session_and_skips_both_restore_and_save() {
+        let (mut app, cmd_rx) = test_app();
+        let dir = unique_temp_dir("restore-too-new");
+        let exe = "/tmp/restore-too-new-exe.out";
+        app.store = Some(crate::state::Store { root: dir.clone() });
+        let store = app.store.as_ref().unwrap();
+        let path = store.project_path(exe);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {}\nexecutable = \"{exe}\"\n",
+                crate::state::SCHEMA_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: exe.into(),
+        });
+
+        assert!(app.persistence_quarantined);
+        assert!(!app.restore_pending);
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(!sent.iter().any(|c| matches!(c, Command::AddBreakpoint { .. })));
+
+        // A subsequent mutation must not overwrite the newer file.
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(1, "/tmp/main.c", 5),
+        });
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(&(crate::state::SCHEMA_VERSION + 1).to_string()),
+            "the quarantined file must remain byte-for-byte the newer version's, got: {raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

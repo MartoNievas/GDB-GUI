@@ -9,6 +9,7 @@ pub(crate) mod catchpoints;
 pub(crate) mod commands;
 pub(crate) mod console;
 pub(crate) mod files;
+pub(crate) mod restore_report;
 pub(crate) mod stack;
 pub(crate) mod struct_panel;
 pub(crate) mod thread;
