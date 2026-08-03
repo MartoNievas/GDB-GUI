@@ -70,6 +70,19 @@ pub struct AsmLine {
     pub inst: String,
 }
 
+// ─── Memory (hex dump) ──────────────────────────────────────────────────────
+
+/// One contiguous (or gapped) range from a `-data-read-memory-bytes` reply.
+/// A single reply may hold multiple tuples when the requested range spans
+/// an unreadable gap (R2) — never collapsed into a single struct.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryBlock {
+    pub begin: String,
+    pub offset: String,
+    pub end: String,
+    pub bytes: Vec<u8>,
+}
+
 // ─── Watchpoint ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +279,12 @@ pub struct ErrorState {
     /// error to). Wiped in full on Loaded/Started/Exited, like
     /// `watchpoint_errors`.
     pub catchpoint_errors: std::collections::HashMap<String, String>,
+    /// GDB `^error` message from a failed memory read request (R3/R6).
+    /// Single slot, not keyed — only one memory view exists at a time
+    /// (D4). Displayed in place of the grid; cleared on the next
+    /// successful `MemoryUpdated`. Wiped in full on Loaded/Started/Exited,
+    /// like the other error slots.
+    pub memory_error: Option<String>,
 }
 
 // ─── Top-level state ─────────────────────────────────────────────────────────
@@ -295,6 +314,14 @@ pub struct DebuggerState {
     /// topbar location label keeps meaning "where execution is".
     pub preview_file: Option<String>,
     pub errors: ErrorState,
+    /// Latest `-data-read-memory-bytes` reply, cleared on
+    /// Loaded/Started/Exited (R9) but NOT on `ProgramPaused` — mirrors
+    /// `disasm`.
+    pub memory: Vec<MemoryBlock>,
+    /// The committed address (D4) — the truth `refresh_thread_scoped_views`
+    /// re-sends on every pause. `""` = none committed yet, same convention
+    /// as `struct_expr`.
+    pub memory_addr: String,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -427,6 +454,17 @@ pub enum StateEvent {
         key: String,
         message: String,
     },
+    /// `^done,memory=[...]` parsed unconditionally (D1) — self-describing,
+    /// no token correlation needed for success.
+    MemoryUpdated {
+        blocks: Vec<MemoryBlock>,
+    },
+    /// GDB `^error` for a memory read request, correlated by MI token via
+    /// `pending_memory` (D2, error-only).
+    MemoryRequestFailed {
+        address: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +504,8 @@ impl DebuggerState {
             },
             preview_file: None,
             errors: ErrorState::default(),
+            memory: vec![],
+            memory_addr: String::new(),
         }
     }
 
@@ -493,6 +533,8 @@ impl DebuggerState {
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
                 self.errors.catchpoint_errors.clear();
+                self.memory = vec![];
+                self.errors.memory_error = None;
             }
 
             StateEvent::ProgramStarted => {
@@ -512,6 +554,8 @@ impl DebuggerState {
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
                 self.errors.catchpoint_errors.clear();
+                self.memory = vec![];
+                self.errors.memory_error = None;
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -550,6 +594,8 @@ impl DebuggerState {
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
                 self.errors.catchpoint_errors.clear();
+                self.memory = vec![];
+                self.errors.memory_error = None;
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -670,6 +716,15 @@ impl DebuggerState {
             }
             StateEvent::CatchpointError { key, message } => {
                 self.errors.catchpoint_errors.insert(key, message);
+            }
+
+            StateEvent::MemoryUpdated { blocks } => {
+                self.memory = blocks;
+                self.errors.memory_error = None;
+            }
+            StateEvent::MemoryRequestFailed { address: _, message } => {
+                self.memory = vec![];
+                self.errors.memory_error = Some(message);
             }
         }
     }
@@ -1921,5 +1976,104 @@ mod tests {
         });
 
         assert_eq!(state.persistent.catchpoints.len(), 1);
+    }
+
+    // ─── Memory (hex dump) ──────────────────────────────────────────────────
+
+    fn mem_block(begin: &str, offset: &str, end: &str, bytes: &[u8]) -> MemoryBlock {
+        MemoryBlock {
+            begin: begin.into(),
+            offset: offset.into(),
+            end: end.into(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn memory_updated_replaces_state_memory() {
+        let mut state = DebuggerState::new();
+        state.memory = vec![mem_block("0x1000", "0x0", "0x1010", &[0u8; 16])];
+
+        let fresh = vec![mem_block("0x2000", "0x0", "0x2010", &[0xffu8; 16])];
+        state.apply(StateEvent::MemoryUpdated {
+            blocks: fresh.clone(),
+        });
+
+        assert_eq!(state.memory, fresh);
+    }
+
+    #[test]
+    fn memory_updated_clears_a_prior_memory_error() {
+        let mut state = DebuggerState::new();
+        state.errors.memory_error = Some("stale error".into());
+
+        state.apply(StateEvent::MemoryUpdated {
+            blocks: vec![mem_block("0x1000", "0x0", "0x1010", &[1, 2, 3])],
+        });
+
+        assert_eq!(state.errors.memory_error, None);
+    }
+
+    #[test]
+    fn memory_request_failed_sets_memory_error_and_clears_dump() {
+        let mut state = DebuggerState::new();
+        state.memory = vec![mem_block("0x1000", "0x0", "0x1010", &[0u8; 16])];
+
+        state.apply(StateEvent::MemoryRequestFailed {
+            address: "&&x".into(),
+            message: "No symbol \"x\" in current context.".into(),
+        });
+
+        assert_eq!(
+            state.errors.memory_error,
+            Some("No symbol \"x\" in current context.".into())
+        );
+        assert!(state.memory.is_empty());
+    }
+
+    #[test]
+    fn program_loaded_started_exited_clear_memory_but_not_paused() {
+        let block = mem_block("0x1000", "0x0", "0x1010", &[9, 9]);
+
+        let mut state = DebuggerState::new();
+        state.memory = vec![block.clone()];
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.memory.is_empty());
+
+        let mut state = DebuggerState::new();
+        state.memory = vec![block.clone()];
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.memory.is_empty());
+
+        let mut state = DebuggerState::new();
+        state.memory = vec![block.clone()];
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.memory.is_empty());
+
+        // R9: ProgramPaused must NOT clear the memory dump.
+        let mut state = DebuggerState::new();
+        state.memory = vec![block.clone()];
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0,
+                    function: "main".into(),
+                    file: None,
+                    line: None,
+                },
+                stack: vec![],
+                stop_reason: StopReason::BreakpointHit(1),
+            },
+        });
+        assert_eq!(state.memory, vec![block]);
+    }
+
+    #[test]
+    fn debugger_state_new_has_empty_memory_addr() {
+        let state = DebuggerState::new();
+        assert_eq!(state.memory_addr, "");
     }
 }
