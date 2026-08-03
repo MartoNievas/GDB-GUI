@@ -63,6 +63,12 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         Command::Evaluate(expr) => format!("-data-evaluate-expression {}", quote_mi(expr)),
 
+        Command::RequestMemory { address, count } => format!(
+            "-data-read-memory-bytes {} {}",
+            quote_mi(address),
+            clamp_memory_count(*count)
+        ),
+
         Command::RequestGlobalNames => "-symbol-info-variables".into(),
         Command::EvaluateGlobal(name) => format!("-data-evaluate-expression {name}"),
 
@@ -125,6 +131,13 @@ pub fn quote_mi(arg: &str) -> String {
 /// get the same guard.
 pub fn strip_mi_newlines(s: &str) -> String {
     s.chars().filter(|&c| c != '\n' && c != '\r').collect()
+}
+
+/// Clamps a requested memory byte count to `[1, 4096]` (D7). Applied inside
+/// `command_to_mi` — the writer is the only path to GDB's stdin, so clamping
+/// here is unbypassable by any future caller, mirroring `strip_mi_newlines`.
+pub fn clamp_memory_count(n: u32) -> u32 {
+    n.clamp(1, 4096)
 }
 
 /// Builds a `-gdb-set` command writing `value` to `target`. RAW and
@@ -908,6 +921,103 @@ mod tests {
             args: vec!["std::runtime_error".to_string()],
         });
         assert_eq!(mi, "-catch-throw -r \"std::runtime_error\"");
+    }
+
+    // ─── Memory (D7: unbypassable clamp) ─────────────────────────────────────
+
+    #[test]
+    fn clamp_memory_count_passes_through_in_range_value() {
+        assert_eq!(clamp_memory_count(256), 256);
+    }
+
+    #[test]
+    fn clamp_memory_count_clamps_zero_up_to_one() {
+        assert_eq!(clamp_memory_count(0), 1);
+    }
+
+    #[test]
+    fn clamp_memory_count_passes_through_max_boundary() {
+        assert_eq!(clamp_memory_count(4096), 4096);
+    }
+
+    #[test]
+    fn clamp_memory_count_clamps_above_max_down_to_max() {
+        assert_eq!(clamp_memory_count(4097), 4096);
+        assert_eq!(clamp_memory_count(8000), 4096);
+    }
+
+    #[test]
+    fn request_memory_command_maps_to_data_read_memory_bytes() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: "$sp".into(),
+            count: 256,
+        });
+        assert_eq!(mi, "-data-read-memory-bytes \"$sp\" 256");
+    }
+
+    #[test]
+    fn request_memory_command_clamps_count_above_max() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: "0x1000".into(),
+            count: 8000,
+        });
+        assert_eq!(mi, "-data-read-memory-bytes \"0x1000\" 4096");
+    }
+
+    // SECURITY (threat-matrix: MI argument composition — `address` is
+    // arbitrary user text interpolated into a subprocess stdin line). One
+    // test per adversarial character class, mirroring build_break_watch's
+    // own injection tests.
+    #[test]
+    fn request_memory_command_strips_embedded_newline() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: "$sp\n-exec-continue".into(),
+            count: 256,
+        });
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-data-read-memory-bytes \"$sp-exec-continue\" 256");
+    }
+
+    #[test]
+    fn request_memory_command_strips_embedded_carriage_return() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: "$sp\r-exec-continue".into(),
+            count: 256,
+        });
+        assert!(!mi.contains('\r'));
+        assert_eq!(mi, "-data-read-memory-bytes \"$sp-exec-continue\" 256");
+    }
+
+    #[test]
+    fn request_memory_command_escapes_embedded_quote() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: r#"say("hi")"#.into(),
+            count: 256,
+        });
+        assert_eq!(mi, "-data-read-memory-bytes \"say(\\\"hi\\\")\" 256");
+    }
+
+    #[test]
+    fn request_memory_command_escapes_embedded_backslash() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: r"C:\path".into(),
+            count: 256,
+        });
+        assert_eq!(mi, "-data-read-memory-bytes \"C:\\\\path\" 256");
+    }
+
+    // A full second MI command riding an embedded newline must collapse
+    // into one inert quoted line, never split — the canonical injection
+    // payload.
+    #[test]
+    fn request_memory_command_second_mi_command_payload_stays_a_single_line() {
+        let mi = command_to_mi(&Command::RequestMemory {
+            address: "$sp\n-exec-run".into(),
+            count: 256,
+        });
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-data-read-memory-bytes \"$sp-exec-run\" 256");
     }
 
     #[test]

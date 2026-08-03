@@ -94,6 +94,15 @@ pub enum Command {
     RequestRegisters,
     RequestDisasm,
     RequestThreads,
+    /// Reads target memory via `-data-read-memory-bytes <addr> <count>`.
+    /// The reply (`^done,memory=[...]`) is self-describing and parsed
+    /// unconditionally, keyed on `memory=[` — no `pending_*` token needed
+    /// for success. Only `^error` is correlated back to `address` via
+    /// `pending_memory` (mirrors `AddWatchpoint`'s D2 error-only pattern).
+    RequestMemory {
+        address: String,
+        count: u32,
+    },
     /// Switches GDB's current thread via `-thread-select <id>`. Clickable
     /// only from a paused thread-panel row (gated UI-side).
     SelectThread(u32),
@@ -291,6 +300,36 @@ mod tests {
             }
         );
         assert_ne!(enable, disable);
+    }
+
+    #[test]
+    fn request_memory_carries_address_and_count() {
+        let a = Command::RequestMemory {
+            address: "$sp".into(),
+            count: 256,
+        };
+        let b = Command::RequestMemory {
+            address: "$sp".into(),
+            count: 256,
+        };
+        let different_address = Command::RequestMemory {
+            address: "0x1000".into(),
+            count: 256,
+        };
+        let different_count = Command::RequestMemory {
+            address: "$sp".into(),
+            count: 16,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, different_address);
+        assert_ne!(a, different_count);
+        assert_ne!(
+            Command::RequestMemory {
+                address: "$sp".into(),
+                count: 256,
+            },
+            Command::RequestStack
+        );
     }
 
     // D2 regression guard: AddCatchpoint/RemoveCatchpoint/ToggleCatchpoint
