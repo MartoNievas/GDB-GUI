@@ -32,6 +32,11 @@ structured, panel-based UI instead of the raw command line.
   read-only.
 - **Disassembly** — instructions around the program counter, with the current
   instruction marked.
+- **Memory view (hex dump)** — enter an address expression (e.g. `$sp`,
+  `0x1000`, `&my_array`) in the Memory tab to read 256 bytes via
+  `-data-read-memory-bytes` and view them as a 16-bytes/row offset|hex|ASCII
+  grid. Read-only; auto-refetches the same address at every subsequent
+  pause. If GDB rejects the address, its error message replaces the grid.
 - **Integrated GDB console** — type raw GDB/MI commands and see GDB's output.
 - **Watchpoints** — click in the Watchpoints panel to add read/write/access watchpoints
   for any expression; watchpoints trigger and display old→new values in a banner when
@@ -188,7 +193,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui)
 | `panels/topbar.rs`              | Execution buttons and the status bar.            |
 | `panels/breakpoints.rs`         | Breakpoint list, conditions and delete buttons.  |
 | `panels/stack.rs`               | Call stack / backtrace.                          |
-| `panels/watch.rs`               | Watch / Registers / Data tabs.                   |
+| `panels/watch.rs`               | Watch / Registers / Disasm / Memory tabs.        |
 | `panels/struct_panel.rs`        | Expansion of struct-typed values.                |
 | `panels/thread.rs`              | Thread list and switching.                       |
 | `panels/files.rs`               | Source file selection.                           |

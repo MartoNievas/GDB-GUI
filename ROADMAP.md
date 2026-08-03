@@ -87,12 +87,19 @@ being a seriously usable debugger, ordered roughly by priority.
   continue/fall-through semantics verified by manual smoke test against live GDB.
   Strict TDD: 369/369 tests passing (2 new characterization tests added).
   See `openspec/changes/archive/2026-07-30-{extract-run-loop-functions,pending-registry}/`.
-
-## Missing debugging functionality
-
-- **No memory view (hex dump)** — no command wraps
-  `-data-read-memory-bytes`; raw memory cannot be inspected outside of
-  named variables.
+- **Memory view (hex dump, implemented)** — New `Command::RequestMemory`
+  wraps `-data-read-memory-bytes` (`src/gdb/writer.rs`, with an unbypassable
+  `clamp_memory_count` capping requests at 4096 bytes). The self-describing
+  `memory=[...]` reply is parsed unconditionally in `src/gdb/parser.rs`
+  (`parse_memory`/`decode_hex`, best-effort hex decode that never panics on
+  malformed input) into `Vec<MemoryBlock>` on `DebuggerState`; only `^error`
+  is correlated back to the requested address via `pending.memory` in
+  `src/gdb/process.rs`. New `Memory` tab in `src/ui/panels/watch.rs`
+  (address input, 16-bytes/row offset|hex|ASCII grid via pure
+  `format_hex_row`) auto-refetches on every pause through the existing
+  `refresh_thread_scoped_views` cascade. The `Data` tab was relabeled
+  `Disasm` in the same change to avoid ambiguity with the new tab. Strict
+  TDD: 408/408 tests passing (39 new).
 - **No attach to a running process** — only `LoadExecutable(String)` via
   `-file-exec-and-symbols`; no `-target-attach <pid>`.
 - **No remote debugging or core dumps** — no `target remote`, no core file
