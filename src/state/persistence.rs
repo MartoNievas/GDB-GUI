@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::debugger_state::{
-    Breakpoint, Catchpoint, CatchpointKind, PersistentState, Watchpoint, WatchpointKind,
+    Breakpoint, Catchpoint, CatchpointKind, PersistentState, StateEvent, Watchpoint, WatchpointKind,
 };
 
 /// Current on-disk schema. Bumped only on a breaking DTO shape change; a
@@ -134,6 +134,32 @@ fn fnv1a64(bytes: &str) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// Whether `event`, once applied, changes the persisted shape of
+/// breakpoints/watchpoints/catchpoints (spec: "Save Timing and
+/// Atomicity" — save on every add/remove/toggle/condition-change). `App`'s
+/// save hook (design decision D6) calls `Store::save()` only when this
+/// returns `true` (and `restore_pending` is `false`), so read-only refresh
+/// events (locals, stack, registers, ...) and error-only events (whose
+/// message lives on a transient field never serialized into the DTO) never
+/// trigger a disk write. `BreakpointAdded` alone covers both a fresh insert
+/// and a condition change: GDB's `=breakpoint-modified` notify re-emits the
+/// same event (see `debugger_state.rs`'s `apply` doc comments), so there is
+/// no separate "condition changed" variant to list here.
+pub fn mutates_tracepoints(event: &StateEvent) -> bool {
+    matches!(
+        event,
+        StateEvent::BreakpointAdded { .. }
+            | StateEvent::BreakpointRemoved { .. }
+            | StateEvent::BreakpointToggled { .. }
+            | StateEvent::WatchpointAdded { .. }
+            | StateEvent::WatchpointRemoved { .. }
+            | StateEvent::WatchpointToggled { .. }
+            | StateEvent::CatchpointAdded { .. }
+            | StateEvent::CatchpointRemoved { .. }
+            | StateEvent::CatchpointToggled { .. }
+    )
 }
 
 /// Owns the root directory persisted project files live under (design
@@ -647,6 +673,98 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── mutates_tracepoints (save-hook gate) ──────────────────────────────
+
+    // Spec "Save Timing and Atomicity": the file must be rewritten after
+    // every mutating tracepoint event (add/remove/toggle/condition-change).
+    // BreakpointAdded is the merge point for both a fresh insert and a
+    // condition change (the `=breakpoint-modified` notify re-emits the same
+    // event — see `debugger_state.rs`'s `apply` doc comments), so it alone
+    // covers "add" and "condition change" for breakpoints.
+    #[test]
+    fn mutates_tracepoints_true_for_breakpoint_lifecycle_events() {
+        assert!(mutates_tracepoints(&StateEvent::BreakpointAdded {
+            breakpoint: test_bp(),
+        }));
+        assert!(mutates_tracepoints(&StateEvent::BreakpointRemoved { id: 1 }));
+        assert!(mutates_tracepoints(&StateEvent::BreakpointToggled {
+            id: 1,
+            enabled: false,
+        }));
+    }
+
+    #[test]
+    fn mutates_tracepoints_true_for_watchpoint_and_catchpoint_lifecycle_events() {
+        assert!(mutates_tracepoints(&StateEvent::WatchpointAdded {
+            watchpoint: test_wp(),
+        }));
+        assert!(mutates_tracepoints(&StateEvent::WatchpointRemoved { id: 1 }));
+        assert!(mutates_tracepoints(&StateEvent::WatchpointToggled {
+            id: 1,
+            enabled: false,
+        }));
+        assert!(mutates_tracepoints(&StateEvent::CatchpointAdded {
+            catchpoint: test_cp(),
+        }));
+        assert!(mutates_tracepoints(&StateEvent::CatchpointRemoved { id: 1 }));
+        assert!(mutates_tracepoints(&StateEvent::CatchpointToggled {
+            id: 1,
+            enabled: false,
+        }));
+    }
+
+    // Triangulation: a read-only refresh event (no persisted shape changes)
+    // and an error-only event (message attached to a transient field never
+    // serialized into the DTO) must both leave the save hook untriggered —
+    // otherwise every locals refresh would hit disk.
+    #[test]
+    fn mutates_tracepoints_false_for_non_mutating_events() {
+        assert!(!mutates_tracepoints(&StateEvent::LocalsUpdated { vars: vec![] }));
+        assert!(!mutates_tracepoints(&StateEvent::BreakpointConditionError {
+            id: 1,
+            message: "err".into(),
+        }));
+        assert!(!mutates_tracepoints(&StateEvent::WatchpointError {
+            expr: "x".into(),
+            message: "err".into(),
+        }));
+        assert!(!mutates_tracepoints(&StateEvent::BreakpointInsertFailed {
+            file: "a.c".into(),
+            line: 1,
+            message: "err".into(),
+        }));
+    }
+
+    fn test_bp() -> Breakpoint {
+        Breakpoint {
+            id: 1,
+            file: "a.c".into(),
+            line: 1,
+            requested_line: None,
+            enabled: true,
+            condition: None,
+            condition_error: None,
+        }
+    }
+
+    fn test_wp() -> Watchpoint {
+        Watchpoint {
+            id: 1,
+            expr: "x".into(),
+            kind: WatchpointKind::Write,
+            enabled: true,
+        }
+    }
+
+    fn test_cp() -> Catchpoint {
+        Catchpoint {
+            id: 1,
+            kind: CatchpointKind::Fork,
+            args: vec![],
+            enabled: true,
+        }
     }
 
     // `from_env` is a thin wrapper over the `directories` crate; the

@@ -30,6 +30,8 @@ pub use debugger_state::{
     WatchpointKind,
 };
 
+pub(crate) use debugger_state::same_file;
+
 pub use persistence::{
     BreakpointDTO,
     CatchpointDTO,
@@ -38,6 +40,7 @@ pub use persistence::{
     SCHEMA_VERSION,
     Store,
     WatchpointDTO,
+    mutates_tracepoints,
 };
 
 pub use settings::{Settings, SettingsStore, persistence_enabled};

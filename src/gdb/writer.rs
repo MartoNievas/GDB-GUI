@@ -158,7 +158,17 @@ pub fn build_gdb_set(target: &EditTarget, value: &str) -> String {
 
 /// Builds `-break-insert [-c <quoted>] file:line`. `condition` is applied
 /// only to the `-c` argument, never to `file:line`.
+///
+/// SECURITY (threat-matrix: "CLI-in-MI nesting" — restored/persisted `file`
+/// values are a new untrusted input crossing into GDB's stdin): unlike
+/// `condition`, `file` is raw-interpolated into `file:line` rather than
+/// quoted (GDB's `-break-insert` reads CLI-style text, so wrapping it in
+/// `quote_mi`'s escaping would embed literal `\"`/`\\` into the location
+/// GDB tries to resolve). `strip_mi_newlines` is still applied — the same
+/// unbypassable injection guard `build_gdb_set` uses for its own raw,
+/// unquoted argument.
 pub fn build_break_insert(file: &str, line: u32, condition: Option<&str>) -> String {
+    let file = strip_mi_newlines(file);
     match condition {
         Some(cond) => format!("-break-insert -c {} {file}:{line}", quote_mi(cond)),
         None => format!("-break-insert {file}:{line}"),
@@ -418,6 +428,48 @@ mod tests {
     #[test]
     fn break_condition_builder_clears_with_no_trailing_arg() {
         assert_eq!(build_break_condition(3, ""), "-break-condition 3");
+    }
+
+    // SECURITY (threat-matrix: "CLI-in-MI nesting", persistence-serialization
+    // design): `file` reaches `-break-insert` raw-interpolated (never through
+    // `quote_mi`, unlike `condition`), so a persisted/restored `file` value
+    // containing an embedded newline could smuggle a second, independent MI
+    // command into GDB's stdin. One test per adversarial character class,
+    // mirroring `build_break_watch`'s own injection tests.
+    #[test]
+    fn build_break_insert_strips_embedded_newline_in_file() {
+        let mi = build_break_insert("main.c\n-exec-continue", 10, None);
+        assert!(
+            !mi.contains('\n'),
+            "MI command must not contain a raw newline: {mi:?}"
+        );
+        assert_eq!(mi, "-break-insert main.c-exec-continue:10");
+    }
+
+    #[test]
+    fn build_break_insert_strips_embedded_carriage_return_in_file() {
+        let mi = build_break_insert("main.c\r-exec-continue", 10, None);
+        assert!(!mi.contains('\r'));
+        assert_eq!(mi, "-break-insert main.c-exec-continue:10");
+    }
+
+    #[test]
+    fn build_break_insert_second_mi_command_payload_in_file_stays_a_single_line() {
+        let mi = build_break_insert("main.c\n-exec-run", 10, Some("x > 5"));
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(mi, "-break-insert -c \"x > 5\" main.c-exec-run:10");
+    }
+
+    // Verify-only (no production change needed here): `condition` already
+    // goes through `quote_mi`, which itself calls `strip_mi_newlines` —
+    // confirms the threat-matrix row for this field at the
+    // `build_break_insert` call site, not just at `quote_mi`'s own unit
+    // level.
+    #[test]
+    fn build_break_insert_condition_already_sanitized_via_quote_mi() {
+        let mi = build_break_insert("main.c", 10, Some("x == 1\n-exec-continue"));
+        assert!(!mi.contains('\n'));
+        assert_eq!(mi, "-break-insert -c \"x == 1-exec-continue\" main.c:10");
     }
 
     // ─── Interrupt dispatch (Option A: SIGINT, not an MI command) ──────────────

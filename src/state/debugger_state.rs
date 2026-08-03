@@ -92,6 +92,22 @@ pub enum WatchpointKind {
     Access,
 }
 
+impl WatchpointKind {
+    /// Inverse of `persistence.rs`'s wire-literal encoding (`"write"` |
+    /// `"read"` | `"access"`) — used by restore replay (Phase 3) to rebuild
+    /// a `Command::AddWatchpoint` from a persisted `WatchpointDTO`. `None`
+    /// for an unrecognized literal (e.g. a project file from a future
+    /// schema version) rather than guessing a default kind.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "write" => Some(WatchpointKind::Write),
+            "read" => Some(WatchpointKind::Read),
+            "access" => Some(WatchpointKind::Access),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Watchpoint {
     pub id: u32,
@@ -139,6 +155,29 @@ impl std::fmt::Display for CatchpointKind {
             CatchpointKind::Catch => "catch",
         };
         write!(f, "{s}")
+    }
+}
+
+impl CatchpointKind {
+    /// Inverse of `Display` (design.md File Changes: `CatchpointKind::from_wire`)
+    /// — used by restore replay (Phase 3) to rebuild a `Command::AddCatchpoint`
+    /// from a persisted `CatchpointDTO`'s `kind` wire literal. `None` for an
+    /// unrecognized literal (e.g. a project file from a future schema
+    /// version listing a kind this build doesn't know) rather than guessing.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "fork" => Some(CatchpointKind::Fork),
+            "vfork" => Some(CatchpointKind::Vfork),
+            "exec" => Some(CatchpointKind::Exec),
+            "signal" => Some(CatchpointKind::Signal),
+            "load" => Some(CatchpointKind::Load),
+            "unload" => Some(CatchpointKind::Unload),
+            "syscall" => Some(CatchpointKind::Syscall),
+            "throw" => Some(CatchpointKind::Throw),
+            "rethrow" => Some(CatchpointKind::Rethrow),
+            "catch" => Some(CatchpointKind::Catch),
+            _ => None,
+        }
     }
 }
 
@@ -250,11 +289,14 @@ pub enum ProgramState {
 pub struct PersistentState {
     pub executable: Option<String>,
     pub breakpoints: Vec<Breakpoint>,
-    /// Expression watchpoints. In-memory only for the session's lifetime —
-    /// never persisted to disk (spec: "No Persistence Across Sessions").
+    /// Expression watchpoints. Persisted to the per-executable project file
+    /// and restored via Command replay on the next launch (spec:
+    /// "Watchpoint Cross-Session Persistence" — supersedes the earlier "No
+    /// Persistence Across Sessions" decision).
     pub watchpoints: Vec<Watchpoint>,
-    /// Event catchpoints (fork/vfork/exec/signal/load/unload). In-memory
-    /// only for the session's lifetime, same scope as `watchpoints`.
+    /// Event catchpoints (fork/vfork/exec/signal/load/unload/syscall/
+    /// throw/rethrow/catch). Persisted and restored the same way as
+    /// `watchpoints` (spec: "Catchpoint Cross-Session Persistence").
     pub catchpoints: Vec<Catchpoint>,
 }
 
@@ -273,6 +315,13 @@ pub struct ErrorState {
     /// error to). Cleared on that expression's next successful add. Wiped in
     /// full on Loaded/Started/Exited, like `edit_errors`.
     pub watchpoint_errors: std::collections::HashMap<String, String>,
+    /// GDB `^error` message from a failed `-break-insert` attempt, keyed by
+    /// `"{file}:{line}"` (design decision pattern — a rejected insert
+    /// returns no GDB id, so there is no row to attach an error to,
+    /// mirroring `watchpoint_errors`). Cleared on that location's next
+    /// successful add. Wiped in full on Loaded/Started/Exited, like the
+    /// other error slots.
+    pub breakpoint_insert_errors: std::collections::HashMap<String, String>,
     /// GDB `^error` message from a failed catchpoint creation/toggle/delete,
     /// keyed by `"{kind}:{args joined}"` (design decision D1 — a rejected
     /// catchpoint attempt returns no GDB id, so there is no row to attach an
@@ -353,6 +402,19 @@ pub enum StateEvent {
     },
     BreakpointConditionError {
         id: u32,
+        message: String,
+    },
+    /// `-break-insert` acked with `^error` — the requested breakpoint was
+    /// never created, so (unlike `BreakpointConditionError`) there is no
+    /// GDB id to attach the error to. Correlated by MI token in
+    /// `process.rs`'s `pending.insert` map back to the requested
+    /// `file`/`line` (mirrors `WatchpointError`/`CatchpointError`, which
+    /// key by expression/kind+args for the same no-id reason). Relevant
+    /// once restore (Phase 3) replays a persisted entry whose source line
+    /// no longer resolves (e.g. a deleted/edited source file).
+    BreakpointInsertFailed {
+        file: String,
+        line: u32,
         message: String,
     },
     LocalsUpdated {
@@ -532,6 +594,7 @@ impl DebuggerState {
                 self.preview_file = None;
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
+                self.errors.breakpoint_insert_errors.clear();
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
@@ -553,6 +616,7 @@ impl DebuggerState {
                 self.current_thread = None;
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
+                self.errors.breakpoint_insert_errors.clear();
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
@@ -593,6 +657,7 @@ impl DebuggerState {
                 self.current_thread = None;
                 self.errors.edit_errors.clear();
                 self.errors.watchpoint_errors.clear();
+                self.errors.breakpoint_insert_errors.clear();
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
@@ -625,6 +690,12 @@ impl DebuggerState {
                 if let Some(bp) = self.persistent.breakpoints.iter_mut().find(|b| b.id == id) {
                     bp.condition_error = Some(message);
                 }
+            }
+
+            StateEvent::BreakpointInsertFailed { file, line, message } => {
+                self.errors
+                    .breakpoint_insert_errors
+                    .insert(format!("{file}:{line}"), message);
             }
 
             StateEvent::LocalsUpdated { vars } => self.locals = vars,
@@ -790,6 +861,15 @@ impl DebuggerState {
         self.errors.edit_errors.get(target).map(|s| s.as_str())
     }
 
+    /// GDB's `^error` message from a failed `-break-insert` attempt at
+    /// `file:line`, if any. Mirrors `watchpoint_error`/`catchpoint_error`.
+    pub fn breakpoint_insert_error(&self, file: &str, line: u32) -> Option<&str> {
+        self.errors
+            .breakpoint_insert_errors
+            .get(&format!("{file}:{line}"))
+            .map(|s| s.as_str())
+    }
+
     /// Whether a watchpoint already exists for `expr` (exact string match).
     /// Used to reject a duplicate creation attempt client-side, with no MI
     /// round trip (spec: "Duplicate Expression Prevention").
@@ -848,7 +928,7 @@ impl DebuggerState {
 /// two paths to point to the same file if they are equal or if the shorter
 /// one is a component-wise suffix of the longer one. Comparing by components
 /// avoids false positives like `foobar.c` vs `bar.c`.
-fn same_file(a: &str, b: &str) -> bool {
+pub(crate) fn same_file(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
@@ -1134,6 +1214,59 @@ mod tests {
             .expect("breakpoint 1 must still exist");
         assert_eq!(bp.condition, Some("count > 3".to_string()));
         assert_eq!(bp.condition_error, None);
+    }
+
+    // Phase 2 (persistence-serialization): unlike `BreakpointConditionError`
+    // (which attaches to an existing row by id), a failed `-break-insert`
+    // never got an id — there is no row to attach the error to. Mirrors
+    // `WatchpointError`/`CatchpointError`, which key by
+    // expression/kind+args for the same reason; here the key is
+    // `"{file}:{line}"`, the location the restore/add attempt was made for.
+    #[test]
+    fn breakpoint_insert_failed_sets_error_keyed_by_file_and_line() {
+        let mut state = DebuggerState::new();
+
+        state.apply(StateEvent::BreakpointInsertFailed {
+            file: "/tmp/deleted.c".into(),
+            line: 42,
+            message: "No such file or directory.".into(),
+        });
+
+        assert_eq!(
+            state.breakpoint_insert_error("/tmp/deleted.c", 42),
+            Some("No such file or directory.")
+        );
+        assert_eq!(state.breakpoint_insert_error("/tmp/deleted.c", 43), None);
+        assert_eq!(state.breakpoint_insert_error("/tmp/other.c", 42), None);
+    }
+
+    #[test]
+    fn program_loaded_started_exited_wipe_breakpoint_insert_errors() {
+        let mut state = DebuggerState::new();
+        state
+            .errors
+            .breakpoint_insert_errors
+            .insert("a.c:1".into(), "stale error".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert!(state.errors.breakpoint_insert_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .errors
+            .breakpoint_insert_errors
+            .insert("a.c:1".into(), "stale error".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert!(state.errors.breakpoint_insert_errors.is_empty());
+
+        let mut state = DebuggerState::new();
+        state
+            .errors
+            .breakpoint_insert_errors
+            .insert("a.c:1".into(), "stale error".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert!(state.errors.breakpoint_insert_errors.is_empty());
     }
 
     #[test]
@@ -2075,5 +2208,57 @@ mod tests {
     fn debugger_state_new_has_empty_memory_addr() {
         let state = DebuggerState::new();
         assert_eq!(state.memory_addr, "");
+    }
+
+    // ── Phase 3 (persistence-serialization): DTO -> domain kind parsing ─────
+    //
+    // `persistence.rs`'s `WatchpointDTO`/`CatchpointDTO` store `kind` as the
+    // wire literal (`Display`'s output). Replay (app.rs) needs the inverse
+    // to rebuild a `Command::Add{Watchpoint,Catchpoint}` — mirrors the
+    // existing `Display` impl exactly so `to_string()` -> `from_wire()`
+    // round-trips for every variant.
+
+    #[test]
+    fn watchpoint_kind_from_wire_parses_all_three_variants() {
+        assert_eq!(
+            WatchpointKind::from_wire("write"),
+            Some(WatchpointKind::Write)
+        );
+        assert_eq!(
+            WatchpointKind::from_wire("read"),
+            Some(WatchpointKind::Read)
+        );
+        assert_eq!(
+            WatchpointKind::from_wire("access"),
+            Some(WatchpointKind::Access)
+        );
+    }
+
+    #[test]
+    fn watchpoint_kind_from_wire_rejects_unknown_literal() {
+        assert_eq!(WatchpointKind::from_wire("bogus"), None);
+    }
+
+    #[test]
+    fn catchpoint_kind_from_wire_round_trips_every_display_variant() {
+        for kind in [
+            CatchpointKind::Fork,
+            CatchpointKind::Vfork,
+            CatchpointKind::Exec,
+            CatchpointKind::Signal,
+            CatchpointKind::Load,
+            CatchpointKind::Unload,
+            CatchpointKind::Syscall,
+            CatchpointKind::Throw,
+            CatchpointKind::Rethrow,
+            CatchpointKind::Catch,
+        ] {
+            assert_eq!(CatchpointKind::from_wire(&kind.to_string()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn catchpoint_kind_from_wire_rejects_unknown_literal() {
+        assert_eq!(CatchpointKind::from_wire("bogus"), None);
     }
 }
