@@ -18,6 +18,9 @@ strip = true
 egui = "0.33.3"
 eframe = "0.33.3"
 bitflags = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

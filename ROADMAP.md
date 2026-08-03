@@ -104,18 +104,36 @@ being a seriously usable debugger, ordered roughly by priority.
   `-file-exec-and-symbols`; no `-target-attach <pid>`.
 - **No remote debugging or core dumps** — no `target remote`, no core file
   loading.
+- **Session persistence (implemented)** — Breakpoints, watchpoints, and
+  catchpoints now survive across restarts. `src/state/persistence.rs` owns a
+  pure (no `egui`, no GDB) TOML DTO, a per-executable project file at
+  `~/.config/gdb-gui/projects/<fnv1a64-hex>.toml` (self-implemented FNV-1a
+  64-bit hash of the canonicalized absolute executable path — not SHA-256;
+  std's `DefaultHasher`/SipHash was rejected because its output is
+  explicitly unstable across Rust releases), and atomic save (tmp file +
+  `fsync` + rename, surviving a crash mid-write). `src/ui/app.rs`'s
+  `apply_state_event` saves after every mutating tracepoint event
+  (`mutates_tracepoints`) and, on `StateEvent::ProgramLoaded`, loads the
+  project file and replays every entry as a fresh `Command::Add{Breakpoint,
+  Watchpoint,Catchpoint}` so GDB assigns new ids — no id ever round-trips
+  through the file. A disabled entry is added, then toggled off only after
+  its own `*Added` event confirms the fresh id (never before). Partial
+  restore failures (e.g. a deleted source file) are collected into a
+  `RestoreSession` and reported via a modal (`src/ui/panels/restore_report.rs`)
+  offering `Keep` (leave the file untouched — retry next launch) or
+  `Remove N failed` (explicitly rewrite the file, dropping only the
+  failures); failures are never auto-dropped. An unrecognized/newer
+  `schema_version` quarantines saves for the session (never clobbers a
+  newer file); unparsable TOML warns and starts clean. A topbar "Persist"
+  checkbox (backed by `src/state/settings.rs`'s `Settings`/`SettingsStore`,
+  plus a `GDB_GUI_NO_PERSIST` environment override) is a full opt-out for
+  both saving and loading/restoring. Strict TDD: 468/468 tests passing (60
+  new across Phases 1-3).
 
 ## Fragility already acknowledged by the project
 
 - Breakpoint conditions are only validated **after** the round-trip to GDB;
   there is no local validation of the C expression before sending it.
-
-## Persistence
-
-- `PersistentState` (`src/state/debugger_state.rs`) only holds `executable`
-  and `breakpoints` in process memory — nothing is serialized to disk.
-  Closing the app loses breakpoints and session state; there is no
-  "project" or config file concept.
 
 ## Already solid
 

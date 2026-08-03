@@ -35,6 +35,20 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             app.send(Command::Restart);
         }
 
+        ui.add(egui::Separator::default().vertical());
+
+        // Phase 3 task 3.11 (spec "Persistence Enable/Disable Setting"):
+        // controls both the save hook and the load/restore hook — a full
+        // opt-out, not just a save-side toggle.
+        let mut persistence_enabled = app.settings.persistence_enabled;
+        if ui
+            .checkbox(&mut persistence_enabled, m("Persist", 12.0, TXT_MUTED))
+            .on_hover_text("Save/restore breakpoints, watchpoints, and catchpoints across sessions")
+            .changed()
+        {
+            app.set_persistence_enabled(persistence_enabled);
+        }
+
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
             let color = if app.state.is_running() {

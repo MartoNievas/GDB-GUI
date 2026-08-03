@@ -171,6 +171,50 @@ fn correlate_pending_edit(
     }
 }
 
+/// Value type for `PendingRegistry.insert` — the `file`/`line` a pending
+/// `Command::AddBreakpoint` was requested for, so a later `^error` can be
+/// correlated back to the exact location the row/error belongs to (mirrors
+/// `correlate_pending_watch`'s `String` key, but insert needs two fields
+/// since there is no single string identity like an expression).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BreakpointInsertRequest {
+    pub file: String,
+    pub line: u32,
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::AddBreakpoint`. If the token matches an entry in
+/// `pending_insert`, removes it (cleanup on both success and failure,
+/// mirroring `correlate_pending_watch`). `^error` returns
+/// `BreakpointInsertFailed{file,line,message}` for the caller to emit —
+/// there is no GDB id to attach the error to (the insert never succeeded).
+/// `^done` is cleanup-only: the self-describing `^done,bkpt={...}` reply
+/// falls through to the normal `parse_line`/`parse_result` path, which turns
+/// it into `BreakpointAdded`.
+fn correlate_pending_insert(
+    line: &str,
+    pending_insert: &mut HashMap<u32, BreakpointInsertRequest>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let request = pending_insert.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_insert.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::BreakpointInsertFailed {
+            file: request.file,
+            line: request.line,
+            message: msg,
+        })
+    } else if rest.starts_with("^done") {
+        pending_insert.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
 /// Outcome of a resolved `Command::ProbeMainSource` reply, correlated by MI
 /// token in `correlate_pending_probe`. Never crosses into a `StateEvent`
 /// that reaches the UI as its own row — `run_loop` translates `Resolved`
@@ -380,7 +424,7 @@ fn spawn_reader_thread(
     (handle, line_rx)
 }
 
-/// Groups the 7 in-flight MI-token correlation maps used by `handle_commands`
+/// Groups the 8 in-flight MI-token correlation maps used by `handle_commands`
 /// and `handle_gdb_output` into one cohesive concept. Fields are deliberately
 /// **distinctly typed** — never a single `HashMap<u32, PendingKind>` — because
 /// type-level mutual isolation between correlation domains is a documented
@@ -442,6 +486,15 @@ struct PendingRegistry {
     /// here (success is self-describing and flows through the normal
     /// `parse_line` path into `MemoryUpdated`).
     memory: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) -> `BreakpointInsertRequest`
+    /// (file/line) of the `Command::AddBreakpoint` pending a response.
+    /// Correlated by token, not FIFO, like the other pending maps: only
+    /// `^error` needs correlation here (success is self-describing and
+    /// flows through the normal `parse_line` path into `BreakpointAdded`).
+    /// Distinct from `cond` (which tracks `-break-condition` on an
+    /// *existing* id, not a new insert).
+    insert: HashMap<u32, BreakpointInsertRequest>,
 }
 
 /// Drains `cmd_rx` fully, dispatching each `DebuggerCommand` to GDB and
@@ -489,6 +542,16 @@ fn handle_commands<W: Write>(
 
         if let DebuggerCommand::SetBreakpointCondition { id, .. } = &cmd {
             pending.cond.insert(token, *id);
+        }
+
+        if let DebuggerCommand::AddBreakpoint { file, line, .. } = &cmd {
+            pending.insert.insert(
+                token,
+                BreakpointInsertRequest {
+                    file: file.clone(),
+                    line: *line,
+                },
+            );
         }
 
         if let DebuggerCommand::Evaluate(expr) = &cmd {
@@ -549,10 +612,10 @@ fn handle_commands<W: Write>(
     Ok(())
 }
 
-/// Runs the 8 ordered correlation checks against a single raw MI `line`,
+/// Runs the 9 ordered correlation checks against a single raw MI `line`,
 /// then falls through to `parse_line`. CRITICAL: exact check order is
-/// struct → globals → probe → cond → edit → watch → catch → memory →
-/// parse_line. struct/globals/probe early-return `ControlFlow::Continue(())`
+/// struct → globals → probe → cond → edit → watch → catch → insert →
+/// memory → parse_line. struct/globals/probe early-return `ControlFlow::Continue(())`
 /// on a match (short-circuit: the rest of the checks, including
 /// `parse_line`, are skipped for this line). cond/edit/watch/catch/memory do
 /// NOT early-return on a match: they fall through to the next check and
@@ -650,6 +713,18 @@ fn handle_gdb_output<W: Write>(
     // self-describing `bkpt={catch-type=...}` payload into `CatchpointAdded`
     // (same fn the untokened notify-async path uses — A6).
     if let Some(event) = correlate_pending_catch(line, &mut pending.catch) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Breakpoint-insert correlation: like watch/catch, does not `continue`
+    // on `^error` — the console log still shows it via parse_line below. On
+    // `^done`, the token is cleaned up and the line falls through to
+    // parse_line, which turns the self-describing `bkpt={...}` reply into
+    // `BreakpointAdded` (same path a real, uncorrelated insert already
+    // used).
+    if let Some(event) = correlate_pending_insert(line, &mut pending.insert) {
         if event_tx.send(DebuggerEvent::State(event)).is_err() {
             return ControlFlow::Break(());
         }
@@ -813,6 +888,159 @@ mod tests {
             !pending_cond.contains_key(&9),
             "token must be removed after a matching ^error"
         );
+    }
+
+    // Phase 2 (persistence-serialization): mirrors
+    // `pending_cond_insert_and_removal_on_matching_reply` /
+    // `correlate_pending_cond_emits_error_for_correct_row` — a failed
+    // `-break-insert` has no id to attach an error to, so it is correlated
+    // by token back to the requested `file`/`line` instead.
+    #[test]
+    fn pending_insert_insert_and_removal_on_matching_done_reply() {
+        let mut pending_insert: HashMap<u32, BreakpointInsertRequest> = HashMap::new();
+        pending_insert.insert(
+            7,
+            BreakpointInsertRequest {
+                file: "/tmp/main.c".into(),
+                line: 10,
+            },
+        );
+
+        // A `^done` (success) for the matching token must remove the entry
+        // and emit no new event — the self-describing `^done,bkpt={...}`
+        // reply is parsed separately by `parse_line`/`parse_result` into
+        // `BreakpointAdded`.
+        let result = correlate_pending_insert(
+            "7^done,bkpt={number=\"3\",fullname=\"/tmp/main.c\",line=\"10\"}",
+            &mut pending_insert,
+        );
+        assert!(result.is_none());
+        assert!(
+            !pending_insert.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_insert_emits_error_for_correct_file_and_line() {
+        let mut pending_insert: HashMap<u32, BreakpointInsertRequest> = HashMap::new();
+        pending_insert.insert(
+            9,
+            BreakpointInsertRequest {
+                file: "/tmp/deleted.c".into(),
+                line: 42,
+            },
+        );
+
+        let event = correlate_pending_insert(
+            "9^error,msg=\"No such file or directory.\"",
+            &mut pending_insert,
+        );
+
+        match event {
+            Some(StateEvent::BreakpointInsertFailed { file, line, message }) => {
+                assert_eq!(file, "/tmp/deleted.c");
+                assert_eq!(line, 42);
+                assert_eq!(message, "No such file or directory.");
+            }
+            other => panic!("expected BreakpointInsertFailed, got {other:?}"),
+        }
+        assert!(
+            !pending_insert.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_insert_ignores_unrelated_tokens() {
+        let mut pending_insert: HashMap<u32, BreakpointInsertRequest> = HashMap::new();
+        pending_insert.insert(
+            1,
+            BreakpointInsertRequest {
+                file: "/tmp/a.c".into(),
+                line: 5,
+            },
+        );
+
+        let event = correlate_pending_insert("2^done", &mut pending_insert);
+        assert!(event.is_none());
+        assert!(pending_insert.contains_key(&1));
+    }
+
+    #[test]
+    fn handle_commands_inserts_pending_insert_entry_on_add_breakpoint_dispatch() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx
+            .send(DebuggerCommand::AddBreakpoint {
+                file: "/tmp/main.c".into(),
+                line: 10,
+                condition: None,
+            })
+            .unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert_eq!(
+            pending.insert.get(&0),
+            Some(&BreakpointInsertRequest {
+                file: "/tmp/main.c".into(),
+                line: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn handle_gdb_output_insert_error_falls_through_to_parse_line() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.insert.insert(
+            7,
+            BreakpointInsertRequest {
+                file: "/tmp/deleted.c".into(),
+                line: 42,
+            },
+        );
+
+        let flow = handle_gdb_output(
+            "7^error,msg=\"No such file or directory.\"",
+            &mut writer,
+            &event_tx,
+            &mut pending,
+        );
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.insert.contains_key(&7));
+
+        // Fall-through: the same line emits BOTH BreakpointInsertFailed AND
+        // the GdbError from parse_line, mirroring cond/edit/watch/catch/memory.
+        let first = event_rx.try_recv().expect("BreakpointInsertFailed event");
+        match first {
+            DebuggerEvent::State(StateEvent::BreakpointInsertFailed { file, line, message }) => {
+                assert_eq!(file, "/tmp/deleted.c");
+                assert_eq!(line, 42);
+                assert_eq!(message, "No such file or directory.");
+            }
+            other => panic!("expected BreakpointInsertFailed, got {other:?}"),
+        }
+
+        let second = event_rx
+            .try_recv()
+            .expect("GdbError event from parse_line fall-through");
+        match second {
+            DebuggerEvent::Ui(UiEvent::GdbError(msg)) => {
+                assert_eq!(msg, "No such file or directory.");
+            }
+            other => panic!("expected GdbError, got {other:?}"),
+        }
     }
 
     #[test]
