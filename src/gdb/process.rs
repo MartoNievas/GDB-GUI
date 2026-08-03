@@ -245,6 +245,37 @@ fn correlate_pending_catch(
     }
 }
 
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::RequestMemory`. If the token matches an entry in
+/// `pending_memory`, removes it (cleanup happens on both success and
+/// failure, mirroring `correlate_pending_watch`). `^error` returns
+/// `MemoryRequestFailed{address,message}` for the caller to emit — success
+/// needs no event here: GDB's `-data-read-memory-bytes` reply is
+/// self-describing (`memory=[...]`), parsed by the normal `parse_line` path
+/// into `MemoryUpdated` (D1/D2).
+fn correlate_pending_memory(
+    line: &str,
+    pending_memory: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let address = pending_memory.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_memory.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::MemoryRequestFailed {
+            address,
+            message: msg,
+        })
+    } else if rest.starts_with("^done") {
+        pending_memory.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
 /// Pure decision for the two catchpoint commands (`RemoveCatchpoint`,
 /// `ToggleCatchpoint`) that have no correlatable reply — mirrors
 /// `optimistic_watchpoint_event` exactly (D2/D4 from design #65, unaffected
@@ -404,6 +435,13 @@ struct PendingRegistry {
     /// here (a successful creation is never send-time optimistic — see
     /// `correlate_pending_catch` doc comment / design addendum A2/A3).
     catch: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) -> address of the
+    /// `Command::RequestMemory` pending a response. Correlated by token, not
+    /// FIFO, like the other pending maps: only `^error` needs correlation
+    /// here (success is self-describing and flows through the normal
+    /// `parse_line` path into `MemoryUpdated`).
+    memory: HashMap<u32, String>,
 }
 
 /// Drains `cmd_rx` fully, dispatching each `DebuggerCommand` to GDB and
@@ -473,6 +511,10 @@ fn handle_commands<W: Write>(
             pending.watch.insert(token, expr.clone());
         }
 
+        if let DebuggerCommand::RequestMemory { address, .. } = &cmd {
+            pending.memory.insert(token, address.clone());
+        }
+
         // D1 key: "{kind}:{args joined by ','}" — matches
         // `catchpoint_errors`' key shape so a later `^error` attributes
         // straight to the row the panel is tracking by (kind, args).
@@ -507,14 +549,15 @@ fn handle_commands<W: Write>(
     Ok(())
 }
 
-/// Runs the 7 ordered correlation checks against a single raw MI `line`,
+/// Runs the 8 ordered correlation checks against a single raw MI `line`,
 /// then falls through to `parse_line`. CRITICAL: exact check order is
-/// struct → globals → probe → cond → edit → watch → catch → parse_line.
-/// struct/globals/probe early-return `ControlFlow::Continue(())` on a match
-/// (short-circuit: the rest of the checks, including `parse_line`, are
-/// skipped for this line). cond/edit/watch/catch do NOT early-return on a
-/// match: they fall through to the next check and eventually to
-/// `parse_line`, so a single line can emit two events. Any `event_tx.send`
+/// struct → globals → probe → cond → edit → watch → catch → memory →
+/// parse_line. struct/globals/probe early-return `ControlFlow::Continue(())`
+/// on a match (short-circuit: the rest of the checks, including
+/// `parse_line`, are skipped for this line). cond/edit/watch/catch/memory do
+/// NOT early-return on a match: they fall through to the next check and
+/// eventually to `parse_line`, so a single line can emit two events. Any
+/// `event_tx.send`
 /// or `writer.send` error anywhere returns `ControlFlow::Break(())`, which
 /// tells the caller to kill the child and stop the loop.
 fn handle_gdb_output<W: Write>(
@@ -607,6 +650,17 @@ fn handle_gdb_output<W: Write>(
     // self-describing `bkpt={catch-type=...}` payload into `CatchpointAdded`
     // (same fn the untokened notify-async path uses — A6).
     if let Some(event) = correlate_pending_catch(line, &mut pending.catch) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Memory-read correlation: like watch/catch, does not `continue` on
+    // `^error` — the console log still shows it via parse_line below. On
+    // `^done`, the token is cleaned up and the line falls through to
+    // parse_line, which turns the self-describing `memory=[...]` reply into
+    // `MemoryUpdated`.
+    if let Some(event) = correlate_pending_memory(line, &mut pending.memory) {
         if event_tx.send(DebuggerEvent::State(event)).is_err() {
             return ControlFlow::Break(());
         }
@@ -1458,5 +1512,78 @@ mod tests {
             }
             other => panic!("expected GdbError, got {other:?}"),
         }
+    }
+
+    // ── Memory-read correlation (^error only, D2) ────────────────────────────
+
+    #[test]
+    fn correlate_pending_memory_emits_error_for_correct_address() {
+        let mut pending_memory: HashMap<u32, String> = HashMap::new();
+        pending_memory.insert(9, "&&x".into());
+
+        let event = correlate_pending_memory(
+            "9^error,msg=\"No symbol \\\"x\\\" in current context.\"",
+            &mut pending_memory,
+        );
+
+        match event {
+            Some(StateEvent::MemoryRequestFailed { address, message }) => {
+                assert_eq!(address, "&&x");
+                assert_eq!(message, "No symbol \"x\" in current context.");
+            }
+            other => panic!("expected MemoryRequestFailed, got {other:?}"),
+        }
+        assert!(
+            !pending_memory.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_memory_done_is_cleanup_only_no_event() {
+        let mut pending_memory: HashMap<u32, String> = HashMap::new();
+        pending_memory.insert(7, "$sp".into());
+
+        // Success carries no event here: the self-describing memory=[...]
+        // reply is parsed separately by parse_line into MemoryUpdated.
+        let result = correlate_pending_memory(
+            "7^done,memory=[{begin=\"0x1\",offset=\"0x0\",end=\"0x2\",contents=\"ab\"}]",
+            &mut pending_memory,
+        );
+        assert!(result.is_none());
+        assert!(
+            !pending_memory.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_memory_ignores_unrelated_tokens() {
+        let mut pending_memory: HashMap<u32, String> = HashMap::new();
+        pending_memory.insert(1, "kept".into());
+
+        let event = correlate_pending_memory("2^done", &mut pending_memory);
+        assert!(event.is_none());
+        assert!(pending_memory.contains_key(&1));
+    }
+
+    #[test]
+    fn handle_commands_inserts_pending_memory_entry_on_request_memory_dispatch() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx
+            .send(DebuggerCommand::RequestMemory {
+                address: "$sp".into(),
+                count: 256,
+            })
+            .unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert_eq!(pending.memory.get(&0), Some(&"$sp".to_string()));
     }
 }
