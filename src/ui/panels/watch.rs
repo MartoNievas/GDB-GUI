@@ -255,17 +255,20 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                 16,
                             )
                             .unwrap_or(0);
-                            for (row_idx, chunk) in block.bytes.chunks(16).enumerate() {
-                                let (offset, hex, ascii) = format_hex_row(base, row_idx, chunk);
-                                ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
-                                    ui.label(m(&offset, 11.0, TXT_DIM));
-                                    ui.add_space(6.0);
-                                    ui.label(m(&hex, 11.0, TXT));
-                                    ui.add_space(6.0);
-                                    ui.label(m(&ascii, 11.0, TXT_CYAN));
+                            egui::Grid::new(("memory_grid", block_idx))
+                                .num_columns(3)
+                                .spacing([12.0, 2.0])
+                                .show(ui, |ui| {
+                                    for (row_idx, chunk) in block.bytes.chunks(16).enumerate() {
+                                        let (offset, hex, ascii) = format_hex_row(base, row_idx, chunk);
+
+                                        ui.add_space(8.0);
+                                        ui.label(m(&offset, 11.0, TXT_DIM));
+                                        ui.label(m(&hex, 11.0, TXT));
+                                        ui.label(m(&ascii, 11.0, TXT_CYAN));
+                                        ui.end_row();
+                                    }
                                 });
-                            }
                         }
                     }
                 }
