@@ -49,6 +49,14 @@ structured, panel-based UI instead of the raw command line.
   and C++ exception catchpoints support optional regex filtering.
 - **Resizable panels** — drag the dividers between the side sections, the console
   and the source view.
+- **Session persistence** — breakpoints, watchpoints and catchpoints survive
+  restarts. Each executable gets its own project file at
+  `~/.config/gdb-gui/projects/<hash>.toml`; on load, every saved entry is
+  replayed as a fresh add so GDB assigns new ids. If some entries fail to
+  restore (e.g. a deleted source file), a modal lets you keep them for the
+  next attempt or drop just the failures. A topbar **Persist** checkbox
+  (or the `GDB_GUI_NO_PERSIST` environment variable) fully opts out of both
+  saving and restoring.
 
 ## Requirements
 
@@ -174,6 +182,8 @@ Key modules:
 | `src/ui/widgets.rs`, `theme.rs`   | Shared small widgets and the colour/typography scale. |
 | `src/ui/registers.rs`             | Register classification and per-architecture order.   |
 | `src/ui/command.rs`               | The `Command` enum the UI sends to GDB.               |
+| `src/state/persistence.rs`        | Breakpoint/watchpoint/catchpoint save & restore.      |
+| `src/state/settings.rs`           | The Persist checkbox and its on-disk setting.         |
 
 ### UI layout
 
@@ -199,6 +209,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui)
 | `panels/files.rs`               | Source file selection.                           |
 | `panels/console.rs`             | GDB console output and input line.               |
 | `panels/commands.rs`            | Command shortcuts.                               |
+| `panels/restore_report.rs`      | Modal reporting partial session-restore failures. |
 | `panels/util.rs`                | Formatting helpers shared by the panels.         |
 
 The split is behaviour-preserving: panels render exactly what they did before,
