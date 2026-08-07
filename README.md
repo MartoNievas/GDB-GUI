@@ -61,6 +61,22 @@ structured, panel-based UI instead of the raw command line.
   policy — on Linux, `/proc/sys/kernel/yama/ptrace_scope` restricts
   attaching to processes GDB did not itself launch, which GDB reports via
   its own `^error` message shown in the Attach panel.
+- **Remote target connection** — enter a `host:port` in the Remote panel and
+  click *Connect* to attach to a `gdbserver` (or other GDB remote stub) via
+  `-target-select extended-remote host:port` (only enabled when no program is
+  loaded/attached locally and no remote target is already connected; the
+  topbar shows the connected target, distinct from "Loaded"/"Attached").
+  Load-executable and local-attach are disabled while connected, and vice
+  versa. On failure, GDB's error message is shown verbatim and the connect
+  action can be retried. There is no manual/interactive disconnect: closing
+  the GUI while connected sends `-target-disconnect` (not `-target-detach`)
+  before the GDB subprocess exits, leaving the remote target **stopped, not
+  resumed** — the GUI never started it, so resuming it would be
+  unrecoverable from here. Out of scope: serial or other device targets
+  (e.g. `/dev/ttyUSB0`), core-dump loading, and running or attaching to a
+  process after connect. The remote stub is trusted implicitly — GDB's
+  remote protocol gives it full control of the debug session, so only
+  connect to targets you trust.
 - **Session persistence** — breakpoints, watchpoints and catchpoints survive
   restarts. Each executable gets its own project file at
   `~/.config/gdb-gui/projects/<hash>.toml`; on load, every saved entry is
@@ -223,6 +239,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui)
 | `panels/commands.rs`            | Command shortcuts.                               |
 | `panels/restore_report.rs`      | Modal reporting partial session-restore failures. |
 | `panels/util.rs`                | Formatting helpers shared by the panels.         |
+| `panels/attach.rs`              | Local-attach PID input and Attach button.        |
+| `panels/remote.rs`              | Remote-connect `host:port` input and Connect button. |
 
 The split is behaviour-preserving: panels render exactly what they did before,
 they are just no longer competing for the same file.

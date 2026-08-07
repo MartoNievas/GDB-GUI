@@ -29,6 +29,7 @@ bitflags! {
         const THREAD      = 1 << 6;
         const STRUCT      = 1 << 7;
         const ATTACH      = 1 << 8;
+        const REMOTE      = 1 << 9;
     }
 }
 
@@ -86,6 +87,9 @@ pub struct App {
 
     // Attach panel PID input buffer (design D1-D5).
     pub(crate) attach_pid_buffer: String,
+
+    // Remote-connect panel host:port input buffer (design D1-D5, Slice 2).
+    pub(crate) remote_target_buffer: String,
 
     // ── Session persistence (design decision D4/D6) ─────────────────────
     /// Resolved once at construction via `Store::from_env()`; `None` when
@@ -332,6 +336,7 @@ impl App {
             cp_kind_buffer: crate::state::CatchpointKind::Fork,
             cp_args_buffer: String::new(),
             attach_pid_buffer: String::new(),
+            remote_target_buffer: String::new(),
             store: crate::state::Store::from_env(),
             restore_pending: false,
             restore_session: None,
@@ -401,6 +406,13 @@ impl App {
         // unreachable from `ProcessAttached` (D4's restore guard is
         // unbypassable by construction, not by an added check here).
         let was_attached = matches!(s, crate::state::StateEvent::ProcessAttached { .. });
+        // Design D1/D3/D4 (Slice 2, task 7.2): mirrors `was_attached`'s
+        // precedent for a distinct, structurally-unreachable-from-restore
+        // flag — no `*stopped` is guaranteed after `^connected`, so this
+        // branch must explicitly send both the names requests AND
+        // `refresh_thread_scoped_views()` (unlike `was_attached`, which
+        // relies on the following `*stopped` for the latter).
+        let connected_remote = matches!(s, crate::state::StateEvent::RemoteConnected { .. });
         // Captured for the restore hook (Phase 3, design D2): the executable
         // this `ProgramLoaded` names, so `try_start_restore` can load its
         // project file once `s` has been consumed into `self.state`.
@@ -476,6 +488,15 @@ impl App {
             // unreachable, since this branch is not `if was_loaded`).
             self.send(Command::RequestRegisterNames);
             self.send(Command::RequestGlobalNames);
+        }
+        if connected_remote {
+            // D3/D4: no `ProbeMainSource` (mirrors `was_attached` — the
+            // remote target is never a not-yet-started program) and no
+            // `try_start_restore` (structurally unreachable: this branch is
+            // not `if was_loaded`).
+            self.send(Command::RequestRegisterNames);
+            self.send(Command::RequestGlobalNames);
+            self.refresh_thread_scoped_views();
         }
         if was_paused {
             self.refresh_thread_scoped_views();
@@ -824,61 +845,91 @@ impl App {
     }
 }
 
-// ─── Detach on Exit (design: "Detach on Exit") ─────────────────────────────
+// ─── Shutdown Release (design D6, generalizing "Detach on Exit") ──────────
 
-/// Bound on how long `on_exit` waits for GDB's `-target-detach` `^done`/
-/// `^error` before giving up — a hung or already-dead GDB must not hang GUI
-/// shutdown indefinitely; on timeout the pre-existing kill-on-exit behavior
-/// in `process.rs::run_loop` is the fallback, not a new risk.
+/// Bound on how long `on_exit` waits for GDB's `-target-detach`/
+/// `-target-disconnect` `^done`/`^error` before giving up — a hung or
+/// already-dead GDB must not hang GUI shutdown indefinitely; on timeout the
+/// pre-existing kill-on-exit behavior in `process.rs::run_loop` is the
+/// fallback, not a new risk.
 const DETACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Outcome of `wait_for_detach_ack`: whether `-target-detach` was
-/// acknowledged before the deadline.
+/// What `on_exit` must release before the GUI closes (design D6) — a local
+/// attach or an active remote connection, never both (mutually exclusive by
+/// construction: `attach_enabled`/`remote_connect_enabled` each require the
+/// other to be absent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShutdownRelease {
+    /// A process is attached locally — `on_exit` must send
+    /// `Command::DetachForShutdown`.
+    Detach { pid: u32 },
+    /// A remote target is connected — `on_exit` must send
+    /// `Command::DisconnectForShutdown`.
+    Disconnect { target: String },
+}
+
+/// Outcome of `wait_for_release_ack`: whether the release
+/// (`-target-detach`/`-target-disconnect`) was acknowledged before the
+/// deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachAck {
-    /// `StateEvent::DetachFinished` arrived before the deadline.
+pub(crate) enum ReleaseAck {
+    /// `StateEvent::DetachFinished` or `StateEvent::RemoteDisconnected`
+    /// arrived before the deadline.
     Finished,
-    /// The deadline elapsed with no `DetachFinished` observed.
+    /// The deadline elapsed with no matching event observed.
     TimedOut,
     /// `event_rx`'s sender was dropped (the GDB thread died) before a
-    /// `DetachFinished` arrived.
+    /// matching event arrived — keeps meaning *channel* disconnect (design
+    /// D6), distinct from `StateEvent::RemoteDisconnected`.
     Disconnected,
 }
 
-/// Blocks, bounded by `timeout`, until `StateEvent::DetachFinished` arrives
-/// on `rx` — discarding every other event along the way (`on_exit` has no
-/// UI left to route them to at this point anyway). Loops `recv_timeout`
-/// against a single deadline rather than re-arming a fresh `timeout` per
-/// iteration, so a stream of unrelated events cannot extend the wait past
-/// `timeout`. Never blocks unbounded: a hung/dead GDB resolves via
-/// `TimedOut`/`Disconnected`.
-pub(crate) fn wait_for_detach_ack(
+/// Blocks, bounded by `timeout`, until `StateEvent::DetachFinished` or
+/// `StateEvent::RemoteDisconnected` arrives on `rx` (design D6: shared by
+/// both shutdown branches) — discarding every other event along the way
+/// (`on_exit` has no UI left to route them to at this point anyway). Loops
+/// `recv_timeout` against a single deadline rather than re-arming a fresh
+/// `timeout` per iteration, so a stream of unrelated events cannot extend
+/// the wait past `timeout`. Never blocks unbounded: a hung/dead GDB
+/// resolves via `TimedOut`/`Disconnected`.
+pub(crate) fn wait_for_release_ack(
     rx: &Receiver<DebuggerEvent>,
     timeout: std::time::Duration,
-) -> DetachAck {
+) -> ReleaseAck {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return DetachAck::TimedOut;
+            return ReleaseAck::TimedOut;
         }
         match rx.recv_timeout(remaining) {
-            Ok(DebuggerEvent::State(crate::state::StateEvent::DetachFinished { .. })) => {
-                return DetachAck::Finished;
+            Ok(DebuggerEvent::State(crate::state::StateEvent::DetachFinished { .. }))
+            | Ok(DebuggerEvent::State(crate::state::StateEvent::RemoteDisconnected { .. })) => {
+                return ReleaseAck::Finished;
             }
             Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return DetachAck::TimedOut,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return ReleaseAck::TimedOut,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return DetachAck::Disconnected;
+                return ReleaseAck::Disconnected;
             }
         }
     }
 }
 
-/// Whether `on_exit` must attempt a detach before the GUI closes — `None`
-/// unless a process is currently attached (design "Detach on Exit" step 1).
-pub(crate) fn should_detach_on_exit(state: &DebuggerState) -> Option<u32> {
-    state.attached_pid
+/// What `on_exit` must release before the GUI closes — `None` unless a
+/// process is attached locally or a remote target is connected (design D6,
+/// generalizing "Detach on Exit" step 1). A local attach takes precedence
+/// if somehow both were set (structurally shouldn't happen: `attach_enabled`
+/// requires `remote_target.is_none()` and vice versa).
+pub(crate) fn shutdown_release(state: &DebuggerState) -> Option<ShutdownRelease> {
+    if let Some(pid) = state.attached_pid {
+        Some(ShutdownRelease::Detach { pid })
+    } else {
+        state
+            .remote_target
+            .clone()
+            .map(|target| ShutdownRelease::Disconnect { target })
+    }
 }
 
 // ─── eframe::App ──────────────────────────────────────────────────────────────
@@ -965,6 +1016,9 @@ impl eframe::App for App {
                                 // ATTACH ────────────────────────────────────────────────
                                 panels::attach::render(self, ui);
 
+                                // REMOTE ────────────────────────────────────────────────
+                                panels::remote::render(self, ui);
+
                                 // COMMANDS ──────────────────────────────────────────────
                                 panels::commands::render(self, ui);
 
@@ -1036,39 +1090,49 @@ impl eframe::App for App {
             });
     }
 
-    /// Detach-on-exit (design "Detach on Exit"): closing the GUI while
-    /// attached releases the inferior instead of leaving it stopped-and-
-    /// traced, or killed outright once `event_rx` drops and
-    /// `process.rs::run_loop`'s kill path becomes reachable. Kept a thin
-    /// delegation to `should_detach_on_exit`/`wait_for_detach_ack` so the
-    /// untestable surface — this lifecycle hook actually firing — stays
-    /// minimal; the decision logic itself is unit-tested without a real
-    /// `eframe::App`. `eframe` 0.33.3's default `glow` feature is what
-    /// fixes this exact signature (`Option<&glow::Context>`); the
-    /// no-`glow` alternative takes no parameter at all.
+    /// Shutdown release (design D6, generalizing "Detach on Exit"): closing
+    /// the GUI while attached or remote-connected releases the inferior/
+    /// target instead of leaving it stopped-and-traced, or killed outright
+    /// once `event_rx` drops and `process.rs::run_loop`'s kill path becomes
+    /// reachable. Kept a thin delegation to `shutdown_release`/
+    /// `wait_for_release_ack` so the untestable surface — this lifecycle
+    /// hook actually firing — stays minimal; the decision logic itself is
+    /// unit-tested without a real `eframe::App`. `eframe` 0.33.3's default
+    /// `glow` feature is what fixes this exact signature
+    /// (`Option<&glow::Context>`); the no-`glow` alternative takes no
+    /// parameter at all.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let Some(pid) = should_detach_on_exit(&self.state) else {
+        let Some(release) = shutdown_release(&self.state) else {
             return;
         };
         // GDB in synchronous MI mode does not read stdin while the inferior
-        // is running, so a piped -target-detach is never consumed without
-        // interrupting first.
+        // is running, so a piped -target-detach/-target-disconnect is never
+        // consumed without interrupting first.
         if self.state.is_running() {
             self.send(Command::Interrupt);
         }
-        self.send(Command::DetachForShutdown);
-        match wait_for_detach_ack(&self.event_rx, DETACH_TIMEOUT) {
-            DetachAck::Finished => {}
+        let label = match &release {
+            ShutdownRelease::Detach { pid } => {
+                self.send(Command::DetachForShutdown);
+                format!("pid {pid}")
+            }
+            ShutdownRelease::Disconnect { target } => {
+                self.send(Command::DisconnectForShutdown);
+                format!("target {target}")
+            }
+        };
+        match wait_for_release_ack(&self.event_rx, DETACH_TIMEOUT) {
+            ReleaseAck::Finished => {}
             // The console panel is already gone by now, so a failed
             // release is reported loudly to stderr instead of silently —
             // the pre-existing kill-on-exit behavior is the fallback here,
             // not a new regression.
-            DetachAck::TimedOut => {
-                eprintln!("[gdb-gui] detach timed out waiting for GDB to release pid {pid}");
+            ReleaseAck::TimedOut => {
+                eprintln!("[gdb-gui] release timed out waiting for GDB to release {label}");
             }
-            DetachAck::Disconnected => {
+            ReleaseAck::Disconnected => {
                 eprintln!(
-                    "[gdb-gui] detach failed: GDB thread disconnected before releasing pid {pid}"
+                    "[gdb-gui] release failed: GDB thread disconnected before releasing {label}"
                 );
             }
         }
@@ -2288,28 +2352,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Task 4.3 (design D3): gating predicate truth table — enabled iff no
-    // program is loaded/attached AND the buffer parses to a non-zero u32.
+    // ── RemoteConnected cascade (Slice 2, task 7.1) ──────────────────────────
+
+    // Task 7.1 (design "connected_remote flag ... sends RequestRegisterNames
+    // + RequestGlobalNames and refresh_thread_scoped_views()"): unlike
+    // attach, no `*stopped` is guaranteed after `^connected`, so the pause
+    // cascade must be sent explicitly here too — not just the two
+    // register/global-names requests `was_attached` sends alone.
+    #[test]
+    fn apply_state_event_remote_connected_sends_names_and_thread_scoped_refresh() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::RemoteConnected {
+            target: "localhost:1234".into(),
+        });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::RequestRegisterNames),
+            "expected a RequestRegisterNames follow-up, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestGlobalNames),
+            "expected a RequestGlobalNames follow-up, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestThreads),
+            "expected refresh_thread_scoped_views's RequestThreads, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestLocals),
+            "expected refresh_thread_scoped_views's RequestLocals, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestStack),
+            "expected refresh_thread_scoped_views's RequestStack, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestRegisters),
+            "expected refresh_thread_scoped_views's RequestRegisters, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestDisasm),
+            "expected refresh_thread_scoped_views's RequestDisasm, got {sent:?}"
+        );
+        assert!(
+            !sent.contains(&Command::ProbeMainSource),
+            "ProbeMainSource must never be sent on remote connect, got {sent:?}"
+        );
+    }
+
+    // Task 7.1: a remote connect must never arm a restore replay —
+    // `was_loaded` matches `StateEvent::ProgramLoaded` only, and
+    // `RemoteConnected` is a distinct variant, mirroring
+    // `apply_state_event_process_attached_does_not_start_restore`.
+    #[test]
+    fn apply_state_event_remote_connected_does_not_start_restore() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("remote-connect-no-restore");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::RemoteConnected {
+            target: "localhost:1234".into(),
+        });
+
+        assert!(
+            !app.restore_pending,
+            "RemoteConnected must never arm a restore replay"
+        );
+        assert!(app.restore_session.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 7.1: `persistent.executable` stays `None` on remote connect, so
+    // `save_persistent_state`'s no-executable guard applies, mirroring
+    // `apply_state_event_process_attached_does_not_save_project_file`.
+    #[test]
+    fn apply_state_event_remote_connected_does_not_save_project_file() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("remote-connect-no-save");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::RemoteConnected {
+            target: "localhost:1234".into(),
+        });
+
+        assert_eq!(app.state.persistent.executable, None);
+        let store = app.store.as_ref().unwrap();
+        assert!(matches!(store.load(""), crate::state::LoadOutcome::Absent));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── remote_target_buffer / PanelState::REMOTE (Slice 2, task 7.2) ───────
+
+    #[test]
+    fn app_new_starts_with_empty_remote_target_buffer() {
+        let (app, _cmd_rx) = test_app();
+        assert_eq!(app.remote_target_buffer, "");
+    }
+
+    #[test]
+    fn panel_state_remote_flag_is_distinct_from_attach() {
+        assert_ne!(PanelState::REMOTE.bits(), PanelState::ATTACH.bits());
+        assert_ne!(PanelState::REMOTE.bits(), 0);
+    }
+
+    // Task 4.3 (design D3) + task 6.1 (design D2): gating predicate truth
+    // table — enabled iff no program is loaded/attached AND no remote
+    // target is connected AND the buffer parses to a non-zero u32.
     #[test]
     fn attach_enabled_truth_table() {
         use crate::state::ProgramState;
         use crate::ui::panels::attach::attach_enabled;
 
-        // Enabled: no program, no attached_pid, valid nonzero pid.
-        assert!(attach_enabled(&ProgramState::NoProgramLoaded, None, "4242"));
+        // Enabled: no program, no attached_pid, no remote_target, valid
+        // nonzero pid.
+        assert!(attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            None,
+            "4242"
+        ));
 
         // Disabled: every other ProgramState variant, even with no
-        // attached_pid and a valid buffer.
-        assert!(!attach_enabled(&ProgramState::ProgramLoaded, None, "4242"));
-        assert!(!attach_enabled(&ProgramState::Running, None, "4242"));
-        assert!(!attach_enabled(&ProgramState::Paused, None, "4242"));
+        // attached_pid/remote_target and a valid buffer.
+        assert!(!attach_enabled(
+            &ProgramState::ProgramLoaded,
+            None,
+            None,
+            "4242"
+        ));
+        assert!(!attach_enabled(&ProgramState::Running, None, None, "4242"));
+        assert!(!attach_enabled(&ProgramState::Paused, None, None, "4242"));
         assert!(!attach_enabled(
             &ProgramState::Exited { code: Some(0) },
+            None,
             None,
             "4242"
         ));
         assert!(!attach_enabled(
             &ProgramState::Attached { pid: 1 },
+            None,
             None,
             "4242"
         ));
@@ -2318,20 +2503,61 @@ mod tests {
         assert!(!attach_enabled(
             &ProgramState::NoProgramLoaded,
             Some(1),
+            None,
+            "4242"
+        ));
+
+        // Disabled (design D2): a remote target is connected, even with
+        // NoProgramLoaded, no attached_pid, and a valid buffer.
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            Some("localhost:1234"),
+            "4242"
+        ));
+        // Disabled: the RemoteConnected ProgramState variant itself, paired
+        // with the durable remote_target it implies.
+        assert!(!attach_enabled(
+            &ProgramState::RemoteConnected {
+                target: "localhost:1234".into(),
+            },
+            None,
+            Some("localhost:1234"),
             "4242"
         ));
 
         // Disabled: invalid buffer content — non-numeric, zero, negative,
         // overflowing u32, or empty.
-        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "abc"));
-        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "0"));
-        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "-1"));
         assert!(!attach_enabled(
             &ProgramState::NoProgramLoaded,
             None,
+            None,
+            "abc"
+        ));
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            None,
+            "0"
+        ));
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            None,
+            "-1"
+        ));
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            None,
             "99999999999"
         ));
-        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, ""));
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            None,
+            ""
+        ));
 
         // Injection row (threat matrix): a trailing-newline buffer (e.g.
         // "12\n-exec-run") must never enable the button — u32::from_str
@@ -2339,46 +2565,78 @@ mod tests {
         assert!(!attach_enabled(
             &ProgramState::NoProgramLoaded,
             None,
+            None,
             "12\n-exec-run"
         ));
     }
 
-    // ── Detach-on-exit (PR3, Phase 5) ────────────────────────────────────────
+    // ── Shutdown release (PR3 Phase 5, generalized Slice 2 Phase 8 / D6) ────
 
-    // Task 5.2: `should_detach_on_exit` is the pure predicate `on_exit`
-    // delegates to (design "Detach on Exit" step 1) — `None` unless a
-    // process is currently attached.
+    // Task 8.1: `shutdown_release` is the pure predicate `on_exit` delegates
+    // to (design D6, generalizing "Detach on Exit" step 1) — `None` unless
+    // either a process is attached or a remote target is connected.
     #[test]
-    fn should_detach_on_exit_is_none_when_never_attached() {
+    fn shutdown_release_is_none_when_never_attached_or_connected() {
         let state = DebuggerState::new();
-        assert_eq!(should_detach_on_exit(&state), None);
+        assert_eq!(shutdown_release(&state), None);
     }
 
     #[test]
-    fn should_detach_on_exit_is_some_pid_when_attached() {
+    fn shutdown_release_is_some_detach_when_attached() {
         let mut state = DebuggerState::new();
         state.apply(crate::state::StateEvent::ProcessAttached { pid: 4242 });
-        assert_eq!(should_detach_on_exit(&state), Some(4242));
+        assert_eq!(shutdown_release(&state), Some(ShutdownRelease::Detach { pid: 4242 }));
     }
 
-    // Task 5.1: `wait_for_detach_ack` — the three outcomes `on_exit` reacts
-    // to (design "Detach on Exit" step 4).
     #[test]
-    fn wait_for_detach_ack_returns_finished_on_detach_finished_event() {
+    fn shutdown_release_is_some_disconnect_when_remote_connected() {
+        let mut state = DebuggerState::new();
+        state.apply(crate::state::StateEvent::RemoteConnected {
+            target: "localhost:1234".into(),
+        });
+        assert_eq!(
+            shutdown_release(&state),
+            Some(ShutdownRelease::Disconnect {
+                target: "localhost:1234".into()
+            })
+        );
+    }
+
+    // Task 8.2: rename `wait_for_detach_ack`/`DetachAck` →
+    // `wait_for_release_ack`/`ReleaseAck` — the three outcomes `on_exit`
+    // reacts to (design "Detach on Exit" step 4, generalized by D6).
+    #[test]
+    fn wait_for_release_ack_returns_finished_on_detach_finished_event() {
         let (tx, rx) = mpsc::channel();
         tx.send(crate::state::DebuggerEvent::State(
             crate::state::StateEvent::DetachFinished { error: None },
         ))
         .unwrap();
 
-        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
-        assert_eq!(ack, DetachAck::Finished);
+        let ack = wait_for_release_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, ReleaseAck::Finished);
+    }
+
+    // D6: `ReleaseAck::Finished` must also fire on `RemoteDisconnected` —
+    // `wait_for_release_ack` is shared by both the detach and disconnect
+    // shutdown branches.
+    #[test]
+    fn wait_for_release_ack_returns_finished_on_remote_disconnected_event() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(crate::state::DebuggerEvent::State(
+            crate::state::StateEvent::RemoteDisconnected { error: None },
+        ))
+        .unwrap();
+
+        let ack = wait_for_release_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, ReleaseAck::Finished);
     }
 
     // Discards unrelated events on the way to the real ack (design step 4:
-    // "discarding every event that is not State(DetachFinished{..})").
+    // "discarding every event that is not State(DetachFinished{..} |
+    // RemoteDisconnected{..})").
     #[test]
-    fn wait_for_detach_ack_discards_unrelated_events_before_finished() {
+    fn wait_for_release_ack_discards_unrelated_events_before_finished() {
         let (tx, rx) = mpsc::channel();
         tx.send(crate::state::DebuggerEvent::Ui(
             crate::state::UiEvent::ConsoleOutput("noise".into()),
@@ -2393,22 +2651,22 @@ mod tests {
         ))
         .unwrap();
 
-        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
-        assert_eq!(ack, DetachAck::Finished);
+        let ack = wait_for_release_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, ReleaseAck::Finished);
     }
 
     #[test]
-    fn wait_for_detach_ack_times_out_on_silence() {
+    fn wait_for_release_ack_times_out_on_silence() {
         let (_tx, rx) = mpsc::channel::<crate::state::DebuggerEvent>();
-        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(50));
-        assert_eq!(ack, DetachAck::TimedOut);
+        let ack = wait_for_release_ack(&rx, std::time::Duration::from_millis(50));
+        assert_eq!(ack, ReleaseAck::TimedOut);
     }
 
     #[test]
-    fn wait_for_detach_ack_returns_disconnected_when_sender_dropped() {
+    fn wait_for_release_ack_returns_disconnected_when_sender_dropped() {
         let (tx, rx) = mpsc::channel::<crate::state::DebuggerEvent>();
         drop(tx);
-        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
-        assert_eq!(ack, DetachAck::Disconnected);
+        let ack = wait_for_release_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, ReleaseAck::Disconnected);
     }
 }

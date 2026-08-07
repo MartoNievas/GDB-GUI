@@ -69,6 +69,15 @@ pub(crate) fn attached_status_label(pid: u32, status: &str) -> String {
     format!("Attached (pid {pid}) — {status}")
 }
 
+/// Top-bar status label for a remote-connected session (design D1/D3/D4,
+/// task 9.1): reads from `DebuggerState::remote_target`, not
+/// `ProgramState::RemoteConnected`, mirroring `attached_status_label`'s
+/// precedent — `program` overwrites to `Paused` once execution stops, but
+/// `remote_target` is the durable fact that survives that overwrite.
+pub(crate) fn remote_status_label(target: &str, status: &str) -> String {
+    format!("Remote {target} — {status}")
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -191,6 +200,26 @@ mod tests {
         assert_eq!(
             attached_status_label(1, "Running"),
             "Attached (pid 1) — Running"
+        );
+    }
+
+    // ── remote_status_label (design D1/D3/D4, task 9.1) ──────────────────────
+    // Slice 2: RED — written before `remote_status_label` exists.
+
+    #[test]
+    fn remote_status_label_formats_target_and_status() {
+        assert_eq!(
+            remote_status_label("localhost:1234", "Paused"),
+            "Remote localhost:1234 — Paused"
+        );
+    }
+
+    // Triangulation, mirroring `attached_status_label_reflects_...`.
+    #[test]
+    fn remote_status_label_reflects_different_target_and_status() {
+        assert_eq!(
+            remote_status_label("10.0.0.5:9999", "Running"),
+            "Remote 10.0.0.5:9999 — Running"
         );
     }
 }

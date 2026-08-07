@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Align, Layout, Sense, Vec2};
 
-use super::util::{attached_status_label, location_label};
+use super::util::{attached_status_label, location_label, remote_status_label};
 use crate::ui::app::App;
 use crate::ui::command::Command;
 use crate::ui::theme::*;
@@ -73,24 +73,28 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 // overwrite, so this arm's text is only ever seen in the
                 // brief pre-pause window.
                 crate::state::ProgramState::Attached { .. } => "Attached",
-                // SLICE-1 COMPILE STOPGAP (out of this PR's planned scope):
-                // adding `ProgramState::RemoteConnected` in Phase 4 makes
-                // this match non-exhaustive, so a minimal arm is required
-                // here just to keep the crate building — this slice's UI is
-                // otherwise untouched (Phase 5+). Slice 2 (Phase 9) replaces
-                // this with the real `format!("Remote {target} — {status}")`
-                // via `remote_status_label`, per design.md.
+                // Transient by construction (`ProgramState::RemoteConnected`'s
+                // doc comment), mirroring `Attached { .. }` above —
+                // `remote_target` below is what actually keeps the connected
+                // label alive past the immediate `*stopped` -> Paused
+                // overwrite, so this arm's text is only ever seen in the
+                // brief pre-pause window (design D1/D3/D4, task 9.1).
                 crate::state::ProgramState::RemoteConnected { .. } => "Connected",
             };
 
-            // `attached_pid` (not the `program` match above) drives the
-            // attached label: `program` overwrites to `Paused` almost
-            // immediately after a successful attach, but `attached_pid`
-            // survives that transition (design D2) — reading it here is
-            // what keeps "Attached (pid N)" visible for the whole session
-            // instead of only the initial instant.
+            // `attached_pid`/`remote_target` (not the `program` match above)
+            // drive the attached/connected labels: `program` overwrites to
+            // `Paused` almost immediately after a successful attach or
+            // connect, but these fields survive that transition (design D2,
+            // D1/D3/D4) — reading them here is what keeps "Attached (pid N)"/
+            // "Remote host:port" visible for the whole session instead of
+            // only the initial instant. Mutually exclusive by construction
+            // (`attach_enabled`/`remote_connect_enabled` each require the
+            // other to be absent), so checking `attached_pid` first is safe.
             let location = if let Some(pid) = app.state.attached_pid {
                 attached_status_label(pid, status)
+            } else if let Some(target) = app.state.remote_target.as_deref() {
+                remote_status_label(target, status)
             } else {
                 location_label(app.state.current_file(), app.state.current_function(), status)
             };

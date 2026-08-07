@@ -159,8 +159,55 @@ being a seriously usable debugger, ordered roughly by priority.
   yourself, and closing the window — confirming (a) `eframe::App::on_exit`
   actually fires on window-close in eframe 0.33.3, and (b) the process is
   still alive via `ps` afterward, including while it was mid-`Continue`.
-- **No remote debugging or core dumps** — no `target remote`, no core file
-  loading.
+- **Remote target connection (implemented)** — `Command::ConnectRemote{target}`
+  (`src/ui/command.rs`) maps to `-target-select extended-remote <target>`, and
+  `Command::DisconnectForShutdown` to `-target-disconnect` (`src/gdb/writer.rs`,
+  both via `strip_mi_newlines`). Unlike attach, success is **correlated**, not
+  optimistic: `src/gdb/process.rs`'s `PendingRegistry` gained
+  `remote_connect`/`remote_disconnect` token maps and
+  `correlate_pending_remote_connect`/`correlate_pending_remote_disconnect`,
+  emitting `StateEvent::RemoteConnected{target}`/`RemoteConnectFailed{target,
+  message}`/`RemoteDisconnected{error}` off the actual `^connected`/`^error`/
+  `^done` replies. `src/state/debugger_state.rs` adds
+  `ProgramState::RemoteConnected{target}` plus a durable
+  `remote_target: Option<String>` that survives the `*stopped` -> `Paused`
+  transition (mirroring `attached_pid`), and `remote_connect_error` for
+  persistent error display. The connect gate deliberately allows
+  `ProgramLoaded` as well as `NoProgramLoaded` (not `NoProgramLoaded` alone) —
+  `gdb-gui ./firmware.elf` loads symbols before connecting, and a
+  symbol-less-only gate would make that workflow impossible. A new Remote
+  panel (`src/ui/panels/remote.rs`) takes a `host:port`, rebuilds it
+  canonically from a validated host charset + `u16` port
+  (`parse_remote_target`, `src/state/debugger_state.rs`) rather than
+  raw-interpolating user text, and gates the Connect button
+  (`remote_connect_enabled`) on that plus no local program/attach and no
+  existing remote connection. `attach_enabled` (`src/ui/panels/attach.rs`)
+  gained a fourth `remote_target: Option<&str>` parameter so local attach is
+  disabled while connected, and vice versa. Closing the GUI while connected
+  sends `-target-disconnect` (never `-target-detach`) so the target is left
+  **stopped, not resumed** — generalized from the attach shutdown path via
+  `ShutdownRelease{Detach{pid}|Disconnect{target}}` and `shutdown_release()`
+  (`src/ui/app.rs`, replacing `should_detach_on_exit`), with
+  `wait_for_release_ack`/`ReleaseAck` (renamed from
+  `wait_for_detach_ack`/`DetachAck`) accepting either `DetachFinished` or
+  `RemoteDisconnected` on the same bounded 2s ack. Out of scope: serial/other
+  device targets, core-dump loading, and running or attaching to a process
+  after connect. No interactive/manual disconnect exists — only shutdown
+  triggers it. Strict TDD: 569/569 tests passing across both delivery slices
+  (Slice 1: protocol/state core; Slice 2: panel, `app.rs` wiring, shutdown
+  generalization, docs).
+
+  **Still needs manual verification against a real `gdbserver`** (Phase 10,
+  not yet run in this sandboxed environment — no live GDB remote target
+  available): connect populates stack/threads/locals/registers; the actual
+  `^connected` payload and whether a `*stopped` follows it; a refused/
+  unreachable target's message renders verbatim and the app stays
+  reconnectable; a watchpoint/catchpoint `qSupported` rejection surfaces as
+  `^error`; closing the GUI while connected leaves the stub stopped and
+  reconnectable (`extended-remote`/`--multi`), not exited; and the
+  symbols-loaded-then-connect workflow (`gdb-gui ./firmware.elf`, then
+  connect) actually succeeds. _Verified live against GDB X.Y: pending —
+  fill in after running Phase 10's manual smoke test._
 - **Session persistence (implemented)** — Breakpoints, watchpoints, and
   catchpoints now survive across restarts. `src/state/persistence.rs` owns a
   pure (no `egui`, no GDB) TOML DTO, a per-executable project file at

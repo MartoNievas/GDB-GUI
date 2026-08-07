@@ -31,6 +31,11 @@ pub use debugger_state::{
 };
 
 pub(crate) use debugger_state::same_file;
+// Slice 2 (Phase 5.2): re-exported so `ui::panels::remote` can call the
+// Slice-1 implementation instead of duplicating it — see that function's
+// doc comment (SLICE-1 DEVIATION) for why it lives in `debugger_state.rs`
+// rather than `ui/panels/remote.rs` as design.md's Interfaces block states.
+pub(crate) use debugger_state::parse_remote_target;
 
 pub use persistence::{
     BreakpointDTO,

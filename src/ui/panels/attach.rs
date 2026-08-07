@@ -28,6 +28,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             let can_attach = attach_enabled(
                 &app.state.program,
                 app.state.attached_pid,
+                app.state.remote_target.as_deref(),
                 &app.attach_pid_buffer,
             );
             if ui
@@ -57,16 +58,23 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
     hl(ui);
 }
 
-/// D3: pure gating predicate for the Attach button. Enabled iff no program
-/// is loaded/attached (all of `ProgramLoaded`/`Running`/`Paused`/`Exited`/
-/// `Attached` disable it) AND `attached_pid` is `None` AND `buffer` parses
-/// to a non-zero `u32`. `u32::from_str` on its own already rejects
-/// non-numeric content, negative numbers, overflow, and any embedded
-/// whitespace/newline (the MI-injection threat-matrix row) — no separate
-/// sanitizer is needed.
-pub(crate) fn attach_enabled(program: &ProgramState, attached_pid: Option<u32>, buffer: &str) -> bool {
+/// D3 + design D2: pure gating predicate for the Attach button. Enabled iff
+/// no program is loaded/attached (all of `ProgramLoaded`/`Running`/
+/// `Paused`/`Exited`/`Attached` disable it) AND `attached_pid` is `None`
+/// AND no remote target is connected (`remote_target` is `None`) AND
+/// `buffer` parses to a non-zero `u32`. `u32::from_str` on its own already
+/// rejects non-numeric content, negative numbers, overflow, and any
+/// embedded whitespace/newline (the MI-injection threat-matrix row) — no
+/// separate sanitizer is needed.
+pub(crate) fn attach_enabled(
+    program: &ProgramState,
+    attached_pid: Option<u32>,
+    remote_target: Option<&str>,
+    buffer: &str,
+) -> bool {
     matches!(program, ProgramState::NoProgramLoaded)
         && attached_pid.is_none()
+        && remote_target.is_none()
         && buffer.trim().parse::<u32>().is_ok_and(|pid| pid != 0)
 }
 
