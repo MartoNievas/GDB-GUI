@@ -100,8 +100,65 @@ being a seriously usable debugger, ordered roughly by priority.
   `refresh_thread_scoped_views` cascade. The `Data` tab was relabeled
   `Disasm` in the same change to avoid ambiguity with the new tab. Strict
   TDD: 408/408 tests passing (39 new).
-- **No attach to a running process** — only `LoadExecutable(String)` via
-  `-file-exec-and-symbols`; no `-target-attach <pid>`.
+- **Attach to a running process (implemented)** — `Command::AttachToProcess(u32)`
+  (`src/ui/command.rs:97`) maps to `-target-attach {pid}`, and `Command::DetachForShutdown`
+  (`command.rs:104`) to `-target-detach` (`src/gdb/writer.rs`). `src/gdb/process.rs`'s
+  `PendingRegistry` gained error-only `attach`/`detach` token maps, correlating
+  `^error` back to `StateEvent::ProcessAttachFailed`/`DetachFinished` (`^done` is
+  cleanup-only for `attach`, mirroring `catch`/`watch`); success is signalled
+  optimistically at dispatch via `StateEvent::ProcessAttached`, since attach's
+  `*stopped` reply carries no pid. `src/state/debugger_state.rs` adds
+  `ProgramState::Attached{pid}` plus a durable `attached_pid: Option<u32>` that
+  survives the `*stopped` → `Paused` transition, and `attach_error` for
+  persistent (not toast) error display. A new Attach panel
+  (`src/ui/panels/attach.rs`) takes a PID and gates the button on no
+  program being loaded/attached plus a valid non-zero `u32` (`attach_enabled`).
+  Closing the GUI while attached auto-detaches instead of leaving the
+  process stopped-and-traced or killing it outright: `App::on_exit`
+  (`src/ui/app.rs:1049`) delegates to `should_detach_on_exit` (`app.rs:880`,
+  pure `Option<u32>` predicate) and `wait_for_detach_ack` (`app.rs:855`, a
+  bounded `recv_timeout` loop against a 2s deadline, `DETACH_TIMEOUT` at
+  `app.rs:833`) — interrupting first if the inferior is running (GDB in
+  synchronous MI mode does not read stdin while running), since a piped
+  `-target-detach` would otherwise never be consumed. A timed-out or
+  disconnected ack falls back to the pre-existing kill-on-exit path in
+  `process.rs::run_loop` (unchanged) and is reported via `eprintln!` naming
+  the pid. There is no in-app process picker (the PID must be known ahead of
+  time, e.g. via `ps`/`pgrep`) and no interactive mid-session detach — only
+  the shutdown path detaches. Strict TDD: 502/502 tests passing (34 new
+  across the attach implementation).
+
+  Verified live against GDB 17.2: `-target-attach <pid>` against a real
+  long-lived process (opted into being traced via its own `PR_SET_PTRACER`,
+  not a `ptrace_scope` change) produced a real `*stopped` record with no
+  `reason=` field and a populated `frame=`, exactly matching the
+  `parser.rs` no-reason fixture; the follow-up `-data-list-register-names`,
+  `-symbol-info-variables`, `-thread-info`, `-stack-list-variables
+  --all-values`, `-stack-list-frames`, and `-data-list-register-values`
+  commands (the exact MI strings `RequestRegisterNames`/`RequestGlobalNames`/
+  `refresh_thread_scoped_views` send) all returned populated `^done` replies.
+  Resuming the inferior, then replicating `on_exit`'s
+  interrupt-then-detach sequence (`SIGINT` to GDB's own pid, then
+  `-target-detach`) produced GDB's own `*stopped,reason="signal-received"`
+  followed by `9^done` for the detach, and the target process was confirmed
+  alive and running independently (`ps` state `S`, not `T`/zombie) after the
+  GDB process exited — the core mechanism `App::on_exit` relies on. Yama
+  `ptrace_scope=1` denial (attaching to an unrelated, non-opted-in sibling
+  process) reproduced GDB's own `^error,msg="ptrace: Operation not
+  permitted."` verbatim, confirming the error passes through
+  `ProcessAttachFailed`/`attach_error` unmodified in the common (ASCII)
+  case — a non-English locale was observed to emit an accented message that
+  `unescape` (`parser.rs`) does not octal-decode, a pre-existing limitation
+  of that function unrelated to attach specifically, not fixed here.
+  These checks were run directly against GDB's MI protocol with the exact
+  command strings `gdb-gui` sends, **not** through the compiled `gdb-gui`
+  binary itself — this sandbox runs inside a real, active desktop session,
+  and launching/controlling GUI windows on it without being asked was
+  avoided. **Still needs manual verification**: actually running the built
+  `gdb-gui` binary, attaching to a real long-lived process you started
+  yourself, and closing the window — confirming (a) `eframe::App::on_exit`
+  actually fires on window-close in eframe 0.33.3, and (b) the process is
+  still alive via `ps` afterward, including while it was mid-`Continue`.
 - **No remote debugging or core dumps** — no `target remote`, no core file
   loading.
 - **Session persistence (implemented)** — Breakpoints, watchpoints, and

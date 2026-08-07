@@ -824,6 +824,63 @@ impl App {
     }
 }
 
+// ─── Detach on Exit (design: "Detach on Exit") ─────────────────────────────
+
+/// Bound on how long `on_exit` waits for GDB's `-target-detach` `^done`/
+/// `^error` before giving up — a hung or already-dead GDB must not hang GUI
+/// shutdown indefinitely; on timeout the pre-existing kill-on-exit behavior
+/// in `process.rs::run_loop` is the fallback, not a new risk.
+const DETACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outcome of `wait_for_detach_ack`: whether `-target-detach` was
+/// acknowledged before the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachAck {
+    /// `StateEvent::DetachFinished` arrived before the deadline.
+    Finished,
+    /// The deadline elapsed with no `DetachFinished` observed.
+    TimedOut,
+    /// `event_rx`'s sender was dropped (the GDB thread died) before a
+    /// `DetachFinished` arrived.
+    Disconnected,
+}
+
+/// Blocks, bounded by `timeout`, until `StateEvent::DetachFinished` arrives
+/// on `rx` — discarding every other event along the way (`on_exit` has no
+/// UI left to route them to at this point anyway). Loops `recv_timeout`
+/// against a single deadline rather than re-arming a fresh `timeout` per
+/// iteration, so a stream of unrelated events cannot extend the wait past
+/// `timeout`. Never blocks unbounded: a hung/dead GDB resolves via
+/// `TimedOut`/`Disconnected`.
+pub(crate) fn wait_for_detach_ack(
+    rx: &Receiver<DebuggerEvent>,
+    timeout: std::time::Duration,
+) -> DetachAck {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return DetachAck::TimedOut;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(DebuggerEvent::State(crate::state::StateEvent::DetachFinished { .. })) => {
+                return DetachAck::Finished;
+            }
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return DetachAck::TimedOut,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return DetachAck::Disconnected;
+            }
+        }
+    }
+}
+
+/// Whether `on_exit` must attempt a detach before the GUI closes — `None`
+/// unless a process is currently attached (design "Detach on Exit" step 1).
+pub(crate) fn should_detach_on_exit(state: &DebuggerState) -> Option<u32> {
+    state.attached_pid
+}
+
 // ─── eframe::App ──────────────────────────────────────────────────────────────
 
 impl eframe::App for App {
@@ -977,6 +1034,44 @@ impl eframe::App for App {
                         }
                     });
             });
+    }
+
+    /// Detach-on-exit (design "Detach on Exit"): closing the GUI while
+    /// attached releases the inferior instead of leaving it stopped-and-
+    /// traced, or killed outright once `event_rx` drops and
+    /// `process.rs::run_loop`'s kill path becomes reachable. Kept a thin
+    /// delegation to `should_detach_on_exit`/`wait_for_detach_ack` so the
+    /// untestable surface — this lifecycle hook actually firing — stays
+    /// minimal; the decision logic itself is unit-tested without a real
+    /// `eframe::App`. `eframe` 0.33.3's default `glow` feature is what
+    /// fixes this exact signature (`Option<&glow::Context>`); the
+    /// no-`glow` alternative takes no parameter at all.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let Some(pid) = should_detach_on_exit(&self.state) else {
+            return;
+        };
+        // GDB in synchronous MI mode does not read stdin while the inferior
+        // is running, so a piped -target-detach is never consumed without
+        // interrupting first.
+        if self.state.is_running() {
+            self.send(Command::Interrupt);
+        }
+        self.send(Command::DetachForShutdown);
+        match wait_for_detach_ack(&self.event_rx, DETACH_TIMEOUT) {
+            DetachAck::Finished => {}
+            // The console panel is already gone by now, so a failed
+            // release is reported loudly to stderr instead of silently —
+            // the pre-existing kill-on-exit behavior is the fallback here,
+            // not a new regression.
+            DetachAck::TimedOut => {
+                eprintln!("[gdb-gui] detach timed out waiting for GDB to release pid {pid}");
+            }
+            DetachAck::Disconnected => {
+                eprintln!(
+                    "[gdb-gui] detach failed: GDB thread disconnected before releasing pid {pid}"
+                );
+            }
+        }
     }
 }
 
@@ -2238,5 +2333,74 @@ mod tests {
             None,
             "12\n-exec-run"
         ));
+    }
+
+    // ── Detach-on-exit (PR3, Phase 5) ────────────────────────────────────────
+
+    // Task 5.2: `should_detach_on_exit` is the pure predicate `on_exit`
+    // delegates to (design "Detach on Exit" step 1) — `None` unless a
+    // process is currently attached.
+    #[test]
+    fn should_detach_on_exit_is_none_when_never_attached() {
+        let state = DebuggerState::new();
+        assert_eq!(should_detach_on_exit(&state), None);
+    }
+
+    #[test]
+    fn should_detach_on_exit_is_some_pid_when_attached() {
+        let mut state = DebuggerState::new();
+        state.apply(crate::state::StateEvent::ProcessAttached { pid: 4242 });
+        assert_eq!(should_detach_on_exit(&state), Some(4242));
+    }
+
+    // Task 5.1: `wait_for_detach_ack` — the three outcomes `on_exit` reacts
+    // to (design "Detach on Exit" step 4).
+    #[test]
+    fn wait_for_detach_ack_returns_finished_on_detach_finished_event() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(crate::state::DebuggerEvent::State(
+            crate::state::StateEvent::DetachFinished { error: None },
+        ))
+        .unwrap();
+
+        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, DetachAck::Finished);
+    }
+
+    // Discards unrelated events on the way to the real ack (design step 4:
+    // "discarding every event that is not State(DetachFinished{..})").
+    #[test]
+    fn wait_for_detach_ack_discards_unrelated_events_before_finished() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(crate::state::DebuggerEvent::Ui(
+            crate::state::UiEvent::ConsoleOutput("noise".into()),
+        ))
+        .unwrap();
+        tx.send(crate::state::DebuggerEvent::State(
+            crate::state::StateEvent::LocalsUpdated { vars: vec![] },
+        ))
+        .unwrap();
+        tx.send(crate::state::DebuggerEvent::State(
+            crate::state::StateEvent::DetachFinished { error: None },
+        ))
+        .unwrap();
+
+        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, DetachAck::Finished);
+    }
+
+    #[test]
+    fn wait_for_detach_ack_times_out_on_silence() {
+        let (_tx, rx) = mpsc::channel::<crate::state::DebuggerEvent>();
+        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(50));
+        assert_eq!(ack, DetachAck::TimedOut);
+    }
+
+    #[test]
+    fn wait_for_detach_ack_returns_disconnected_when_sender_dropped() {
+        let (tx, rx) = mpsc::channel::<crate::state::DebuggerEvent>();
+        drop(tx);
+        let ack = wait_for_detach_ack(&rx, std::time::Duration::from_millis(200));
+        assert_eq!(ack, DetachAck::Disconnected);
     }
 }

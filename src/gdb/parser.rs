@@ -2545,4 +2545,32 @@ mod tests {
             other => panic!("expected MemoryUpdated with empty Vec, got {other:?}"),
         }
     }
+
+    // ── Process attach (PR3, Phase 6) ────────────────────────────────────────
+
+    // Attach `*stopped` records carry no `reason=` field at all (unlike every
+    // other stop this parser handles) — GDB simply reports the thread
+    // stopped, with no cause to report. `parse_stop_reason`'s existing
+    // catch-all (`_ => StopReason::Unknown`) and `parse_exec_async`'s
+    // existing frame-required fallthrough for non-synthetic-frame reasons
+    // already cover this shape; this test pins that no dedicated attach
+    // branch was ever needed (design "Testing Strategy": expected to pass
+    // with zero production code changes).
+    #[test]
+    fn attach_stopped_with_no_reason_field_yields_program_paused_unknown_with_frame() {
+        let line = r#"*stopped,thread-id="1",frame={addr="0x0000555555555149",func="bar",args=[]}"#;
+        match parse_line(line) {
+            Some(DebuggerEvent::State(StateEvent::ProgramPaused { pause })) => {
+                assert!(
+                    matches!(pause.stop_reason, StopReason::Unknown),
+                    "expected StopReason::Unknown, got {:?}",
+                    pause.stop_reason
+                );
+                assert_eq!(pause.frame.function, "bar");
+                assert_eq!(pause.frame.addr, 0x0000555555555149);
+                assert_eq!(pause.thread_id, 1);
+            }
+            other => panic!("expected ProgramPaused with StopReason::Unknown, got {other:?}"),
+        }
+    }
 }

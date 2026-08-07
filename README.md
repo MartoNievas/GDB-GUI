@@ -49,6 +49,18 @@ structured, panel-based UI instead of the raw command line.
   and C++ exception catchpoints support optional regex filtering.
 - **Resizable panels** — drag the dividers between the side sections, the console
   and the source view.
+- **Attach to a running process** — enter a PID in the Attach panel and click
+  *Attach* to debug an already-running process instead of launching a new
+  one (only enabled when no program is loaded or attached; requires a valid
+  non-zero PID). There is no in-app process picker — find the PID yourself
+  first (e.g. `ps aux | grep myprogram` or `pgrep myprogram`). There is no
+  manual/interactive detach either: closing the GUI while attached
+  automatically detaches (interrupting a freely-running inferior first, if
+  needed) so the process keeps running independently; to detach mid-session
+  without exiting, restart the GUI. Depends on your platform's ptrace
+  policy — on Linux, `/proc/sys/kernel/yama/ptrace_scope` restricts
+  attaching to processes GDB did not itself launch, which GDB reports via
+  its own `^error` message shown in the Attach panel.
 - **Session persistence** — breakpoints, watchpoints and catchpoints survive
   restarts. Each executable gets its own project file at
   `~/.config/gdb-gui/projects/<hash>.toml`; on load, every saved entry is
