@@ -527,6 +527,34 @@ pub enum StateEvent {
         address: String,
         message: String,
     },
+    /// Attach succeeded. Emitted OPTIMISTICALLY at dispatch time (design
+    /// D1) by `process.rs`'s `handle_commands`, in the same arm that
+    /// inserts into `pending.attach` — never derived from a GDB reply: the
+    /// eventual `*stopped` record is anonymous (no `reason=`, no pid).
+    /// PR1 stub: the `apply` arm here is intentionally a no-op — full state
+    /// handling (`ProgramState::Attached`, `attached_pid`) is wired in a
+    /// later chained PR.
+    ProcessAttached {
+        pid: u32,
+    },
+    /// GDB `^error` for an attach attempt, correlated by MI token via
+    /// `pending.attach` (error-only, mirrors `CatchpointError`/
+    /// `WatchpointError`). `message` is GDB's raw text, verbatim.
+    /// PR1 stub: the `apply` arm here is intentionally a no-op — the
+    /// rollback-to-`NoProgramLoaded` logic is wired in a later chained PR.
+    ProcessAttachFailed {
+        pid: u32,
+        message: String,
+    },
+    /// `-target-detach` acked with either `^done` (success, `error: None`)
+    /// or `^error` (failure, GDB's raw message), correlated by MI token via
+    /// `pending.detach` (token-only, mirrors `Command::ProbeMainSource`'s
+    /// `pending.probe` shape). PR1 stub: the `apply` arm here is
+    /// intentionally a no-op — resetting `attached_pid`/`program` is wired
+    /// in a later chained PR.
+    DetachFinished {
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -797,6 +825,17 @@ impl DebuggerState {
                 self.memory = vec![];
                 self.errors.memory_error = Some(message);
             }
+
+            // PR1 stubs (design D1/D2/D6): these three variants exist so
+            // `process.rs`'s attach/detach dispatch and correlation compile
+            // and are tested in isolation. Full `apply` logic
+            // (`ProgramState::Attached`, `attached_pid`, `attach_error`,
+            // rollback-on-failure, detach reset) is wired in a later
+            // chained PR — deliberately a no-op here, not a design
+            // deviation.
+            StateEvent::ProcessAttached { pid: _ } => {}
+            StateEvent::ProcessAttachFailed { pid: _, message: _ } => {}
+            StateEvent::DetachFinished { error: _ } => {}
         }
     }
 

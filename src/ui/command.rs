@@ -87,6 +87,21 @@ pub enum Command {
 
     // Program
     LoadExecutable(String),
+    /// Attaches to an already-running process via `-target-attach {pid}`.
+    /// Success is signalled optimistically at dispatch time (design D1) as
+    /// `StateEvent::ProcessAttached{pid}`, next to the `pending.attach`
+    /// insert in `handle_commands` — the eventual `*stopped` reply carries
+    /// no `reason=`/pid, so it cannot be the source of the success event.
+    /// Only `^error` is correlated back (error-only, mirrors
+    /// `AddCatchpoint`/`AddWatchpoint`'s pattern).
+    AttachToProcess(u32),
+    /// Detaches from the attached inferior via `-target-detach` (no
+    /// arguments). Named for its single caller (GUI shutdown, design "Detach
+    /// on Exit") — there is no interactive/manual detach action in this
+    /// change. Acked via `pending.detach` (token-only, mirrors
+    /// `Command::ProbeMainSource`'s `pending.probe` shape) on both `^done`
+    /// and `^error`, emitting `StateEvent::DetachFinished{error}`.
+    DetachForShutdown,
 
     RequestLocals,
     RequestStack,

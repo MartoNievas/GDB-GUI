@@ -320,6 +320,66 @@ fn correlate_pending_memory(
     }
 }
 
+/// Inspects an incoming raw MI line for a token that correlates to a pending
+/// `Command::AttachToProcess`. If the token matches an entry in
+/// `pending_attach`, removes it (cleanup on both success and failure,
+/// mirroring `correlate_pending_catch`). `^error` returns
+/// `ProcessAttachFailed{pid, message}` for the caller to emit — GDB's raw
+/// `msg=...` text, verbatim (spec: "Attach Failure Surfaced Verbatim").
+/// `^done` is cleanup-only and emits no event: success was already signalled
+/// optimistically at dispatch time (design D1, `handle_commands`) — a
+/// tokened `^done` here carries nothing new.
+fn correlate_pending_attach(
+    line: &str,
+    pending_attach: &mut HashMap<u32, u32>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let pid = *pending_attach.get(&token)?;
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^error") {
+        pending_attach.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::ProcessAttachFailed { pid, message: msg })
+    } else if rest.starts_with("^done") {
+        pending_attach.remove(&token);
+        None
+    } else {
+        None
+    }
+}
+
+/// Inspects an incoming raw MI line for a token that correlates to the
+/// pending `Command::DetachForShutdown` (design D6). If the token matches an
+/// entry in `pending_detach`, removes it (cleanup on both outcomes, mirroring
+/// `correlate_pending_probe`'s `HashSet<u32>` shape) and returns
+/// `DetachFinished{error}` for the caller to emit on **both** `^done`
+/// (`error: None`) and `^error` (`error: Some(GDB's raw message)`) — unlike
+/// every other `pending_*` map, both outcomes here carry an event: shutdown
+/// needs a definite ack (Finished) either way to unblock `wait_for_detach_ack`
+/// (a later chained PR), not just cleanup.
+fn correlate_pending_detach(
+    line: &str,
+    pending_detach: &mut HashSet<u32>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    if !pending_detach.contains(&token) {
+        return None;
+    }
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_detach.remove(&token);
+        Some(StateEvent::DetachFinished { error: None })
+    } else if rest.starts_with("^error") {
+        pending_detach.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::DetachFinished { error: Some(msg) })
+    } else {
+        None
+    }
+}
+
 /// Pure decision for the two catchpoint commands (`RemoveCatchpoint`,
 /// `ToggleCatchpoint`) that have no correlatable reply — mirrors
 /// `optimistic_watchpoint_event` exactly (D2/D4 from design #65, unaffected
@@ -495,6 +555,22 @@ struct PendingRegistry {
     /// Distinct from `cond` (which tracks `-break-condition` on an
     /// *existing* id, not a new insert).
     insert: HashMap<u32, BreakpointInsertRequest>,
+
+    /// Token (assigned by `GdbWriter::send`) -> pid of the
+    /// `Command::AttachToProcess` pending a response. Correlated by token,
+    /// not FIFO, like the other pending maps: only `^error` needs
+    /// correlation here — success is emitted optimistically at dispatch
+    /// time (design D1), since the eventual `*stopped` reply is anonymous
+    /// (no `reason=`, no pid) and cannot be the source of the success
+    /// event.
+    attach: HashMap<u32, u32>,
+
+    /// Token (assigned by `GdbWriter::send`) of the in-flight
+    /// `Command::DetachForShutdown`, if any (design D6). Payload-free,
+    /// mirroring `probe`'s `HashSet<u32>` shape: unlike `attach`, BOTH
+    /// `^done` and `^error` emit `StateEvent::DetachFinished{error}` — a
+    /// shutdown ack, not a value to attribute an error to.
+    detach: HashSet<u32>,
 }
 
 /// Drains `cmd_rx` fully, dispatching each `DebuggerCommand` to GDB and
@@ -576,6 +652,28 @@ fn handle_commands<W: Write>(
 
         if let DebuggerCommand::RequestMemory { address, .. } = &cmd {
             pending.memory.insert(token, address.clone());
+        }
+
+        // Attach (design D1): a single arm both inserts pending.attach and
+        // emits ProcessAttached optimistically, so the two can never drift
+        // apart. Success is signalled here, at dispatch time — never
+        // derived from a GDB reply: the eventual `*stopped` record is
+        // anonymous (no `reason=`, no pid). Only `^error` is correlated
+        // back via `correlate_pending_attach`.
+        if let DebuggerCommand::AttachToProcess(pid) = &cmd {
+            pending.attach.insert(token, *pid);
+            let _ = event_tx.send(DebuggerEvent::State(StateEvent::ProcessAttached {
+                pid: *pid,
+            }));
+        }
+
+        // Detach-on-shutdown (design D6): payload-free, mirrors
+        // `pending.probe`'s insert. Both `^done` and `^error` are
+        // correlated via `correlate_pending_detach` into
+        // `DetachFinished{error}` — there is no optimistic event here since
+        // the ack itself (not a value) is what the caller needs.
+        if matches!(cmd, DebuggerCommand::DetachForShutdown) {
+            pending.detach.insert(token);
         }
 
         // D1 key: "{kind}:{args joined by ','}" — matches
@@ -713,6 +811,27 @@ fn handle_gdb_output<W: Write>(
     // self-describing `bkpt={catch-type=...}` payload into `CatchpointAdded`
     // (same fn the untokened notify-async path uses — A6).
     if let Some(event) = correlate_pending_catch(line, &mut pending.catch) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Attach correlation (design D1): like watch/catch, does not `continue`
+    // on `^error` — the console log still shows it via parse_line below. On
+    // `^done`, the token is cleaned up and no event is emitted here: success
+    // was already signalled optimistically at dispatch time
+    // (`handle_commands`), so a tokened `^done` here carries nothing new.
+    if let Some(event) = correlate_pending_attach(line, &mut pending.attach) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Detach correlation (design D6): like watch/catch/attach, does not
+    // `continue` — the console log still shows it via parse_line below.
+    // Unlike attach, BOTH `^done` and `^error` emit `DetachFinished{error}`
+    // here (a shutdown ack, not a per-row error attribution).
+    if let Some(event) = correlate_pending_detach(line, &mut pending.detach) {
         if event_tx.send(DebuggerEvent::State(event)).is_err() {
             return ControlFlow::Break(());
         }
@@ -1813,5 +1932,276 @@ mod tests {
         handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
 
         assert_eq!(pending.memory.get(&0), Some(&"$sp".to_string()));
+    }
+
+    // ── Attach / Detach (Phase 2) ────────────────────────────────────────────
+    //
+    // pending.attach: HashMap<u32, u32> (token -> pid), error-only —
+    // mirrors pending.catch/pending.watch's lifecycle exactly. D1: success
+    // (`ProcessAttached`) is emitted OPTIMISTICALLY at dispatch time, in the
+    // same handle_commands arm that inserts into pending.attach — the
+    // eventual `*stopped` reply is anonymous (no pid, no reason=), so it
+    // cannot be the signal.
+
+    // (a) dispatch inserts pending.attach[token]=pid AND emits
+    // ProcessAttached optimistically.
+    #[test]
+    fn attach_dispatch_inserts_pending_attach_and_emits_process_attached_optimistically() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx.send(DebuggerCommand::AttachToProcess(4242)).unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert_eq!(pending.attach.get(&0), Some(&4242));
+
+        // The console echo of the composed MI command is sent first; the
+        // optimistic ProcessAttached event follows it.
+        let console = event_rx.try_recv().expect("console echo event");
+        match console {
+            DebuggerEvent::Ui(UiEvent::ConsoleOutput(text)) => {
+                assert_eq!(text, "> -target-attach 4242");
+            }
+            other => panic!("expected ConsoleOutput echo, got {other:?}"),
+        }
+
+        let event = event_rx.try_recv().expect("ProcessAttached event");
+        match event {
+            DebuggerEvent::State(StateEvent::ProcessAttached { pid }) => {
+                assert_eq!(pid, 4242);
+            }
+            other => panic!("expected ProcessAttached, got {other:?}"),
+        }
+    }
+
+    // (d) unrelated token ignored (correlate_pending_attach half).
+    #[test]
+    fn correlate_pending_attach_ignores_unrelated_tokens() {
+        let mut pending_attach: HashMap<u32, u32> = HashMap::new();
+        pending_attach.insert(1, 4242);
+
+        let event = correlate_pending_attach("2^done", &mut pending_attach);
+        assert!(event.is_none());
+        assert!(
+            pending_attach.contains_key(&1),
+            "unrelated entry must survive untouched"
+        );
+    }
+
+    // (b) `{t}^error,msg="..."` -> ProcessAttachFailed{pid, verbatim msg} +
+    // token removed.
+    #[test]
+    fn correlate_pending_attach_emits_error_with_verbatim_message_and_removes_token() {
+        let mut pending_attach: HashMap<u32, u32> = HashMap::new();
+        pending_attach.insert(9, 4242);
+
+        let event = correlate_pending_attach(
+            "9^error,msg=\"ptrace: Operation not permitted.\"",
+            &mut pending_attach,
+        );
+
+        match event {
+            Some(StateEvent::ProcessAttachFailed { pid, message }) => {
+                assert_eq!(pid, 4242);
+                assert_eq!(message, "ptrace: Operation not permitted.");
+            }
+            other => panic!("expected ProcessAttachFailed, got {other:?}"),
+        }
+        assert!(
+            !pending_attach.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    // (c) `{t}^done` -> token removed, no event (cleanup-only, mirrors
+    // correlate_pending_catch's ^done).
+    #[test]
+    fn correlate_pending_attach_done_is_cleanup_only_no_event() {
+        let mut pending_attach: HashMap<u32, u32> = HashMap::new();
+        pending_attach.insert(7, 4242);
+
+        let result = correlate_pending_attach("7^done", &mut pending_attach);
+        assert!(result.is_none());
+        assert!(
+            !pending_attach.contains_key(&7),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    // (e) attach + catch in flight resolve independently — mirrors
+    // struct_and_global_evaluations_in_flight_simultaneously_resolve_independently.
+    #[test]
+    fn attach_and_catch_in_flight_resolve_independently() {
+        let mut pending_attach: HashMap<u32, u32> = HashMap::new();
+        pending_attach.insert(30, 4242);
+        let mut pending_catch: HashMap<u32, String> = HashMap::new();
+        pending_catch.insert(31, "fork:".into());
+
+        // The catch reply arrives first; the attach path must not touch it,
+        // since its token isn't tracked there.
+        let attach_attempt = correlate_pending_attach("31^done", &mut pending_attach);
+        assert!(attach_attempt.is_none());
+        assert!(pending_attach.contains_key(&30));
+        assert!(pending_catch.contains_key(&31));
+
+        let catch_event = correlate_pending_catch("31^error,msg=\"boom\"", &mut pending_catch);
+        match catch_event {
+            Some(StateEvent::CatchpointError { key, message }) => {
+                assert_eq!(key, "fork:");
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected CatchpointError, got {other:?}"),
+        }
+        assert!(!pending_catch.contains_key(&31));
+
+        // The attach reply resolves its own token afterward, unaffected.
+        let attach_event = correlate_pending_attach(
+            "30^error,msg=\"ptrace: Operation not permitted.\"",
+            &mut pending_attach,
+        );
+        match attach_event {
+            Some(StateEvent::ProcessAttachFailed { pid, message }) => {
+                assert_eq!(pid, 4242);
+                assert_eq!(message, "ptrace: Operation not permitted.");
+            }
+            other => panic!("expected ProcessAttachFailed, got {other:?}"),
+        }
+        assert!(!pending_attach.contains_key(&30));
+    }
+
+    // (f) detach ^done/^error -> DetachFinished, token removed. pending.detach
+    // is a HashSet<u32> (token only, payload-free), mirroring pending.probe.
+    #[test]
+    fn correlate_pending_detach_done_emits_detach_finished_with_no_error() {
+        let mut pending_detach: HashSet<u32> = HashSet::new();
+        pending_detach.insert(5);
+
+        let event = correlate_pending_detach("5^done", &mut pending_detach);
+
+        match event {
+            Some(StateEvent::DetachFinished { error }) => assert_eq!(error, None),
+            other => panic!("expected DetachFinished, got {other:?}"),
+        }
+        assert!(
+            !pending_detach.contains(&5),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_detach_error_emits_detach_finished_with_verbatim_message() {
+        let mut pending_detach: HashSet<u32> = HashSet::new();
+        pending_detach.insert(6);
+
+        let event = correlate_pending_detach(
+            "6^error,msg=\"Cannot detach: no attached target.\"",
+            &mut pending_detach,
+        );
+
+        match event {
+            Some(StateEvent::DetachFinished { error }) => {
+                assert_eq!(error, Some("Cannot detach: no attached target.".to_string()));
+            }
+            other => panic!("expected DetachFinished, got {other:?}"),
+        }
+        assert!(
+            !pending_detach.contains(&6),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_detach_ignores_unrelated_tokens() {
+        let mut pending_detach: HashSet<u32> = HashSet::new();
+        pending_detach.insert(1);
+
+        let event = correlate_pending_detach("2^done", &mut pending_detach);
+        assert!(event.is_none());
+        assert!(pending_detach.contains(&1));
+    }
+
+    #[test]
+    fn handle_commands_inserts_pending_detach_entry_on_detach_for_shutdown_dispatch() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx.send(DebuggerCommand::DetachForShutdown).unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert!(pending.detach.contains(&0));
+    }
+
+    // Check order in handle_gdb_output: … watch -> catch -> attach ->
+    // detach -> insert -> memory -> parse_line (design.md). Fall-through
+    // (not short-circuit), like watch/catch/insert/memory: the console log
+    // still shows the raw GdbError via parse_line.
+    #[test]
+    fn handle_gdb_output_attach_error_falls_through_to_parse_line() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.attach.insert(7, 4242);
+
+        let flow = handle_gdb_output(
+            "7^error,msg=\"ptrace: Operation not permitted.\"",
+            &mut writer,
+            &event_tx,
+            &mut pending,
+        );
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.attach.contains_key(&7));
+
+        let first = event_rx.try_recv().expect("ProcessAttachFailed event");
+        match first {
+            DebuggerEvent::State(StateEvent::ProcessAttachFailed { pid, message }) => {
+                assert_eq!(pid, 4242);
+                assert_eq!(message, "ptrace: Operation not permitted.");
+            }
+            other => panic!("expected ProcessAttachFailed, got {other:?}"),
+        }
+
+        let second = event_rx
+            .try_recv()
+            .expect("GdbError event from parse_line fall-through");
+        match second {
+            DebuggerEvent::Ui(UiEvent::GdbError(msg)) => {
+                assert_eq!(msg, "ptrace: Operation not permitted.");
+            }
+            other => panic!("expected GdbError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gdb_output_detach_done_emits_detach_finished_and_falls_through() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.detach.insert(8);
+
+        let flow = handle_gdb_output("8^done", &mut writer, &event_tx, &mut pending);
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.detach.contains(&8));
+
+        let event = event_rx.try_recv().expect("DetachFinished event");
+        match event {
+            DebuggerEvent::State(StateEvent::DetachFinished { error }) => assert_eq!(error, None),
+            other => panic!("expected DetachFinished, got {other:?}"),
+        }
     }
 }

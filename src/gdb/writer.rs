@@ -48,6 +48,13 @@ pub fn command_to_mi(cmd: &Command) -> String {
 
         Command::LoadExecutable(path) => format!("-file-exec-and-symbols {path}"),
 
+        // SECURITY (threat-matrix: MI argument composition into subprocess
+        // stdin): `pid: u32` is structurally incapable of carrying a
+        // newline or any other MI-breaking character, so no `quote_mi`/
+        // sanitizer is needed here — mirrors `SelectThread`.
+        Command::AttachToProcess(pid) => format!("-target-attach {pid}"),
+        Command::DetachForShutdown => "-target-detach".into(),
+
         Command::RequestLocals => "-stack-list-variables --all-values".into(),
 
         Command::RequestStack => "-stack-list-frames".into(),
@@ -1070,6 +1077,32 @@ mod tests {
         });
         assert_eq!(mi.lines().count(), 1);
         assert_eq!(mi, "-data-read-memory-bytes \"$sp-exec-run\" 256");
+    }
+
+    // ─── Attach / Detach (Phase 1) ─────────────────────────────────────────
+
+    // SECURITY (threat-matrix: MI argument composition into subprocess
+    // stdin — `-target-attach <pid>` interpolates user input): `pid: u32` is
+    // structurally incapable of carrying a newline or any other MI-breaking
+    // character, so no `quote_mi`/sanitizer is needed here (mirrors
+    // `select_thread_command_maps_to_thread_select`'s injection-safety
+    // rationale).
+    #[test]
+    fn attach_to_process_command_maps_to_target_attach() {
+        let mi = command_to_mi(&Command::AttachToProcess(4242));
+        assert_eq!(mi, "-target-attach 4242");
+        assert_eq!(
+            mi.lines().count(),
+            1,
+            "composed MI command must be exactly one line: {mi:?}"
+        );
+    }
+
+    #[test]
+    fn detach_for_shutdown_command_maps_to_target_detach_no_arguments() {
+        let mi = command_to_mi(&Command::DetachForShutdown);
+        assert_eq!(mi, "-target-detach");
+        assert_eq!(mi.lines().count(), 1);
     }
 
     #[test]
