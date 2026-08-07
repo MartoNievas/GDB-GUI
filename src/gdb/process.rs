@@ -417,22 +417,32 @@ fn optimistic_watchpoint_event(cmd: &DebuggerCommand) -> Option<StateEvent> {
 
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
-fn spawn_gdb(
-    executable: Option<&str>,
-    program_args: &[String],
-) -> std::io::Result<(Child, GdbWriter<ChildStdin>, BufReader<ChildStdout>)> {
+/// Builds the `gdb` subprocess `Command` for `raw_args` — the full,
+/// unmodified CLI argument list gdb-gui itself was invoked with (after its
+/// own binary name). `raw_args` is forwarded to `gdb` completely verbatim,
+/// in the original order, with no `--args` auto-injection: real `gdb` only
+/// treats trailing args as the debuggee's argv when the user explicitly
+/// writes `--args` themselves, so unconditionally inserting it here would
+/// wrongly fold the user's own `-ex`/`-x`/etc. gdb options into the
+/// debuggee's argv instead of letting `gdb` recognize them as its own
+/// options. Split out from `spawn_gdb` so the exact `Command` shape is
+/// testable without spawning a real subprocess.
+fn build_gdb_command(raw_args: &[String]) -> Command {
     let mut cmd = Command::new("gdb");
     cmd.arg("--interpreter=mi")
         .arg("--quiet")
         .arg("-nx")
+        .args(raw_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    cmd
+}
 
-    if let Some(exe) = executable {
-        cmd.arg("--args").arg(exe).args(program_args);
-    }
-
+fn spawn_gdb(
+    raw_args: &[String],
+) -> std::io::Result<(Child, GdbWriter<ChildStdin>, BufReader<ChildStdout>)> {
+    let mut cmd = build_gdb_command(raw_args);
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().expect("stdin piped");
     let stdout_raw = child.stdout.take().expect("stdout piped");
@@ -873,11 +883,11 @@ fn handle_gdb_output<W: Write>(
 
 pub fn run_loop(
     executable: Option<String>,
-    program_args: Vec<String>,
+    raw_args: Vec<String>,
     cmd_rx: Receiver<DebuggerCommand>,
     event_tx: Sender<DebuggerEvent>,
 ) {
-    let (mut child, mut writer, reader) = match spawn_gdb(executable.as_deref(), &program_args) {
+    let (mut child, mut writer, reader) = match spawn_gdb(&raw_args) {
         Ok(parts) => parts,
         Err(e) => {
             let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
@@ -949,6 +959,81 @@ fn send_interrupt(_pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn build_gdb_command_forwards_raw_args_verbatim_no_args_injection() {
+        // Exact bug-report shape: the executable followed by `-ex` flags must
+        // reach `gdb` completely unmodified, in the original order, with no
+        // `--args` inserted anywhere — otherwise gdb folds the `-ex` values
+        // into the debuggee's own argv instead of executing them.
+        let raw_args = vec![
+            "kernel.elf".to_string(),
+            "-ex".to_string(),
+            "source orga2.py".to_string(),
+            "-ex".to_string(),
+            "target remote localhost:1234".to_string(),
+        ];
+        let cmd = build_gdb_command(&raw_args);
+
+        assert_eq!(cmd.get_program().to_string_lossy(), "gdb");
+        assert_eq!(
+            command_args(&cmd),
+            vec![
+                "--interpreter=mi".to_string(),
+                "--quiet".to_string(),
+                "-nx".to_string(),
+                "kernel.elf".to_string(),
+                "-ex".to_string(),
+                "source orga2.py".to_string(),
+                "-ex".to_string(),
+                "target remote localhost:1234".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_gdb_command_with_no_raw_args_has_only_base_flags() {
+        let cmd = build_gdb_command(&[]);
+        assert_eq!(
+            command_args(&cmd),
+            vec![
+                "--interpreter=mi".to_string(),
+                "--quiet".to_string(),
+                "-nx".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_gdb_command_preserves_explicit_user_args_flag_verbatim() {
+        // If the user explicitly writes --args themselves, it must be
+        // forwarded as-is (gdb-gui never inserts or strips it).
+        let raw_args = vec![
+            "--args".to_string(),
+            "kernel.elf".to_string(),
+            "foo".to_string(),
+            "bar".to_string(),
+        ];
+        let cmd = build_gdb_command(&raw_args);
+        assert_eq!(
+            command_args(&cmd),
+            vec![
+                "--interpreter=mi".to_string(),
+                "--quiet".to_string(),
+                "-nx".to_string(),
+                "--args".to_string(),
+                "kernel.elf".to_string(),
+                "foo".to_string(),
+                "bar".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn send_returns_the_token_it_used() {
