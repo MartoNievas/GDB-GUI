@@ -145,6 +145,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             egui::Grid::new(label)
                                 .num_columns(3)
                                 .spacing([12.0, 1.0])
+                                .min_col_width(200.0)
                                 .striped(true)
                                 .show(ui, |ui| {
                                     for (name, value, _) in &group {
