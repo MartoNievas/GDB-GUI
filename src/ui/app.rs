@@ -1139,7 +1139,15 @@ mod tests {
     fn test_app() -> (App, Receiver<Command>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_event_tx, event_rx) = mpsc::channel();
-        let app = App::new(DebuggerState::new(), event_rx, cmd_tx);
+        let mut app = App::new(DebuggerState::new(), event_rx, cmd_tx);
+        // App::new() reads real settings via SettingsStore::from_env(), so a
+        // developer machine's actual ~/.config/gdb-gui/settings.toml (e.g.
+        // persistence_enabled = false, left over from manual runs) would
+        // otherwise leak into every test. Tests that inject a temp-dir
+        // `store` already assume persistence is on by default; tests that
+        // need it off set `app.settings.persistence_enabled = false`
+        // explicitly afterward.
+        app.settings.persistence_enabled = true;
         (app, cmd_rx)
     }
 
