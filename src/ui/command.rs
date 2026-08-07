@@ -102,6 +102,23 @@ pub enum Command {
     /// `Command::ProbeMainSource`'s `pending.probe` shape) on both `^done`
     /// and `^error`, emitting `StateEvent::DetachFinished{error}`.
     DetachForShutdown,
+    /// Connects to a remote `gdbserver`/GDB remote stub via
+    /// `-target-select extended-remote <host:port>` (design D5: `target` is
+    /// the canonical `"{host}:{port}"` rebuilt by the panel from a validated
+    /// host + `u16` port, never raw user text). Success is correlated off
+    /// `^connected` (never optimistic, unlike `AttachToProcess`) via
+    /// `process.rs`'s `pending.remote_connect` map; `^error` is correlated
+    /// back to `target` the same way.
+    ConnectRemote {
+        target: String,
+    },
+    /// Disconnects from a remote target via `-target-disconnect` (no
+    /// arguments). Named for its single caller (GUI shutdown, design D7),
+    /// mirroring `DetachForShutdown`'s naming — there is no interactive/
+    /// manual disconnect action. Acked via `pending.remote_disconnect`
+    /// (token-only, mirrors `pending.detach`'s shape) on both `^done` and
+    /// `^error`, emitting `StateEvent::RemoteDisconnected{error}`.
+    DisconnectForShutdown,
 
     RequestLocals,
     RequestStack,

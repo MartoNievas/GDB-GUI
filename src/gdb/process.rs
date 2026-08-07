@@ -380,6 +380,67 @@ fn correlate_pending_detach(
     }
 }
 
+/// Inspects an incoming raw MI line for a token that correlates to a
+/// pending `Command::ConnectRemote`. If the token matches an entry in
+/// `pending.remote_connect`, removes it (cleanup on both outcomes, mirroring
+/// `correlate_pending_attach`) and returns the event to emit for either
+/// outcome — unlike `correlate_pending_attach`, BOTH outcomes here carry an
+/// event (design D3/D4): success is correlated off `^connected`, never
+/// optimistic at dispatch time, so `RemoteConnectFailed` needs no rollback
+/// (nothing was ever set speculatively). `^connected` -> `RemoteConnected
+/// {target}`. `^error` -> `RemoteConnectFailed{target, message}` (GDB's raw
+/// `msg=...` text, verbatim, mirroring `ProcessAttachFailed`).
+fn correlate_pending_remote_connect(
+    line: &str,
+    pending_remote_connect: &mut HashMap<u32, String>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    let target = pending_remote_connect.get(&token)?.clone();
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^connected") {
+        pending_remote_connect.remove(&token);
+        Some(StateEvent::RemoteConnected { target })
+    } else if rest.starts_with("^error") {
+        pending_remote_connect.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::RemoteConnectFailed {
+            target,
+            message: msg,
+        })
+    } else {
+        None
+    }
+}
+
+/// `correlate_pending_detach` verbatim, retargeted at
+/// `Command::DisconnectForShutdown` (design D6/D7). If the token matches an
+/// entry in `pending.remote_disconnect`, removes it (cleanup on both
+/// outcomes) and returns `RemoteDisconnected{error}` for the caller to
+/// emit on **both** `^done` (`error: None`) and `^error` (`error: Some(GDB's
+/// raw message)`) — a shutdown ack, not a per-row error attribution.
+fn correlate_pending_remote_disconnect(
+    line: &str,
+    pending_remote_disconnect: &mut HashSet<u32>,
+) -> Option<StateEvent> {
+    let token = parse_token(line)?;
+    if !pending_remote_disconnect.contains(&token) {
+        return None;
+    }
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+
+    if rest.starts_with("^done") {
+        pending_remote_disconnect.remove(&token);
+        Some(StateEvent::RemoteDisconnected { error: None })
+    } else if rest.starts_with("^error") {
+        pending_remote_disconnect.remove(&token);
+        let msg = extract_str(rest, "msg").unwrap_or_else(|| "GDB error".into());
+        Some(StateEvent::RemoteDisconnected { error: Some(msg) })
+    } else {
+        None
+    }
+}
+
 /// Pure decision for the two catchpoint commands (`RemoveCatchpoint`,
 /// `ToggleCatchpoint`) that have no correlatable reply — mirrors
 /// `optimistic_watchpoint_event` exactly (D2/D4 from design #65, unaffected
@@ -598,6 +659,21 @@ struct PendingRegistry {
     /// `^done` and `^error` emit `StateEvent::DetachFinished{error}` — a
     /// shutdown ack, not a value to attribute an error to.
     detach: HashSet<u32>,
+
+    /// Token (assigned by `GdbWriter::send`) -> target of the
+    /// `Command::ConnectRemote` pending a response. Correlated by token, not
+    /// FIFO, like the other pending maps: unlike `attach`, BOTH outcomes
+    /// carry an event here (design D3/D4) — success is correlated off
+    /// `^connected`, never optimistic, so `RemoteConnectFailed` needs no
+    /// rollback.
+    remote_connect: HashMap<u32, String>,
+
+    /// Token (assigned by `GdbWriter::send`) of the in-flight
+    /// `Command::DisconnectForShutdown`, if any (design D6/D7). Payload-free,
+    /// mirroring `detach`'s `HashSet<u32>` shape: BOTH `^done` and `^error`
+    /// emit `StateEvent::RemoteDisconnected{error}` — a shutdown ack, not a
+    /// value to attribute an error to.
+    remote_disconnect: HashSet<u32>,
 }
 
 /// Drains `cmd_rx` fully, dispatching each `DebuggerCommand` to GDB and
@@ -701,6 +777,21 @@ fn handle_commands<W: Write>(
         // the ack itself (not a value) is what the caller needs.
         if matches!(cmd, DebuggerCommand::DetachForShutdown) {
             pending.detach.insert(token);
+        }
+
+        // Remote-connect (design D3/D4): unlike attach, no optimistic event
+        // is emitted here — success is only ever signalled off the
+        // eventual `^connected` reply via `correlate_pending_remote_connect`.
+        if let DebuggerCommand::ConnectRemote { target } = &cmd {
+            pending.remote_connect.insert(token, target.clone());
+        }
+
+        // Remote-disconnect-on-shutdown (design D6/D7): payload-free,
+        // mirrors `pending.detach`'s insert. Both `^done` and `^error` are
+        // correlated via `correlate_pending_remote_disconnect` into
+        // `RemoteDisconnected{error}`.
+        if matches!(cmd, DebuggerCommand::DisconnectForShutdown) {
+            pending.remote_disconnect.insert(token);
         }
 
         // D1 key: "{kind}:{args joined by ','}" — matches
@@ -859,6 +950,29 @@ fn handle_gdb_output<W: Write>(
     // Unlike attach, BOTH `^done` and `^error` emit `DetachFinished{error}`
     // here (a shutdown ack, not a per-row error attribution).
     if let Some(event) = correlate_pending_detach(line, &mut pending.detach) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Remote-connect correlation (design D3/D4): like attach/detach, does
+    // not `continue` — the console log still shows an `^error` via
+    // parse_line below. On `^connected`, the token is cleaned up and
+    // `RemoteConnected{target}` is emitted directly here (never derived
+    // from `parse_line`/`parse_result`, which hits `_ => None` for the
+    // "connected" class — verified).
+    if let Some(event) = correlate_pending_remote_connect(line, &mut pending.remote_connect) {
+        if event_tx.send(DebuggerEvent::State(event)).is_err() {
+            return ControlFlow::Break(());
+        }
+    }
+
+    // Remote-disconnect correlation (design D6/D7): like detach, does not
+    // `continue`. Unlike attach, BOTH `^done` and `^error` emit
+    // `RemoteDisconnected{error}` here (a shutdown ack, not a per-row error
+    // attribution).
+    if let Some(event) = correlate_pending_remote_disconnect(line, &mut pending.remote_disconnect)
+    {
         if event_tx.send(DebuggerEvent::State(event)).is_err() {
             return ControlFlow::Break(());
         }
@@ -2306,6 +2420,292 @@ mod tests {
             DebuggerEvent::State(StateEvent::DetachFinished { error }) => assert_eq!(error, None),
             other => panic!("expected DetachFinished, got {other:?}"),
         }
+    }
+
+    // ── Remote target connect/disconnect (Phase 2) ──────────────────────────
+    //
+    // pending.remote_connect: HashMap<u32, String> (token -> target), BOTH
+    // outcomes carry an event (design D3: success is correlated off
+    // `^connected` — never optimistic, unlike attach — so
+    // `RemoteConnectFailed` needs no rollback).
+
+    #[test]
+    fn correlate_pending_remote_connect_emits_remote_connected_and_removes_token_on_connected() {
+        let mut pending_remote_connect: HashMap<u32, String> = HashMap::new();
+        pending_remote_connect.insert(4, "localhost:1234".into());
+
+        let event = correlate_pending_remote_connect("4^connected", &mut pending_remote_connect);
+
+        match event {
+            Some(StateEvent::RemoteConnected { target }) => {
+                assert_eq!(target, "localhost:1234");
+            }
+            other => panic!("expected RemoteConnected, got {other:?}"),
+        }
+        assert!(
+            !pending_remote_connect.contains_key(&4),
+            "token must be removed after a matching ^connected"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_remote_connect_emits_error_with_verbatim_message_and_removes_token() {
+        let mut pending_remote_connect: HashMap<u32, String> = HashMap::new();
+        pending_remote_connect.insert(9, "localhost:9999".into());
+
+        let event = correlate_pending_remote_connect(
+            "9^error,msg=\"localhost:9999: Connection refused.\"",
+            &mut pending_remote_connect,
+        );
+
+        match event {
+            Some(StateEvent::RemoteConnectFailed { target, message }) => {
+                assert_eq!(target, "localhost:9999");
+                assert_eq!(message, "localhost:9999: Connection refused.");
+            }
+            other => panic!("expected RemoteConnectFailed, got {other:?}"),
+        }
+        assert!(
+            !pending_remote_connect.contains_key(&9),
+            "token must be removed after a matching ^error"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_remote_connect_ignores_unrelated_tokens() {
+        let mut pending_remote_connect: HashMap<u32, String> = HashMap::new();
+        pending_remote_connect.insert(1, "localhost:1234".into());
+
+        let event = correlate_pending_remote_connect("2^connected", &mut pending_remote_connect);
+        assert!(event.is_none());
+        assert!(
+            pending_remote_connect.contains_key(&1),
+            "unrelated entry must survive untouched"
+        );
+    }
+
+    #[test]
+    fn handle_commands_inserts_pending_remote_connect_entry_on_connect_remote_dispatch() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx
+            .send(DebuggerCommand::ConnectRemote {
+                target: "localhost:1234".into(),
+            })
+            .unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert_eq!(
+            pending.remote_connect.get(&0),
+            Some(&"localhost:1234".to_string())
+        );
+    }
+
+    // pending.remote_disconnect: HashSet<u32> (token only), mirrors
+    // pending.detach exactly (design D6/D7).
+
+    #[test]
+    fn correlate_pending_remote_disconnect_done_emits_remote_disconnected_with_no_error() {
+        let mut pending_remote_disconnect: HashSet<u32> = HashSet::new();
+        pending_remote_disconnect.insert(5);
+
+        let event =
+            correlate_pending_remote_disconnect("5^done", &mut pending_remote_disconnect);
+
+        match event {
+            Some(StateEvent::RemoteDisconnected { error }) => assert_eq!(error, None),
+            other => panic!("expected RemoteDisconnected, got {other:?}"),
+        }
+        assert!(
+            !pending_remote_disconnect.contains(&5),
+            "token must be removed after a matching ^done"
+        );
+    }
+
+    #[test]
+    fn correlate_pending_remote_disconnect_error_emits_remote_disconnected_with_verbatim_message()
+     {
+        let mut pending_remote_disconnect: HashSet<u32> = HashSet::new();
+        pending_remote_disconnect.insert(6);
+
+        let event = correlate_pending_remote_disconnect(
+            "6^error,msg=\"Remote connection closed\"",
+            &mut pending_remote_disconnect,
+        );
+
+        match event {
+            Some(StateEvent::RemoteDisconnected { error }) => {
+                assert_eq!(error, Some("Remote connection closed".to_string()));
+            }
+            other => panic!("expected RemoteDisconnected, got {other:?}"),
+        }
+        assert!(!pending_remote_disconnect.contains(&6));
+    }
+
+    #[test]
+    fn correlate_pending_remote_disconnect_ignores_unrelated_tokens() {
+        let mut pending_remote_disconnect: HashSet<u32> = HashSet::new();
+        pending_remote_disconnect.insert(1);
+
+        let event = correlate_pending_remote_disconnect("2^done", &mut pending_remote_disconnect);
+        assert!(event.is_none());
+        assert!(pending_remote_disconnect.contains(&1));
+    }
+
+    #[test]
+    fn handle_commands_inserts_pending_remote_disconnect_entry_on_disconnect_for_shutdown_dispatch()
+     {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = GdbWriter { stdin: &mut buf, seq: 0 };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending = PendingRegistry::default();
+
+        cmd_tx.send(DebuggerCommand::DisconnectForShutdown).unwrap();
+
+        handle_commands(&cmd_rx, &mut writer, &event_tx, 1234, &mut pending).unwrap();
+
+        assert!(pending.remote_disconnect.contains(&0));
+    }
+
+    // Attach-and-connect in flight resolve independently — mirrors
+    // attach_and_catch_in_flight_resolve_independently.
+    #[test]
+    fn attach_and_remote_connect_in_flight_resolve_independently() {
+        let mut pending_attach: HashMap<u32, u32> = HashMap::new();
+        pending_attach.insert(30, 4242);
+        let mut pending_remote_connect: HashMap<u32, String> = HashMap::new();
+        pending_remote_connect.insert(31, "localhost:1234".into());
+
+        // The remote-connect reply arrives first; the attach path must not
+        // touch it, since its token isn't tracked there.
+        let attach_attempt = correlate_pending_attach("31^done", &mut pending_attach);
+        assert!(attach_attempt.is_none());
+        assert!(pending_attach.contains_key(&30));
+        assert!(pending_remote_connect.contains_key(&31));
+
+        let connect_event =
+            correlate_pending_remote_connect("31^connected", &mut pending_remote_connect);
+        match connect_event {
+            Some(StateEvent::RemoteConnected { target }) => {
+                assert_eq!(target, "localhost:1234");
+            }
+            other => panic!("expected RemoteConnected, got {other:?}"),
+        }
+        assert!(!pending_remote_connect.contains_key(&31));
+
+        // The attach reply resolves its own token afterward, unaffected.
+        let attach_event = correlate_pending_attach(
+            "30^error,msg=\"ptrace: Operation not permitted.\"",
+            &mut pending_attach,
+        );
+        match attach_event {
+            Some(StateEvent::ProcessAttachFailed { pid, message }) => {
+                assert_eq!(pid, 4242);
+                assert_eq!(message, "ptrace: Operation not permitted.");
+            }
+            other => panic!("expected ProcessAttachFailed, got {other:?}"),
+        }
+        assert!(!pending_attach.contains_key(&30));
+    }
+
+    // Check order in handle_gdb_output (design.md): … detach -> remote_connect
+    // -> remote_disconnect -> insert -> memory -> parse_line. Fall-through
+    // (not short-circuit): the console log still shows the raw GdbError via
+    // parse_line, mirroring watch/catch/attach/detach/insert/memory.
+    #[test]
+    fn handle_gdb_output_remote_connect_error_falls_through_to_parse_line() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending
+            .remote_connect
+            .insert(7, "localhost:9999".into());
+
+        let flow = handle_gdb_output(
+            "7^error,msg=\"localhost:9999: Connection refused.\"",
+            &mut writer,
+            &event_tx,
+            &mut pending,
+        );
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.remote_connect.contains_key(&7));
+
+        let first = event_rx.try_recv().expect("RemoteConnectFailed event");
+        match first {
+            DebuggerEvent::State(StateEvent::RemoteConnectFailed { target, message }) => {
+                assert_eq!(target, "localhost:9999");
+                assert_eq!(message, "localhost:9999: Connection refused.");
+            }
+            other => panic!("expected RemoteConnectFailed, got {other:?}"),
+        }
+
+        let second = event_rx
+            .try_recv()
+            .expect("GdbError event from parse_line fall-through");
+        match second {
+            DebuggerEvent::Ui(UiEvent::GdbError(msg)) => {
+                assert_eq!(msg, "localhost:9999: Connection refused.");
+            }
+            other => panic!("expected GdbError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gdb_output_remote_disconnect_done_emits_remote_disconnected_and_falls_through() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+        pending.remote_disconnect.insert(8);
+
+        let flow = handle_gdb_output("8^done", &mut writer, &event_tx, &mut pending);
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(!pending.remote_disconnect.contains(&8));
+
+        let event = event_rx.try_recv().expect("RemoteDisconnected event");
+        match event {
+            DebuggerEvent::State(StateEvent::RemoteDisconnected { error }) => {
+                assert_eq!(error, None)
+            }
+            other => panic!("expected RemoteDisconnected, got {other:?}"),
+        }
+    }
+
+    // An untokened `^connected` (e.g. from `gdb-gui -ex "target
+    // extended-remote …"`) has no `pending.remote_connect` entry to
+    // correlate against, so it falls through harmlessly to parse_line's
+    // `_ => None` (design D3 — no generic "connected" arm in
+    // `parser.rs::parse_result`, verified). This documents a non-regression,
+    // not a new gap.
+    #[test]
+    fn handle_gdb_output_untokened_connected_falls_through_harmlessly() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+        let mut writer = GdbWriter {
+            stdin: Vec::<u8>::new(),
+            seq: 1,
+        };
+        let mut pending = PendingRegistry::default();
+
+        let flow = handle_gdb_output("^connected", &mut writer, &event_tx, &mut pending);
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an untokened ^connected must emit no event at all"
+        );
     }
 
     // ─── spawn_reader_thread ────────────────────────────────────────────────

@@ -73,6 +73,14 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 // overwrite, so this arm's text is only ever seen in the
                 // brief pre-pause window.
                 crate::state::ProgramState::Attached { .. } => "Attached",
+                // SLICE-1 COMPILE STOPGAP (out of this PR's planned scope):
+                // adding `ProgramState::RemoteConnected` in Phase 4 makes
+                // this match non-exhaustive, so a minimal arm is required
+                // here just to keep the crate building — this slice's UI is
+                // otherwise untouched (Phase 5+). Slice 2 (Phase 9) replaces
+                // this with the real `format!("Remote {target} — {status}")`
+                // via `remote_status_label`, per design.md.
+                crate::state::ProgramState::RemoteConnected { .. } => "Connected",
             };
 
             // `attached_pid` (not the `program` match above) drives the

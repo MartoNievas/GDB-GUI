@@ -289,6 +289,14 @@ pub enum ProgramState {
     /// window before the first pause, and `topbar.rs` reads `attached_pid`
     /// (not this variant) to keep showing "Attached (pid N)" afterward.
     Attached { pid: u32 },
+    /// Connected to a remote `gdbserver`/GDB remote stub (design D1/D3/D4).
+    /// Distinct from `ProgramLoaded` and `Attached`, per spec ("Distinct
+    /// Connected State") — the topbar reads this variant to show the
+    /// connected target rather than "Loaded"/"Attached".
+    /// `DebuggerState::remote_target` is the durable fact that survives the
+    /// `ProgramPaused` overwrite once execution stops, mirroring
+    /// `attached_pid`'s precedent for `Attached { pid }`.
+    RemoteConnected { target: String },
 }
 
 // ─── Persistent state ────────────────────────────────────────────────────────
@@ -347,6 +355,12 @@ pub struct ErrorState {
     /// exists at a time. Cleared on the next successful `ProcessAttached`.
     /// Wiped in full on Loaded/Started/Exited, like the other error slots.
     pub attach_error: Option<String>,
+    /// GDB `^error` message from a failed `-target-select extended-remote`
+    /// attempt (design: "single slot, like `attach_error`") — only one
+    /// remote-connect panel/attempt exists at a time. Cleared on the next
+    /// successful `RemoteConnected`. Wiped in full on Loaded/Started/Exited,
+    /// like `attach_error`.
+    pub remote_connect_error: Option<String>,
 }
 
 // ─── Top-level state ─────────────────────────────────────────────────────────
@@ -392,6 +406,13 @@ pub struct DebuggerState {
     /// mirroring `preview_file`'s precedent for state that survives a
     /// program-state churn.
     pub attached_pid: Option<u32>,
+    /// The connected remote target (design D1/D3/D4), set by
+    /// `RemoteConnected` and cleared by `RemoteDisconnected`. Durable across
+    /// the `ProgramPaused` transition, mirroring `attached_pid`'s precedent:
+    /// `ProgramState::RemoteConnected` is transient by construction (see
+    /// its doc comment) — this field is the fact that outlives that
+    /// overwrite.
+    pub remote_target: Option<String>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -578,6 +599,34 @@ pub enum StateEvent {
     DetachFinished {
         error: Option<String>,
     },
+    /// `-target-select extended-remote <target>` acked with `^connected`
+    /// (design D3/D4). Correlated by MI token via `pending.remote_connect`
+    /// in `process.rs` — success is NEVER optimistic here, unlike
+    /// `ProcessAttached` (see `correlate_pending_remote_connect`'s doc
+    /// comment). The full state-transition `apply` arm (Phase 4) sets
+    /// `program = RemoteConnected{target}`, `remote_target = Some(target)`,
+    /// clears `remote_connect_error`.
+    RemoteConnected {
+        target: String,
+    },
+    /// `^error` for a `ConnectRemote` attempt, correlated by MI token via
+    /// `pending.remote_connect` (both outcomes carry an event here, unlike
+    /// the error-only `ProcessAttachFailed`). `message` is GDB's raw text,
+    /// verbatim. Needs no rollback (Phase 4): nothing was ever set
+    /// optimistically for this command.
+    RemoteConnectFailed {
+        target: String,
+        message: String,
+    },
+    /// `-target-disconnect` acked with either `^done` (success,
+    /// `error: None`) or `^error` (failure, GDB's raw message), correlated
+    /// by MI token via `pending.remote_disconnect` (token-only, mirrors
+    /// `DetachFinished`/`pending.detach`). The Phase 4 `apply` arm resets to
+    /// `ProgramState::NoProgramLoaded`/`remote_target = None` regardless of
+    /// `error`.
+    RemoteDisconnected {
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +669,7 @@ impl DebuggerState {
             memory: vec![],
             memory_addr: String::new(),
             attached_pid: None,
+            remote_target: None,
         }
     }
 
@@ -651,6 +701,7 @@ impl DebuggerState {
                 self.memory = vec![];
                 self.errors.memory_error = None;
                 self.errors.attach_error = None;
+                self.errors.remote_connect_error = None;
             }
 
             StateEvent::ProgramStarted => {
@@ -674,6 +725,7 @@ impl DebuggerState {
                 self.memory = vec![];
                 self.errors.memory_error = None;
                 self.errors.attach_error = None;
+                self.errors.remote_connect_error = None;
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -716,6 +768,7 @@ impl DebuggerState {
                 self.memory = vec![];
                 self.errors.memory_error = None;
                 self.errors.attach_error = None;
+                self.errors.remote_connect_error = None;
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -887,6 +940,36 @@ impl DebuggerState {
                 self.program = ProgramState::NoProgramLoaded;
                 self.attached_pid = None;
             }
+
+            // Phase 4 (design D3/D4): emitted only off a correlated
+            // `^connected` reply — never optimistic, unlike
+            // `ProcessAttached` — so `persistent.executable` is left
+            // deliberately untouched here too (same D4 restore-guard
+            // reasoning as `ProcessAttached`'s comment above).
+            StateEvent::RemoteConnected { target } => {
+                self.program = ProgramState::RemoteConnected {
+                    target: target.clone(),
+                };
+                self.remote_target = Some(target);
+                self.errors.remote_connect_error = None;
+            }
+            // Phase 4 (design D3/D4): stores GDB's verbatim `^error`
+            // message. Needs NO rollback — unlike `ProcessAttachFailed`,
+            // nothing was ever set optimistically for `ConnectRemote`, so
+            // there is no prior state to undo.
+            StateEvent::RemoteConnectFailed { target: _, message } => {
+                self.errors.remote_connect_error = Some(message);
+            }
+            // Phase 4 (design D6/D7): only the state transition is
+            // implemented here — the actual `-target-disconnect`
+            // dispatch/shutdown hook is a later chained PR's (Slice 2)
+            // responsibility, mirroring `DetachFinished`. `error` is a
+            // diagnostic only; either outcome releases the connected
+            // session the same way.
+            StateEvent::RemoteDisconnected { error: _ } => {
+                self.program = ProgramState::NoProgramLoaded;
+                self.remote_target = None;
+            }
         }
     }
 
@@ -1011,6 +1094,55 @@ impl DebuggerState {
     }
 }
 
+/// Parses and canonically rebuilds a `"host:port"` remote target string
+/// from raw panel input (design D5 — the panel rebuilds the target from a
+/// validated host + `u16` port rather than raw-interpolating user text into
+/// `Command::ConnectRemote`, so the writer's `strip_mi_newlines` guard is
+/// defense-in-depth, not the only line of defense).
+///
+/// SLICE-1 DEVIATION (Phase 3): design.md's Interfaces block places this
+/// function in `src/ui/panels/remote.rs` (Phase 5, out of scope for this
+/// PR). Placed here instead — the only Slice-1 file suited to pure,
+/// UI-framework-free validation logic — so the writer/state plumbing this
+/// slice delivers is fully covered by tests without creating the panel
+/// file early. Slice 2 should call (or re-export) this function from
+/// `remote.rs` rather than duplicating it.
+///
+/// Trims surrounding whitespace, then requires: exactly one `:`; a
+/// non-empty host with every char in `[A-Za-z0-9._-]`; and a port parseable
+/// as `u16` and non-zero. Returns `None` on any violation — including any
+/// remaining internal whitespace (which cannot appear in either a valid
+/// host or a valid port) — so the reconstructed `"{host}:{port}"` can never
+/// carry any MI-breaking byte forward.
+pub(crate) fn parse_remote_target(buf: &str) -> Option<String> {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+
+    let mut parts = trimmed.split(':');
+    let host = parts.next()?;
+    let port_str = parts.next()?;
+    if parts.next().is_some() {
+        return None; // more than one colon
+    }
+
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+
+    let port: u16 = port_str.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+
+    Some(format!("{host}:{port}"))
+}
+
 /// Compares two file paths tolerantly.
 ///
 /// GDB may report a breakpoint's path differently from the current frame's
@@ -1042,6 +1174,210 @@ impl Default for DebuggerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Remote target connect/disconnect state transitions (Phase 4) ────────
+
+    #[test]
+    fn remote_connected_sets_program_state_and_remote_target_leaves_executable_untouched() {
+        let mut state = DebuggerState::new();
+        state.errors.remote_connect_error = Some("stale error".into());
+
+        state.apply(StateEvent::RemoteConnected {
+            target: "localhost:1234".into(),
+        });
+
+        match &state.program {
+            ProgramState::RemoteConnected { target } => assert_eq!(target, "localhost:1234"),
+            other => panic!("expected ProgramState::RemoteConnected, got {other:?}"),
+        }
+        assert_eq!(state.remote_target, Some("localhost:1234".to_string()));
+        assert_eq!(state.errors.remote_connect_error, None);
+        // persistent.executable must stay untouched (D4's restore guard —
+        // `try_start_restore` is only reachable under `was_loaded`).
+        assert_eq!(state.persistent.executable, None);
+    }
+
+    #[test]
+    fn remote_connect_failed_sets_error_slot_only_no_rollback() {
+        let mut state = DebuggerState::new();
+
+        state.apply(StateEvent::RemoteConnectFailed {
+            target: "localhost:9999".into(),
+            message: "localhost:9999: Connection refused.".into(),
+        });
+
+        assert_eq!(
+            state.errors.remote_connect_error,
+            Some("localhost:9999: Connection refused.".to_string())
+        );
+        // Nothing was ever set optimistically, so failure needs no rollback:
+        // program/remote_target stay at their prior (unset) values.
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.remote_target, None);
+    }
+
+    #[test]
+    fn remote_disconnected_resets_to_no_program_loaded_and_clears_remote_target() {
+        let mut state = DebuggerState::new();
+        state.program = ProgramState::RemoteConnected {
+            target: "localhost:1234".into(),
+        };
+        state.remote_target = Some("localhost:1234".into());
+
+        state.apply(StateEvent::RemoteDisconnected { error: None });
+
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.remote_target, None);
+    }
+
+    #[test]
+    fn remote_disconnected_resets_regardless_of_error_payload() {
+        let mut state = DebuggerState::new();
+        state.program = ProgramState::RemoteConnected {
+            target: "localhost:1234".into(),
+        };
+        state.remote_target = Some("localhost:1234".into());
+
+        state.apply(StateEvent::RemoteDisconnected {
+            error: Some("Remote connection closed".into()),
+        });
+
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.remote_target, None);
+    }
+
+    #[test]
+    fn remote_target_survives_program_paused() {
+        let mut state = DebuggerState::new();
+        state.remote_target = Some("localhost:1234".into());
+
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0x1000,
+                    function: "main".into(),
+                    file: Some("a.c".into()),
+                    line: Some(3),
+                },
+                stack: vec![],
+                stop_reason: StopReason::Unknown,
+            },
+        });
+
+        assert_eq!(state.remote_target, Some("localhost:1234".to_string()));
+    }
+
+    #[test]
+    fn program_loaded_started_exited_clear_remote_connect_error_alongside_attach_error() {
+        let mut state = DebuggerState::new();
+        state.errors.remote_connect_error = Some("e".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert_eq!(state.errors.remote_connect_error, None);
+
+        let mut state = DebuggerState::new();
+        state.errors.remote_connect_error = Some("e".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert_eq!(state.errors.remote_connect_error, None);
+
+        let mut state = DebuggerState::new();
+        state.errors.remote_connect_error = Some("e".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert_eq!(state.errors.remote_connect_error, None);
+    }
+
+    // ── parse_remote_target (Phase 3) ────────────────────────────────────────
+    //
+    // SLICE-1 DEVIATION: lives here, not `src/ui/panels/remote.rs` (Phase 5,
+    // out of scope for this PR) — see the function's doc comment.
+
+    #[test]
+    fn parse_remote_target_valid_host_and_port() {
+        assert_eq!(
+            parse_remote_target("localhost:1234"),
+            Some("localhost:1234".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_target_trims_leading_and_trailing_whitespace() {
+        assert_eq!(
+            parse_remote_target("  localhost:1234  "),
+            Some("localhost:1234".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_empty_input() {
+        assert_eq!(parse_remote_target(""), None);
+        assert_eq!(parse_remote_target("   "), None);
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_missing_colon() {
+        assert_eq!(parse_remote_target("localhost"), None);
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_two_colons() {
+        assert_eq!(parse_remote_target("localhost:1234:5678"), None);
+        assert_eq!(parse_remote_target("::1:1234"), None);
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_port_zero() {
+        assert_eq!(parse_remote_target("localhost:0"), None);
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_port_above_u16_max() {
+        assert_eq!(parse_remote_target("localhost:65536"), None);
+    }
+
+    #[test]
+    fn parse_remote_target_accepts_max_u16_port() {
+        assert_eq!(
+            parse_remote_target("localhost:65535"),
+            Some("localhost:65535".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_target_rejects_embedded_whitespace() {
+        assert_eq!(parse_remote_target("local host:1234"), None);
+        assert_eq!(parse_remote_target("localhost: 1234"), None);
+    }
+
+    // SECURITY (threat-matrix: MI argument composition into GDB stdin): an
+    // embedded newline must be REJECTED outright, not silently stripped —
+    // unlike the writer's `strip_mi_newlines` guard, the panel-side rebuild
+    // refuses the whole input rather than forwarding a mangled target.
+    #[test]
+    fn parse_remote_target_rejects_embedded_newline() {
+        assert_eq!(parse_remote_target("local\nhost:1234"), None);
+        assert_eq!(parse_remote_target("localhost:1234\n-exec-continue"), None);
+    }
+
+    // SECURITY (D5): host chars outside `[A-Za-z0-9._-]` are rejected
+    // outright — the canonical rebuild never carries a hostile byte forward
+    // for the writer's `strip_mi_newlines` to have to catch.
+    #[test]
+    fn parse_remote_target_rejects_hostile_host_characters() {
+        assert_eq!(parse_remote_target("local\"host:1234"), None);
+        assert_eq!(parse_remote_target("local;host:1234"), None);
+        assert_eq!(parse_remote_target("local$host:1234"), None);
+        assert_eq!(parse_remote_target("local\\host:1234"), None);
+    }
+
+    #[test]
+    fn parse_remote_target_accepts_host_with_dots_underscores_hyphens() {
+        assert_eq!(
+            parse_remote_target("my-host_1.example.com:22"),
+            Some("my-host_1.example.com:22".to_string())
+        );
+    }
 
     #[test]
     fn edit_error_returns_none_for_absent_key() {

@@ -55,6 +55,18 @@ pub fn command_to_mi(cmd: &Command) -> String {
         Command::AttachToProcess(pid) => format!("-target-attach {pid}"),
         Command::DetachForShutdown => "-target-detach".into(),
 
+        // SECURITY (threat-matrix: MI argument composition into subprocess
+        // stdin — D5): `target` is raw-interpolated (never `quote_mi`'d),
+        // mirroring `build_break_insert`'s `file:line` — `-target-select`
+        // reads CLI-style text, so quoting would embed literal `\"` into the
+        // target GDB tries to resolve. `strip_mi_newlines` is still applied
+        // as the unbypassable injection guard.
+        Command::ConnectRemote { target } => format!(
+            "-target-select extended-remote {}",
+            strip_mi_newlines(target)
+        ),
+        Command::DisconnectForShutdown => "-target-disconnect".into(),
+
         Command::RequestLocals => "-stack-list-variables --all-values".into(),
 
         Command::RequestStack => "-stack-list-frames".into(),
@@ -1102,6 +1114,87 @@ mod tests {
     fn detach_for_shutdown_command_maps_to_target_detach_no_arguments() {
         let mi = command_to_mi(&Command::DetachForShutdown);
         assert_eq!(mi, "-target-detach");
+        assert_eq!(mi.lines().count(), 1);
+    }
+
+    // ─── Remote target connect/disconnect (Phase 1) ─────────────────────────
+
+    #[test]
+    fn connect_remote_command_maps_to_target_select_extended_remote() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "localhost:1234".into(),
+        });
+        assert_eq!(mi, "-target-select extended-remote localhost:1234");
+    }
+
+    // SECURITY (threat-matrix: MI argument composition into subprocess
+    // stdin — `-target-select extended-remote <target>` interpolates
+    // `target`). One test per adversarial character class, mirroring
+    // `build_break_insert`'s own injection tests: `target` is raw
+    // (unquoted, CLI-style, like `file:line`), so only `strip_mi_newlines`
+    // guards it — no `quote_mi` escaping is applied.
+    #[test]
+    fn connect_remote_command_strips_embedded_newline() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "localhost:1234\n-exec-continue".into(),
+        });
+        assert!(
+            !mi.contains('\n'),
+            "MI command must not contain a raw newline: {mi:?}"
+        );
+        assert_eq!(
+            mi,
+            "-target-select extended-remote localhost:1234-exec-continue"
+        );
+    }
+
+    #[test]
+    fn connect_remote_command_strips_embedded_carriage_return() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "localhost:1234\r-exec-continue".into(),
+        });
+        assert!(!mi.contains('\r'));
+        assert_eq!(
+            mi,
+            "-target-select extended-remote localhost:1234-exec-continue"
+        );
+    }
+
+    #[test]
+    fn connect_remote_command_passes_quote_and_backslash_through_raw() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "host\"with\\backslash:1234".into(),
+        });
+        assert_eq!(
+            mi,
+            "-target-select extended-remote host\"with\\backslash:1234"
+        );
+    }
+
+    #[test]
+    fn connect_remote_command_passes_space_through_raw() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "host name:1234".into(),
+        });
+        assert_eq!(mi, "-target-select extended-remote host name:1234");
+    }
+
+    #[test]
+    fn connect_remote_command_second_mi_command_payload_stays_a_single_line() {
+        let mi = command_to_mi(&Command::ConnectRemote {
+            target: "localhost:1234\n-exec-run".into(),
+        });
+        assert_eq!(mi.lines().count(), 1);
+        assert_eq!(
+            mi,
+            "-target-select extended-remote localhost:1234-exec-run"
+        );
+    }
+
+    #[test]
+    fn disconnect_for_shutdown_command_maps_to_target_disconnect() {
+        let mi = command_to_mi(&Command::DisconnectForShutdown);
+        assert_eq!(mi, "-target-disconnect");
         assert_eq!(mi.lines().count(), 1);
     }
 
