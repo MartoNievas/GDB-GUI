@@ -927,8 +927,8 @@ impl eframe::App for App {
         // ── CONSOLE (bottom) ──────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("console")
             .resizable(true)
-            .min_height(50.0)
-            .default_height(180.0)
+            .min_height(100.0)
+            .default_height(300.0)
             .frame(flat(BG_CONSOLE))
             .show(ctx, |ui| {
                 panels::console::render(self, ui, ctx);
@@ -937,8 +937,8 @@ impl eframe::App for App {
         // ── RIGHT PANEL ───────────────────────────────────────────────────────
         egui::SidePanel::right("right_panel")
             .resizable(true)
-            .min_width(180.0)
-            .default_width(280.0)
+            .min_width(500.0)
+            .default_width(500.0)
             .frame(flat(BG_PANEL))
             .show(ctx, |ui| {
                 // Upper collapsible sections — drag the divider below to resize
