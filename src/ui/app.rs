@@ -28,6 +28,7 @@ bitflags! {
         const FILES       = 1 << 5;
         const THREAD      = 1 << 6;
         const STRUCT      = 1 << 7;
+        const ATTACH      = 1 << 8;
     }
 }
 
@@ -82,6 +83,9 @@ pub struct App {
     // Catchpoints panel input row buffers.
     pub(crate) cp_kind_buffer: crate::state::CatchpointKind,
     pub(crate) cp_args_buffer: String,
+
+    // Attach panel PID input buffer (design D1-D5).
+    pub(crate) attach_pid_buffer: String,
 
     // ── Session persistence (design decision D4/D6) ─────────────────────
     /// Resolved once at construction via `Store::from_env()`; `None` when
@@ -327,6 +331,7 @@ impl App {
             wp_kind_buffer: crate::state::WatchpointKind::Write,
             cp_kind_buffer: crate::state::CatchpointKind::Fork,
             cp_args_buffer: String::new(),
+            attach_pid_buffer: String::new(),
             store: crate::state::Store::from_env(),
             restore_pending: false,
             restore_session: None,
@@ -390,6 +395,12 @@ impl App {
 
         let was_paused = matches!(s, crate::state::StateEvent::ProgramPaused { .. });
         let was_loaded = matches!(s, crate::state::StateEvent::ProgramLoaded { .. });
+        // Design D1/D4/D5: a distinct flag from `was_loaded` — `was_loaded`
+        // matches `StateEvent::ProgramLoaded` only, so `try_start_restore`
+        // and `Command::ProbeMainSource` below stay structurally
+        // unreachable from `ProcessAttached` (D4's restore guard is
+        // unbypassable by construction, not by an added check here).
+        let was_attached = matches!(s, crate::state::StateEvent::ProcessAttached { .. });
         // Captured for the restore hook (Phase 3, design D2): the executable
         // this `ProgramLoaded` names, so `try_start_restore` can load its
         // project file once `s` has been consumed into `self.state`.
@@ -457,6 +468,14 @@ impl App {
                     self.try_start_restore(&exe);
                 }
             }
+        }
+        if was_attached {
+            // D5: only the register/global-names requests — no
+            // `ProbeMainSource` (targets a not-yet-started program, which
+            // attach never is) and no `try_start_restore` (D4: structurally
+            // unreachable, since this branch is not `if was_loaded`).
+            self.send(Command::RequestRegisterNames);
+            self.send(Command::RequestGlobalNames);
         }
         if was_paused {
             self.refresh_thread_scoped_views();
@@ -885,6 +904,9 @@ impl eframe::App for App {
 
                                 // CATCHPOINTS ──────────────────────────────────────────
                                 panels::catchpoints::render(self, ui);
+
+                                // ATTACH ────────────────────────────────────────────────
+                                panels::attach::render(self, ui);
 
                                 // COMMANDS ──────────────────────────────────────────────
                                 panels::commands::render(self, ui);
@@ -2057,5 +2079,164 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Process attach (PR2, Phase 4) ────────────────────────────────────────
+
+    // Task 4.1: the attach cascade sends exactly RequestRegisterNames +
+    // RequestGlobalNames — ProbeMainSource must be absent (design D5: it
+    // targets a not-yet-started program, which attach never is).
+    #[test]
+    fn apply_state_event_process_attached_sends_register_and_global_names_only() {
+        let (mut app, cmd_rx) = test_app();
+
+        app.apply_state_event(crate::state::StateEvent::ProcessAttached { pid: 4242 });
+
+        let sent: Vec<Command> = cmd_rx.try_iter().collect();
+        assert!(
+            sent.contains(&Command::RequestRegisterNames),
+            "expected a RequestRegisterNames follow-up, got {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::RequestGlobalNames),
+            "expected a RequestGlobalNames follow-up, got {sent:?}"
+        );
+        assert!(
+            !sent.contains(&Command::ProbeMainSource),
+            "ProbeMainSource must never be sent on attach, got {sent:?}"
+        );
+        assert_eq!(
+            sent.len(),
+            2,
+            "attach cascade must send exactly two commands, got {sent:?}"
+        );
+    }
+
+    // Task 4.2 (design D4): a successful attach must never arm a restore
+    // replay — `was_loaded` matches `StateEvent::ProgramLoaded` only, and
+    // `ProcessAttached` is a distinct variant, so `try_start_restore` is
+    // structurally unreachable from this event.
+    #[test]
+    fn apply_state_event_process_attached_does_not_start_restore() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("attach-no-restore");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProcessAttached { pid: 4242 });
+
+        assert!(
+            !app.restore_pending,
+            "ProcessAttached must never arm a restore replay"
+        );
+        assert!(app.restore_session.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 4.2 (design D4): `persistent.executable` stays `None` on attach,
+    // so `save_persistent_state`'s own no-executable guard applies —
+    // asserted end-to-end via the project-file store, mirroring
+    // `apply_state_event_does_not_save_when_no_executable_loaded`.
+    #[test]
+    fn apply_state_event_process_attached_does_not_save_project_file() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("attach-no-save");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProcessAttached { pid: 4242 });
+
+        assert_eq!(app.state.persistent.executable, None);
+        let store = app.store.as_ref().unwrap();
+        assert!(matches!(store.load(""), crate::state::LoadOutcome::Absent));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Triangulation: seed a real project file for a PRIOR executable first,
+    // so a restore WOULD have fired here if attach accidentally reused the
+    // `ProgramLoaded` restore path. The prior file must be left untouched.
+    #[test]
+    fn apply_state_event_process_attached_leaves_a_prior_executables_project_file_untouched() {
+        let (mut app, _cmd_rx) = test_app();
+        let dir = unique_temp_dir("attach-leaves-prior-file-untouched");
+        app.store = Some(crate::state::Store { root: dir.clone() });
+
+        app.apply_state_event(crate::state::StateEvent::ProgramLoaded {
+            executable: "/tmp/prior-exe.out".into(),
+        });
+        app.apply_state_event(crate::state::StateEvent::BreakpointAdded {
+            breakpoint: bp_row(1, "/tmp/main.c", 5),
+        });
+
+        app.apply_state_event(crate::state::StateEvent::ProcessAttached { pid: 4242 });
+
+        let store = app.store.as_ref().unwrap();
+        match store.load("/tmp/prior-exe.out") {
+            crate::state::LoadOutcome::Loaded(project_file) => {
+                assert_eq!(
+                    project_file.breakpoints.len(),
+                    1,
+                    "attach must not rewrite a prior executable's project file"
+                );
+            }
+            other => panic!("expected the prior seeded project file to still be Loaded, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task 4.3 (design D3): gating predicate truth table — enabled iff no
+    // program is loaded/attached AND the buffer parses to a non-zero u32.
+    #[test]
+    fn attach_enabled_truth_table() {
+        use crate::state::ProgramState;
+        use crate::ui::panels::attach::attach_enabled;
+
+        // Enabled: no program, no attached_pid, valid nonzero pid.
+        assert!(attach_enabled(&ProgramState::NoProgramLoaded, None, "4242"));
+
+        // Disabled: every other ProgramState variant, even with no
+        // attached_pid and a valid buffer.
+        assert!(!attach_enabled(&ProgramState::ProgramLoaded, None, "4242"));
+        assert!(!attach_enabled(&ProgramState::Running, None, "4242"));
+        assert!(!attach_enabled(&ProgramState::Paused, None, "4242"));
+        assert!(!attach_enabled(
+            &ProgramState::Exited { code: Some(0) },
+            None,
+            "4242"
+        ));
+        assert!(!attach_enabled(
+            &ProgramState::Attached { pid: 1 },
+            None,
+            "4242"
+        ));
+
+        // Disabled: attached_pid already set, even with NoProgramLoaded.
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            Some(1),
+            "4242"
+        ));
+
+        // Disabled: invalid buffer content — non-numeric, zero, negative,
+        // overflowing u32, or empty.
+        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "abc"));
+        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "0"));
+        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, "-1"));
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            "99999999999"
+        ));
+        assert!(!attach_enabled(&ProgramState::NoProgramLoaded, None, ""));
+
+        // Injection row (threat matrix): a trailing-newline buffer (e.g.
+        // "12\n-exec-run") must never enable the button — u32::from_str
+        // rejects trailing whitespace/newlines outright.
+        assert!(!attach_enabled(
+            &ProgramState::NoProgramLoaded,
+            None,
+            "12\n-exec-run"
+        ));
     }
 }

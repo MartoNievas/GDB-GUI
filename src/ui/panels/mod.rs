@@ -4,6 +4,7 @@
 //! (console additionally takes `&egui::Context`). The egui panel/ScrollArea
 //! skeleton stays in `app.rs`; only panel *content* lives here.
 
+pub(crate) mod attach;
 pub(crate) mod breakpoints;
 pub(crate) mod catchpoints;
 pub(crate) mod commands;

@@ -60,6 +60,16 @@ pub(crate) fn location_label(file: Option<&str>, func: Option<&str>, status: &st
     }
 }
 
+/// Top-bar status label for an attached session (design D2/topbar.rs): reads
+/// from `attached_pid`, not `ProgramState::Attached`, since `program`
+/// overwrites to `Paused` within milliseconds of a successful attach — this
+/// keeps "Attached (pid N)" visible for the whole session instead of only
+/// the brief pre-pause window.
+pub(crate) fn attached_status_label(pid: u32, status: &str) -> String {
+    format!("Attached (pid {pid}) — {status}")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +171,26 @@ mod tests {
     #[test]
     fn location_label_falls_back_to_status_when_function_missing() {
         assert_eq!(location_label(Some("main.c"), None, "Loaded"), "Loaded");
+    }
+
+    // ── attached_status_label (design D2/topbar.rs) ──────────────────────────
+
+    #[test]
+    fn attached_status_label_formats_pid_and_status() {
+        assert_eq!(
+            attached_status_label(4242, "Paused"),
+            "Attached (pid 4242) — Paused"
+        );
+    }
+
+    // Triangulation: a different pid/status pair must not collide with the
+    // first — proves the format string is driven by its arguments, not a
+    // hardcoded fake.
+    #[test]
+    fn attached_status_label_reflects_different_pid_and_status() {
+        assert_eq!(
+            attached_status_label(1, "Running"),
+            "Attached (pid 1) — Running"
+        );
     }
 }

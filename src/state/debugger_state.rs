@@ -281,6 +281,14 @@ pub enum ProgramState {
     Running,
     Paused,
     Exited { code: Option<i32> },
+    /// Attached to an already-running process (design D2). Transient by
+    /// construction: the `*stopped` reply that follows a successful attach
+    /// overwrites this to `Paused` almost immediately, same as any other
+    /// pause. `DebuggerState::attached_pid` is the durable fact that
+    /// survives that overwrite — this variant exists only for the brief
+    /// window before the first pause, and `topbar.rs` reads `attached_pid`
+    /// (not this variant) to keep showing "Attached (pid N)" afterward.
+    Attached { pid: u32 },
 }
 
 // ─── Persistent state ────────────────────────────────────────────────────────
@@ -334,6 +342,11 @@ pub struct ErrorState {
     /// successful `MemoryUpdated`. Wiped in full on Loaded/Started/Exited,
     /// like the other error slots.
     pub memory_error: Option<String>,
+    /// GDB `^error` message from a failed `-target-attach` attempt (design:
+    /// "single slot, like `memory_error`") — only one attach panel/attempt
+    /// exists at a time. Cleared on the next successful `ProcessAttached`.
+    /// Wiped in full on Loaded/Started/Exited, like the other error slots.
+    pub attach_error: Option<String>,
 }
 
 // ─── Top-level state ─────────────────────────────────────────────────────────
@@ -371,6 +384,14 @@ pub struct DebuggerState {
     /// re-sends on every pause. `""` = none committed yet, same convention
     /// as `struct_expr`.
     pub memory_addr: String,
+    /// The attached pid (design D2), set by `ProcessAttached` and cleared by
+    /// `ProcessAttachFailed`/`DetachFinished`. Durable across the
+    /// `ProgramPaused` transition, which overwrites `program` unconditionally
+    /// (`ProgramState::Attached` is transient by construction — see its
+    /// doc comment) — this field is the fact that outlives that overwrite,
+    /// mirroring `preview_file`'s precedent for state that survives a
+    /// program-state churn.
+    pub attached_pid: Option<u32>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -530,18 +551,18 @@ pub enum StateEvent {
     /// Attach succeeded. Emitted OPTIMISTICALLY at dispatch time (design
     /// D1) by `process.rs`'s `handle_commands`, in the same arm that
     /// inserts into `pending.attach` — never derived from a GDB reply: the
-    /// eventual `*stopped` record is anonymous (no `reason=`, no pid).
-    /// PR1 stub: the `apply` arm here is intentionally a no-op — full state
-    /// handling (`ProgramState::Attached`, `attached_pid`) is wired in a
-    /// later chained PR.
+    /// eventual `*stopped` record is anonymous (no `reason=`, no pid). The
+    /// `apply` arm sets `program = Attached{pid}`, `attached_pid = Some(pid)`,
+    /// and clears `attach_error` (PR2).
     ProcessAttached {
         pid: u32,
     },
     /// GDB `^error` for an attach attempt, correlated by MI token via
     /// `pending.attach` (error-only, mirrors `CatchpointError`/
-    /// `WatchpointError`). `message` is GDB's raw text, verbatim.
-    /// PR1 stub: the `apply` arm here is intentionally a no-op — the
-    /// rollback-to-`NoProgramLoaded` logic is wired in a later chained PR.
+    /// `WatchpointError`). `message` is GDB's raw text, verbatim. The
+    /// `apply` arm stores `message` in `attach_error` and rolls back to
+    /// `ProgramState::NoProgramLoaded`/`attached_pid = None` when `pid`
+    /// matches the currently attached pid, so the user can retry (PR2).
     ProcessAttachFailed {
         pid: u32,
         message: String,
@@ -549,9 +570,11 @@ pub enum StateEvent {
     /// `-target-detach` acked with either `^done` (success, `error: None`)
     /// or `^error` (failure, GDB's raw message), correlated by MI token via
     /// `pending.detach` (token-only, mirrors `Command::ProbeMainSource`'s
-    /// `pending.probe` shape). PR1 stub: the `apply` arm here is
-    /// intentionally a no-op — resetting `attached_pid`/`program` is wired
-    /// in a later chained PR.
+    /// `pending.probe` shape). The `apply` arm resets to
+    /// `ProgramState::NoProgramLoaded`/`attached_pid = None` regardless of
+    /// `error` (PR2) — the actual `-target-detach` dispatch/shutdown hook
+    /// (`on_exit`) that produces this event is a later chained PR's
+    /// responsibility.
     DetachFinished {
         error: Option<String>,
     },
@@ -596,6 +619,7 @@ impl DebuggerState {
             errors: ErrorState::default(),
             memory: vec![],
             memory_addr: String::new(),
+            attached_pid: None,
         }
     }
 
@@ -626,6 +650,7 @@ impl DebuggerState {
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
+                self.errors.attach_error = None;
             }
 
             StateEvent::ProgramStarted => {
@@ -648,6 +673,7 @@ impl DebuggerState {
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
+                self.errors.attach_error = None;
             }
 
             StateEvent::ProgramPaused { pause } => {
@@ -689,6 +715,7 @@ impl DebuggerState {
                 self.errors.catchpoint_errors.clear();
                 self.memory = vec![];
                 self.errors.memory_error = None;
+                self.errors.attach_error = None;
             }
 
             StateEvent::BreakpointAdded { breakpoint } => {
@@ -826,16 +853,40 @@ impl DebuggerState {
                 self.errors.memory_error = Some(message);
             }
 
-            // PR1 stubs (design D1/D2/D6): these three variants exist so
-            // `process.rs`'s attach/detach dispatch and correlation compile
-            // and are tested in isolation. Full `apply` logic
-            // (`ProgramState::Attached`, `attached_pid`, `attach_error`,
-            // rollback-on-failure, detach reset) is wired in a later
-            // chained PR — deliberately a no-op here, not a design
-            // deviation.
-            StateEvent::ProcessAttached { pid: _ } => {}
-            StateEvent::ProcessAttachFailed { pid: _, message: _ } => {}
-            StateEvent::DetachFinished { error: _ } => {}
+            // PR2 (design D1/D2/D4): emitted optimistically at dispatch
+            // time — `persistent.executable` is deliberately left
+            // untouched (stays `None`), which is what makes D4's restore
+            // guard (`try_start_restore` only reachable inside
+            // `if was_loaded` in app.rs, matching `ProgramLoaded` only)
+            // unbypassable by construction: this arm never sets
+            // `persistent.executable`, so nothing here could ever satisfy
+            // that `if`.
+            StateEvent::ProcessAttached { pid } => {
+                self.program = ProgramState::Attached { pid };
+                self.attached_pid = Some(pid);
+                self.errors.attach_error = None;
+            }
+            // PR2 (design): stores GDB's verbatim `^error` message. Only
+            // rolls back to `NoProgramLoaded`/`None` when `pid` matches the
+            // currently attached pid — a stale failure for a superseded
+            // attempt must not clobber a session that has since succeeded.
+            StateEvent::ProcessAttachFailed { pid, message } => {
+                self.errors.attach_error = Some(message);
+                if self.attached_pid == Some(pid) {
+                    self.program = ProgramState::NoProgramLoaded;
+                    self.attached_pid = None;
+                }
+            }
+            // PR2 (design D6): only the state transition is implemented
+            // here — the actual `-target-detach` dispatch/shutdown hook
+            // (`on_exit`, `should_detach_on_exit`, `wait_for_detach_ack`)
+            // is a later chained PR's responsibility. `error` is a
+            // diagnostic only; either outcome releases the attached
+            // session the same way.
+            StateEvent::DetachFinished { error: _ } => {
+                self.program = ProgramState::NoProgramLoaded;
+                self.attached_pid = None;
+            }
         }
     }
 
@@ -2299,5 +2350,148 @@ mod tests {
     #[test]
     fn catchpoint_kind_from_wire_rejects_unknown_literal() {
         assert_eq!(CatchpointKind::from_wire("bogus"), None);
+    }
+
+    // ── Process attach (PR2: full apply logic, design D1-D5) ────────────────
+
+    // Task 3.1: ProcessAttached sets Attached{pid} + attached_pid, leaves
+    // persistent.executable untouched (design D4: attach never touches the
+    // project-file identity, so try_start_restore/save_persistent_state
+    // never fire for an attach session).
+    #[test]
+    fn process_attached_sets_attached_state_and_pid_leaves_executable_none() {
+        let mut state = DebuggerState::new();
+
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        assert!(matches!(state.program, ProgramState::Attached { pid: 4242 }));
+        assert_eq!(state.attached_pid, Some(4242));
+        assert_eq!(state.persistent.executable, None);
+    }
+
+    // Task 3.2: the *stopped -> ProgramPaused cascade overwrites `program`
+    // unconditionally (existing behavior, debugger_state.rs ~line 654) but
+    // must NOT clear `attached_pid` — this is the core subtlety design.md
+    // flags: without a durable field, the attached pid vanishes from the
+    // topbar within milliseconds of attach succeeding.
+    #[test]
+    fn program_paused_after_attach_preserves_attached_pid() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        state.apply(StateEvent::ProgramPaused {
+            pause: PauseState {
+                thread_id: 1,
+                frame: Frame {
+                    addr: 0x1000,
+                    function: "main".into(),
+                    file: None,
+                    line: None,
+                },
+                stack: vec![],
+                stop_reason: StopReason::Unknown,
+            },
+        });
+
+        assert!(matches!(state.program, ProgramState::Paused));
+        assert_eq!(
+            state.attached_pid,
+            Some(4242),
+            "attached_pid must survive the ProgramPaused transition"
+        );
+    }
+
+    // Task 3.3: ProcessAttachFailed rolls back to NoProgramLoaded/None (so
+    // the user can retry) and stores GDB's verbatim message.
+    #[test]
+    fn process_attach_failed_rolls_back_and_stores_message() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        state.apply(StateEvent::ProcessAttachFailed {
+            pid: 4242,
+            message: "ptrace: Operation not permitted.".into(),
+        });
+
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.attached_pid, None);
+        assert_eq!(
+            state.errors.attach_error,
+            Some("ptrace: Operation not permitted.".to_string())
+        );
+    }
+
+    // Triangulation: a stale ProcessAttachFailed for a DIFFERENT pid than
+    // the one currently attached must not roll back the live session — only
+    // the message slot updates. Forces the rollback condition to actually
+    // compare pids instead of always rolling back on any failure.
+    #[test]
+    fn process_attach_failed_does_not_roll_back_when_pid_does_not_match_attached() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        state.apply(StateEvent::ProcessAttachFailed {
+            pid: 1111,
+            message: "stale failure for a different attempt".into(),
+        });
+
+        assert!(matches!(state.program, ProgramState::Attached { pid: 4242 }));
+        assert_eq!(state.attached_pid, Some(4242));
+        assert_eq!(
+            state.errors.attach_error,
+            Some("stale failure for a different attempt".to_string())
+        );
+    }
+
+    // Task 3.4: attach_error is wiped in full on Loaded/Started/Exited, like
+    // every other error slot in ErrorState.
+    #[test]
+    fn program_loaded_started_exited_clear_attach_error() {
+        let mut state = DebuggerState::new();
+        state.errors.attach_error = Some("stale".into());
+        state.apply(StateEvent::ProgramLoaded {
+            executable: "a.out".into(),
+        });
+        assert_eq!(state.errors.attach_error, None);
+
+        let mut state = DebuggerState::new();
+        state.errors.attach_error = Some("stale".into());
+        state.apply(StateEvent::ProgramStarted);
+        assert_eq!(state.errors.attach_error, None);
+
+        let mut state = DebuggerState::new();
+        state.errors.attach_error = Some("stale".into());
+        state.apply(StateEvent::ProgramExited { code: Some(0) });
+        assert_eq!(state.errors.attach_error, None);
+    }
+
+    // DetachFinished (design D6/apply-arm contract): PR2 only needs the
+    // state transition itself to exist and behave correctly — the actual
+    // -target-detach dispatch/shutdown hook is PR3's responsibility.
+    #[test]
+    fn detach_finished_resets_to_no_program_loaded_and_clears_attached_pid() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        state.apply(StateEvent::DetachFinished { error: None });
+
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.attached_pid, None);
+    }
+
+    // Triangulation: a failed detach still resets state the same way — the
+    // error is a diagnostic report, not a reason to keep the stale attached
+    // session around.
+    #[test]
+    fn detach_finished_with_error_still_resets_state() {
+        let mut state = DebuggerState::new();
+        state.apply(StateEvent::ProcessAttached { pid: 4242 });
+
+        state.apply(StateEvent::DetachFinished {
+            error: Some("No such process.".into()),
+        });
+
+        assert!(matches!(state.program, ProgramState::NoProgramLoaded));
+        assert_eq!(state.attached_pid, None);
     }
 }

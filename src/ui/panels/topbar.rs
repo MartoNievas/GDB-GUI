@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Align, Layout, Sense, Vec2};
 
-use super::util::location_label;
+use super::util::{attached_status_label, location_label};
 use crate::ui::app::App;
 use crate::ui::command::Command;
 use crate::ui::theme::*;
@@ -67,10 +67,25 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 crate::state::ProgramState::Running => "Running",
                 crate::state::ProgramState::Paused => "Paused",
                 crate::state::ProgramState::Exited { .. } => "Exited",
+                // Transient by construction (`ProgramState::Attached`'s doc
+                // comment) — `attached_pid` below is what actually keeps
+                // this label alive past the immediate `*stopped` -> Paused
+                // overwrite, so this arm's text is only ever seen in the
+                // brief pre-pause window.
+                crate::state::ProgramState::Attached { .. } => "Attached",
             };
 
-            let location =
-                location_label(app.state.current_file(), app.state.current_function(), status);
+            // `attached_pid` (not the `program` match above) drives the
+            // attached label: `program` overwrites to `Paused` almost
+            // immediately after a successful attach, but `attached_pid`
+            // survives that transition (design D2) — reading it here is
+            // what keeps "Attached (pid N)" visible for the whole session
+            // instead of only the initial instant.
+            let location = if let Some(pid) = app.state.attached_pid {
+                attached_status_label(pid, status)
+            } else {
+                location_label(app.state.current_file(), app.state.current_function(), status)
+            };
 
             ui.label(m(&location, 11.0, TXT_MUTED));
         });
