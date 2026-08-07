@@ -455,15 +455,30 @@ fn spawn_gdb(
 
 // ─── run_loop ─────────────────────────────────────────────────────────────────
 
-/// Spawns the background thread that blocks on `reader.read_line` and
-/// forwards each trimmed line through the returned channel. Errors and EOF
-/// both terminate the thread silently on the reader side; a read error is
-/// also reported to the UI via `event_tx` before the thread exits. The
+/// Spawns the background thread that blocks on `reader.read_until(b'\n', ..)`
+/// and forwards each trimmed line through the returned channel.
+///
+/// Reads raw bytes and decodes each line lossily (`String::from_utf8_lossy`)
+/// rather than requiring strict UTF-8 (as `BufRead::read_line` does). GDB's
+/// stdout can carry the debuggee's own console output verbatim over the
+/// remote protocol (e.g. `target remote` to a qemu/kernel target), with no
+/// guarantee of UTF-8 validity — a single malformed byte sequence must
+/// degrade gracefully (replaced with U+FFFD, like a real terminal) instead of
+/// tearing down the read loop, since `from_utf8_lossy` never fails. Only a
+/// genuine I/O error from `read_until` itself (e.g. broken pipe) terminates
+/// the thread via the `Err` arm below.
+///
+/// EOF terminates the thread silently on the reader side; a real read error
+/// is also reported to the UI via `event_tx` before the thread exits. The
 /// `JoinHandle` is returned for the caller to hold (never joined — the
 /// thread is expected to outlive `run_loop`'s use of it and terminate on its
 /// own when the child's stdout closes).
-fn spawn_reader_thread(
-    reader: BufReader<ChildStdout>,
+///
+/// Generic over `R: BufRead` — mirrors `GdbWriter<W: Write>` above — so unit
+/// tests can substitute an in-memory reader (e.g. `Cursor<Vec<u8>>`) instead
+/// of a real `BufReader<ChildStdout>`, which requires a live subprocess.
+fn spawn_reader_thread<R: BufRead + Send + 'static>(
+    reader: R,
     event_tx: Sender<DebuggerEvent>,
 ) -> (thread::JoinHandle<()>, Receiver<String>) {
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
@@ -471,13 +486,14 @@ fn spawn_reader_thread(
 
     let handle = thread::spawn(move || {
         let mut reader = reader;
-        let mut buf = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         loop {
-            buf.clear();
-            match reader.read_line(&mut buf) {
+            byte_buf.clear();
+            match reader.read_until(b'\n', &mut byte_buf) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    let line = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+                    let decoded = String::from_utf8_lossy(&byte_buf);
+                    let line = decoded.trim_end_matches('\n').trim_end_matches('\r').to_owned();
                     if !line.is_empty() && line_tx.send(line).is_err() {
                         break;
                     }
@@ -2290,5 +2306,62 @@ mod tests {
             DebuggerEvent::State(StateEvent::DetachFinished { error }) => assert_eq!(error, None),
             other => panic!("expected DetachFinished, got {other:?}"),
         }
+    }
+
+    // ─── spawn_reader_thread ────────────────────────────────────────────────
+
+    #[test]
+    fn spawn_reader_thread_lossily_decodes_invalid_utf8_and_keeps_running() {
+        // Lone 0xFF is not valid UTF-8 on its own. Previously `read_line`
+        // would error on this byte and the `Err` arm would kill the thread
+        // permanently. The fix must decode it lossily (U+FFFD) and keep
+        // reading subsequent lines instead of dying.
+        let mut bytes: Vec<u8> = vec![0xFF, b'\n'];
+        bytes.extend_from_slice(b"hello\n");
+        let cursor = std::io::Cursor::new(bytes);
+        let (event_tx, _event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+
+        let (handle, line_rx) = spawn_reader_thread(cursor, event_tx);
+
+        let first = line_rx.recv().expect("invalid-UTF8 line should still be delivered");
+        assert!(
+            first.contains('\u{FFFD}'),
+            "expected replacement character in lossily-decoded line, got {first:?}"
+        );
+
+        let second = line_rx.recv().expect("thread must keep running after invalid UTF-8");
+        assert_eq!(second, "hello");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn spawn_reader_thread_terminates_cleanly_on_eof() {
+        let cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let (event_tx, _event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+
+        let (handle, line_rx) = spawn_reader_thread(cursor, event_tx);
+
+        assert!(
+            line_rx.recv().is_err(),
+            "channel should be closed with no lines delivered on immediate EOF"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn spawn_reader_thread_skips_empty_lines() {
+        let cursor = std::io::Cursor::new(b"\n\nfoo\n\n".to_vec());
+        let (event_tx, _event_rx) = std::sync::mpsc::channel::<DebuggerEvent>();
+
+        let (handle, line_rx) = spawn_reader_thread(cursor, event_tx);
+
+        let line = line_rx.recv().expect("non-empty line should be delivered");
+        assert_eq!(line, "foo");
+        assert!(
+            line_rx.recv().is_err(),
+            "empty lines must be skipped, not forwarded"
+        );
+        handle.join().unwrap();
     }
 }
