@@ -419,6 +419,7 @@ fn optimistic_watchpoint_event(cmd: &DebuggerCommand) -> Option<StateEvent> {
 
 fn spawn_gdb(
     executable: Option<&str>,
+    program_args: &[String],
 ) -> std::io::Result<(Child, GdbWriter<ChildStdin>, BufReader<ChildStdout>)> {
     let mut cmd = Command::new("gdb");
     cmd.arg("--interpreter=mi")
@@ -429,7 +430,7 @@ fn spawn_gdb(
         .stderr(Stdio::null());
 
     if let Some(exe) = executable {
-        cmd.arg(exe);
+        cmd.arg("--args").arg(exe).args(program_args);
     }
 
     let mut child = cmd.spawn()?;
@@ -872,10 +873,11 @@ fn handle_gdb_output<W: Write>(
 
 pub fn run_loop(
     executable: Option<String>,
+    program_args: Vec<String>,
     cmd_rx: Receiver<DebuggerCommand>,
     event_tx: Sender<DebuggerEvent>,
 ) {
-    let (mut child, mut writer, reader) = match spawn_gdb(executable.as_deref()) {
+    let (mut child, mut writer, reader) = match spawn_gdb(executable.as_deref(), &program_args) {
         Ok(parts) => parts,
         Err(e) => {
             let _ = event_tx.send(DebuggerEvent::Ui(UiEvent::GdbError(format!(
